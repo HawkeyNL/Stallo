@@ -11,7 +11,8 @@ publish = false
 anyhow = "1.0.104"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+sha2 = "0.11.1"
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 toml = "1.1.8"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 

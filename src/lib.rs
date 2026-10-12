@@ -4,10 +4,16 @@
 //! a Unix socket.
 
 pub mod config;
+pub mod images;
 pub mod paths;
 pub mod qmp;
 
+use std::process::Stdio;
+use std::time::Duration;
+
+use anyhow::{Context, bail};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use tokio::process::Command;
 
 /// Reads one `\n`-terminated line into `buf` (cleared first, newline
 /// stripped). Returns `Ok(false)` on a clean end of stream.
@@ -42,6 +48,30 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(
     Ok(true)
 }
 
+/// Runs a helper program (fixed argv, never a shell) with a time limit and
+/// returns its stdout. The child is killed if the limit passes or the
+/// caller gives up. Errors carry the exit status and the last stderr line.
+// ponytail: stdout and stderr are buffered whole; fine for the small outputs
+// of curl, gpgv, qemu-img and xorriso. Stream them if a chatty tool appears.
+pub async fn run_tool(cmd: &mut Command, limit: Duration) -> anyhow::Result<Vec<u8>> {
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
+    let out = tokio::time::timeout(limit, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("{program} timed out after {limit:?}"))?
+        .with_context(|| format!("cannot run {program}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        bail!(
+            "{program} failed ({}): {}",
+            out.status,
+            last.unwrap_or("no output")
+        );
+    }
+    Ok(out.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::read_line;
@@ -65,5 +95,28 @@ mod tests {
 
         let mut empty: &[u8] = b"";
         assert!(!read_line(&mut empty, &mut buf, 4).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn run_tool_reports_failures_and_timeouts() {
+        use super::run_tool;
+        use std::time::Duration;
+        use tokio::process::Command;
+        let t = Duration::from_secs(5);
+        let out = run_tool(Command::new("echo").arg("hi"), t).await.unwrap();
+        assert_eq!(out, b"hi\n");
+        let err = run_tool(Command::new("sh").args(["-c", "echo bad >&2; exit 3"]), t)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bad"), "{err:#}");
+        let err = run_tool(Command::new("sleep").arg("5"), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(
+            run_tool(&mut Command::new("/nonexistent"), t)
+                .await
+                .is_err()
+        );
     }
 }
