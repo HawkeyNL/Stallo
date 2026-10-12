@@ -60,7 +60,7 @@ pub fn enabled() -> bool {
     on
 }
 
-fn env_path(var: &str) -> PathBuf {
+pub fn env_path(var: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(var).unwrap_or_else(|| panic!("{var} is not set")))
 }
 
@@ -103,17 +103,25 @@ fn assert_no_other_qemu() {
     );
 }
 
+/// Takes the one-VM-at-a-time lock, kills leftovers of killed test runs
+/// and checks that no other QEMU runs. Returns the lock (hold it while the
+/// VM runs) and the canonical `$HOME/.cache/stallo-it`.
+pub fn exclusive() -> (fs::File, PathBuf) {
+    let cache_root = env_path("HOME").join(".cache/stallo-it");
+    fs::create_dir_all(&cache_root).unwrap();
+    let cache_root = fs::canonicalize(cache_root).unwrap();
+    let lock = fs::File::create(cache_root.join(".lock")).unwrap();
+    lock.lock().unwrap();
+    kill_stale_units();
+    assert_no_other_qemu();
+    (lock, cache_root)
+}
+
 impl Daemon {
     /// Starts stallod for test `name` with `config` as its stallod.toml.
     pub fn start(name: &str, config: &str) -> Self {
         let home = env_path("HOME");
-        let cache_root = home.join(".cache/stallo-it");
-        fs::create_dir_all(&cache_root).unwrap();
-        let cache_root = fs::canonicalize(cache_root).unwrap();
-        let lock = fs::File::create(cache_root.join(".lock")).unwrap();
-        lock.lock().unwrap();
-        kill_stale_units();
-        assert_no_other_qemu();
+        let (lock, cache_root) = exclusive();
 
         let run_root = fs::canonicalize(env_path("XDG_RUNTIME_DIR")).unwrap();
         let base = cache_root.join(name);

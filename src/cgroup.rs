@@ -15,9 +15,8 @@
 //! Callers serialise lifecycle operations per VM (`vm.rs` holds a per-name
 //! lock), so creating, spawning into and removing one `vm-<name>` never race.
 //!
-//! Known gap: QEMU runs under the daemon's UID, so a guest that escapes into
-//! QEMU could rewrite these control files. The plan confines QEMU with an
-//! AppArmor profile in production (M5-3).
+//! QEMU runs under the daemon's UID; Landlock (`confine.rs`) keeps it away
+//! from these control files.
 
 use std::fs;
 use std::io;
@@ -25,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
 const DAEMON_LEAF: &str = "daemon";
@@ -185,14 +184,6 @@ fn parse_own_cgroup(text: &str) -> Result<&str> {
     Ok(path)
 }
 
-/// Spawns `cmd` directly into the cgroup at `dir` and raises its
-/// `oom_score_adj`, both before `exec`, so the program never runs outside
-/// its limits.
-pub fn spawn_into(cmd: &mut Command, dir: &Path) -> Result<Child> {
-    move_on_exec(cmd, dir)?;
-    Ok(cmd.spawn()?)
-}
-
 /// Makes a helper program start in the `tools` leaf (1 GiB for all helpers
 /// together). Does nothing before `Cgroups::setup`, e.g. in unit tests.
 pub fn confine_tool(cmd: &mut Command) -> Result<()> {
@@ -202,7 +193,10 @@ pub fn confine_tool(cmd: &mut Command) -> Result<()> {
     }
 }
 
-fn move_on_exec(cmd: &mut Command, dir: &Path) -> Result<()> {
+/// Makes `cmd` join the cgroup at `dir` and raise its `oom_score_adj`
+/// before `exec`, so the program never runs outside its limits. Registers
+/// a `pre_exec` hook.
+pub fn move_on_exec(cmd: &mut Command, dir: &Path) -> Result<()> {
     let procs = fs::OpenOptions::new()
         .write(true)
         .open(dir.join("cgroup.procs"))
@@ -271,6 +265,11 @@ fn write(path: &Path, value: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spawn_into(cmd: &mut Command, dir: &Path) -> Result<tokio::process::Child> {
+        move_on_exec(cmd, dir)?;
+        Ok(cmd.spawn()?)
+    }
 
     #[test]
     fn parses_own_cgroup() {

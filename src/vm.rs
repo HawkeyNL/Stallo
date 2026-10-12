@@ -28,7 +28,7 @@ use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
-use crate::{images, qemu, seed};
+use crate::{confine, images, qemu, seed};
 
 /// Graceful power-off budget before QEMU is told to quit.
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -301,7 +301,15 @@ impl Manager {
             // Own process group: a Ctrl-C meant for a foreground daemon
             // must not reach the guests.
             .process_group(0);
-        let mut child = crate::cgroup::spawn_into(&mut cmd, &cg).context("cannot start QEMU")?;
+        // Order matters: the cgroup hook opens files the ruleset denies.
+        crate::cgroup::move_on_exec(&mut cmd, &cg)?;
+        let rules = confine::qemu_rules(
+            &vm_dir,
+            &rt_dir,
+            &images::image_path(&self.paths, &cfg.image),
+        );
+        confine::confine_on_exec(&mut cmd, confine::build(&rules)?);
+        let mut child = cmd.spawn().context("cannot start QEMU")?;
         let pid = child
             .id()
             .expect("a child that was not waited for has a pid");
