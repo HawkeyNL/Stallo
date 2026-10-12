@@ -74,6 +74,15 @@ enum Cmd {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Copy a file between the host and a VM, e.g. `stallo cp notes.txt
+    /// dev:/home/agent/notes.txt` or `stallo cp dev:/etc/os-release .`.
+    Cp {
+        src: String,
+        dst: String,
+        /// Read or write the guest file as root instead of the guest user.
+        #[arg(long)]
+        admin: bool,
+    },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
     /// Show host resources and what VMs use.
@@ -240,6 +249,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 argv,
                 admin,
                 timeout_s: timeout,
+                stdin: None,
             })
             .await?;
             let r: ExecResult = serde_json::from_value(v.clone())?;
@@ -253,6 +263,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
             return Ok(ExitCode::from(u8::try_from(r.exit_code).unwrap_or(255)));
+        }
+        Cmd::Cp { src, dst, admin } => {
+            let bytes = match (guest_path(&src), guest_path(&dst)) {
+                (None, Some((vm, path))) => upload(&call, &src, vm, path, admin).await?,
+                (Some((vm, path)), None) => download(&call, vm, path, &dst, admin).await?,
+                _ => bail!("copy between the host and a VM: one side must be <vm>:/path"),
+            };
+            if json {
+                print_json(&serde_json::json!({"bytes": bytes}));
+            } else {
+                println!("copied {bytes} bytes");
+            }
         }
         Cmd::Resume { vm } => {
             call(Request::Resume { name: vm.clone() }).await?;
@@ -297,6 +319,140 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `vm:/abs/path` names a guest file; anything else is a host path.
+fn guest_path(arg: &str) -> Option<(&str, &str)> {
+    let (vm, path) = arg.split_once(':')?;
+    (stallo::config::validate_name(vm).is_ok() && path.starts_with('/')).then_some((vm, path))
+}
+
+/// Largest file `stallo cp` copies from a guest, so a hostile guest
+/// cannot fill the host disk with an endless file.
+const MAX_DOWNLOAD: u64 = 16 << 30;
+
+/// Copies a host file into the guest in appended chunks (requests are
+/// capped at 1 MiB). Not atomic: the first chunk replaces the guest file,
+/// so a failure midway leaves a partial file. A guest path ending in `/`
+/// gets the host file's name.
+async fn upload<F, Fut>(call: &F, src: &str, vm: &str, path: &str, admin: bool) -> Result<u64>
+where
+    F: Fn(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    use base64::Engine;
+    use std::io::Read;
+    let mut path = path.to_owned();
+    if path.ends_with('/') {
+        let name = std::path::Path::new(src)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("the host path has no file name")?;
+        path.push_str(name);
+    }
+    let mut file = std::fs::File::open(src).with_context(|| format!("cannot open {src}"))?;
+    let mut chunk = Vec::with_capacity(api::FILE_WRITE_CHUNK);
+    let mut total = 0u64;
+    loop {
+        chunk.clear();
+        (&mut file)
+            .take(api::FILE_WRITE_CHUNK as u64)
+            .read_to_end(&mut chunk)?;
+        // The first write also creates an empty file.
+        if !chunk.is_empty() || total == 0 {
+            call(Request::FileWrite {
+                name: vm.to_owned(),
+                path: path.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&chunk),
+                append: total > 0,
+                admin,
+            })
+            .await?;
+        }
+        total += chunk.len() as u64;
+        if chunk.len() < api::FILE_WRITE_CHUNK {
+            return Ok(total);
+        }
+    }
+}
+
+/// Copies a guest file to the host in 8 MiB parts, into `<dst>.part` first
+/// and renamed when complete, so a failure never clobbers `dst`. A
+/// directory as `dst` gets the guest file's name.
+async fn download<F, Fut>(call: &F, vm: &str, path: &str, dst: &str, admin: bool) -> Result<u64>
+where
+    F: Fn(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    let mut target = PathBuf::from(dst);
+    if target.is_dir() {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .context("the guest path has no file name")?;
+        target.push(name);
+    }
+    let mut part = target.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let result = download_to(call, vm, path, &part, admin).await;
+    match result {
+        Ok(n) => {
+            std::fs::rename(&part, &target)
+                .with_context(|| format!("cannot write {}", target.display()))?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
+async fn download_to<F, Fut>(
+    call: &F,
+    vm: &str,
+    path: &str,
+    part: &std::path::Path,
+    admin: bool,
+) -> Result<u64>
+where
+    F: Fn(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    use base64::Engine;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .with_context(|| format!("cannot create {}", part.display()))?;
+    let mut offset = 0u64;
+    loop {
+        let v = call(Request::FileRead {
+            name: vm.to_owned(),
+            path: path.to_owned(),
+            offset,
+            max_bytes: Some(8 << 20),
+            admin,
+        })
+        .await?;
+        let chunk: api::FileData = serde_json::from_value(v)?;
+        let data = base64::engine::general_purpose::STANDARD.decode(&chunk.data_base64)?;
+        // A guest that claims more but sends nothing would loop forever.
+        ensure!(
+            !chunk.more || !data.is_empty(),
+            "the guest sent no data for {path}"
+        );
+        offset += data.len() as u64;
+        ensure!(
+            offset <= MAX_DOWNLOAD,
+            "{path} is larger than {} GiB; not copied",
+            MAX_DOWNLOAD >> 30
+        );
+        out.write_all(&data)?;
+        if !chunk.more {
+            return Ok(offset);
+        }
+    }
 }
 
 /// `2 vCPU · 2 GiB · offline`
@@ -405,6 +561,101 @@ mod tests {
         assert!(parse_gib("20bib").is_err());
         assert!(parse_gib("20B").is_err());
         assert_eq!(parse_gib("20GiB").unwrap(), 20);
+    }
+
+    /// A fake daemon holding one guest file.
+    fn fake_guest(
+        file: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        part: usize,
+        lie: bool,
+    ) -> impl Fn(Request) -> std::future::Ready<Result<Value>> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        move |r| {
+            let mut f = file.lock().unwrap();
+            std::future::ready(match r {
+                Request::FileWrite {
+                    data_base64,
+                    append,
+                    path,
+                    ..
+                } => {
+                    assert!(!path.ends_with('/'));
+                    if !append {
+                        f.clear();
+                    }
+                    f.extend(b64.decode(data_base64).unwrap());
+                    Ok(Value::Null)
+                }
+                Request::FileRead { path, offset, .. } if path == "/f" => {
+                    let start = (offset as usize).min(f.len());
+                    let end = (start + part).min(f.len());
+                    let data = if lie { &[][..] } else { &f[start..end] };
+                    Ok(serde_json::json!({"data_base64": b64.encode(data),
+                        "size": data.len(), "more": lie || end < f.len()}))
+                }
+                _ => Err(anyhow::anyhow!("no such file")),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn copies_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let call = fake_guest(guest.clone(), 1000, false);
+        let src = dir.path().join("src");
+        for len in [0, 1, api::FILE_WRITE_CHUNK, 2 * api::FILE_WRITE_CHUNK + 7] {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            std::fs::write(&src, &data).unwrap();
+            let n = upload(&call, src.to_str().unwrap(), "dev", "/f", false)
+                .await
+                .unwrap();
+            assert_eq!(n as usize, len);
+            assert_eq!(*guest.lock().unwrap(), data);
+            // Down again in 1000-byte parts, into a directory.
+            let back = dir.path().join("back");
+            std::fs::create_dir_all(&back).unwrap();
+            download(&call, "dev", "/f", back.to_str().unwrap(), false)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(back.join("f")).unwrap(), data);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_failures_leave_the_target_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep");
+        std::fs::write(&keep, b"precious").unwrap();
+        let guest = std::sync::Arc::new(std::sync::Mutex::new(b"data".to_vec()));
+        let call = fake_guest(guest.clone(), 1000, false);
+        assert!(
+            download(&call, "dev", "/missing", keep.to_str().unwrap(), false)
+                .await
+                .is_err()
+        );
+        // A guest that says "more" but sends nothing.
+        let liar = fake_guest(guest, 1000, true);
+        let err = download(&liar, "dev", "/f", keep.to_str().unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no data"), "{err}");
+        assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no .part left"
+        );
+    }
+
+    #[test]
+    fn guest_paths() {
+        assert_eq!(guest_path("dev:/tmp/a"), Some(("dev", "/tmp/a")));
+        assert_eq!(guest_path("dev:/a:b"), Some(("dev", "/a:b")));
+        for host in ["./a", "/tmp/dev:/x", "dev:relative", "Dev:/x", "a"] {
+            assert_eq!(guest_path(host), None, "{host}");
+        }
     }
 
     #[test]

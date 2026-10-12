@@ -29,6 +29,9 @@ use crate::read_line;
 /// about 22 MiB as base64, and a reply can carry stdout and stderr.
 pub const MAX_LINE: usize = 48 << 20;
 
+/// Largest stderr kept from a guest command.
+const ERR_CAP: usize = 1 << 20;
+
 /// A sync reply is tiny; anything longer is not ours.
 const MAX_SYNC_LINE: usize = 256;
 
@@ -197,25 +200,25 @@ impl Qga {
             .map(drop)
     }
 
-    /// Runs `path args...` in the guest and waits for it to exit. The
-    /// caller makes the guest enforce `limit` (QGA itself cannot kill a
-    /// command); here `limit` plus a grace period is only a backstop. Each
-    /// output stream is cut at `cap` bytes.
+    /// Runs `path args...` in the guest, with `stdin` as its input, and
+    /// waits for it to exit. The caller makes the guest enforce `limit` (QGA
+    /// itself cannot kill a command); here `limit` plus a grace period is
+    /// only a backstop. stdout is cut at `cap` bytes, stderr at
+    /// `min(cap, 1 MiB)`.
     pub async fn exec(
         &mut self,
         path: &str,
         args: &[String],
+        stdin: Option<&[u8]>,
         limit: Duration,
         cap: usize,
     ) -> Result<ExecOutput> {
         let started = Instant::now();
-        let pid = self
-            .call::<Pid>(
-                "guest-exec",
-                json!({"path": path, "arg": args, "capture-output": true}),
-            )
-            .await?
-            .pid;
+        let mut arguments = json!({"path": path, "arg": args, "capture-output": true});
+        if let Some(input) = stdin {
+            arguments["input-data"] = BASE64.encode(input).into();
+        }
+        let pid = self.call::<Pid>("guest-exec", arguments).await?.pid;
         let mut delay = Duration::from_millis(20);
         loop {
             // Output can be large: two 16 MiB streams as base64.
@@ -260,7 +263,8 @@ fn parse_status(status: ExecStatus, cap: usize) -> Result<ExecOutput> {
         (None, None) => bail!("guest-exec-status has neither exitcode nor signal"),
     };
     let (stdout, cut_out) = decode_capped(status.out_data, cap)?;
-    let (stderr, cut_err) = decode_capped(status.err_data, cap)?;
+    // stderr is for messages: never more than the exec cap.
+    let (stderr, cut_err) = decode_capped(status.err_data, cap.min(ERR_CAP))?;
     Ok(ExecOutput {
         exit_code,
         stdout,
@@ -355,6 +359,7 @@ mod tests {
                 "guest-exec" => {
                     assert_eq!(req["arguments"]["path"], "uname");
                     assert_eq!(req["arguments"]["arg"], json!(["-a"]));
+                    assert_eq!(req["arguments"]["input-data"], BASE64.encode(b"in"));
                     json!({"return": {"pid": 42}})
                 }
                 "guest-exec-status" if polls == 0 => {
@@ -373,7 +378,7 @@ mod tests {
         .await;
         let mut qga = Qga::connect(&path, WAIT).await.unwrap();
         let out = qga
-            .exec("uname", &["-a".to_owned()], WAIT, 5)
+            .exec("uname", &["-a".to_owned()], Some(b"in"), WAIT, 5)
             .await
             .unwrap();
         assert_eq!(out.exit_code, 3);
@@ -417,7 +422,7 @@ mod tests {
         .await;
         let mut qga = Qga::connect(&path, WAIT).await.unwrap();
         let err = qga
-            .exec("sleep", &["9".to_owned()], Duration::from_secs(1), 10)
+            .exec("sleep", &["9".to_owned()], None, Duration::from_secs(1), 10)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("did not stop"), "{err:#}");

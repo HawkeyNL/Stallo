@@ -237,6 +237,101 @@ fn agent_drives_the_console() {
     });
     assert_eq!(writer, Some(false));
 
+    // Files: a 9 MiB binary file goes in and comes back (stallo cp, in
+    // parts both ways), owned by the guest user; reads take an offset.
+    let dir = tempfile::tempdir().unwrap();
+    let blob: Vec<u8> = (0..9u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let (src, back) = (dir.path().join("blob"), dir.path().join("back"));
+    std::fs::write(&src, &blob).unwrap();
+    let t = Instant::now();
+    d.ok(&["cp", src.to_str().unwrap(), "dev:/home/agent/blob"]);
+    eprintln!("MEASURE cp 9 MiB host -> guest: {:?}", t.elapsed());
+    let t = Instant::now();
+    d.ok(&["cp", "dev:/home/agent/blob", back.to_str().unwrap()]);
+    eprintln!("MEASURE cp 9 MiB guest -> host: {:?}", t.elapsed());
+    assert!(std::fs::read(&back).unwrap() == blob, "round trip differs");
+    let owner = d.ok(&["exec", "dev", "--", "stat", "-c", "%U", "/home/agent/blob"]);
+    assert_eq!(owner.trim(), "agent");
+    let part: stallo::api::FileData = serde_json::from_value(call(Request::FileRead {
+        name: "dev".into(),
+        path: "/home/agent/blob".into(),
+        offset: 1000,
+        max_bytes: Some(10),
+        admin: false,
+    }))
+    .unwrap();
+    assert_eq!(BASE64.decode(&part.data_base64).unwrap(), blob[1000..1010]);
+    assert!(part.more);
+    let past_end: stallo::api::FileData = serde_json::from_value(call(Request::FileRead {
+        name: "dev".into(),
+        path: "/home/agent/blob".into(),
+        offset: 10 << 20,
+        max_bytes: None,
+        admin: false,
+    }))
+    .unwrap();
+    assert_eq!((past_end.size, past_end.more), (0, false));
+    // A guest directory as the target keeps the host file name.
+    d.ok(&["cp", src.to_str().unwrap(), "dev:/tmp/"]);
+    assert_eq!(
+        d.ok(&["exec", "dev", "--", "stat", "-c", "%s", "/tmp/blob"])
+            .trim(),
+        (9u32 << 20).to_string()
+    );
+    // An empty file is copied too.
+    std::fs::write(&src, b"").unwrap();
+    d.ok(&["cp", src.to_str().unwrap(), "dev:/tmp/empty"]);
+    assert_eq!(
+        d.ok(&["exec", "dev", "--", "stat", "-c", "%s", "/tmp/empty"])
+            .trim(),
+        "0"
+    );
+
+    // The guest user's permissions apply unless admin.
+    let read = |path: &str, admin: bool| {
+        d.api(
+            Via::Cli,
+            Request::FileRead {
+                name: "dev".into(),
+                path: path.into(),
+                offset: 0,
+                max_bytes: None,
+                admin,
+            },
+        )
+    };
+    let err = read("/etc/shadow", false).unwrap_err().to_string();
+    assert!(err.contains("Permission denied"), "{err}");
+    assert!(read("/etc/shadow", true).is_ok());
+    assert!(read("/nonexistent", true).is_err());
+    assert!(read("relative", true).is_err());
+    let write = |path: &str, admin: bool| {
+        d.api(
+            Via::Cli,
+            Request::FileWrite {
+                name: "dev".into(),
+                path: path.into(),
+                data_base64: BASE64.encode(b"x"),
+                append: false,
+                admin,
+            },
+        )
+    };
+    assert!(write("/etc/stallo-test", false).is_err());
+    assert!(write("/etc/stallo-test", true).is_ok());
+
+    // exec passes stdin.
+    let v = call(Request::Exec {
+        name: "dev".into(),
+        argv: vec!["cat".into()],
+        admin: false,
+        timeout_s: None,
+        stdin: Some("from stdin".into()),
+    });
+    assert_eq!(v["stdout"], "from stdin");
+
     // Bad arguments are refused.
     for (stable_ms, timeout_ms) in [(10, 1000), (2000, 1000), (1000, 300_001)] {
         let bad = d.api(

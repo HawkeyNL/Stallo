@@ -14,6 +14,8 @@ use tokio::sync::Semaphore;
 
 use std::time::Instant;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Response, VmInfo};
 use stallo::cgroup::Cgroups;
@@ -219,6 +221,8 @@ fn op_name(r: &Request) -> &'static str {
         Request::Start { .. } => "start",
         Request::Stop { .. } => "stop",
         Request::Exec { .. } => "exec",
+        Request::FileRead { .. } => "file_read",
+        Request::FileWrite { .. } => "file_write",
         Request::Rm { .. } => "rm",
         Request::Screenshot { .. } => "screenshot",
         Request::WaitForScreen { .. } => "wait_for_screen",
@@ -303,15 +307,46 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
             argv,
             admin,
             timeout_s,
+            stdin,
         } => {
             let limit = timeout_s.map_or(EXEC_DEFAULT_TIMEOUT, Duration::from_secs);
-            let out = m.exec(&name, &argv, admin, limit).await?;
+            let stdin = stdin.as_deref().map(str::as_bytes);
+            let out = m.exec(&name, &argv, admin, limit, stdin).await?;
             json!(ExecResult {
                 exit_code: out.exit_code,
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                 truncated: out.truncated,
             })
+        }
+        Request::FileRead {
+            name,
+            path,
+            offset,
+            max_bytes,
+            admin,
+        } => {
+            let max = usize::try_from(max_bytes.unwrap_or(api::FILE_READ_DEFAULT))?;
+            let (data, more) = m.file_read(&name, &path, offset, max, admin).await?;
+            let size = data.len() as u64;
+            json!(api::FileData {
+                data_base64: BASE64.encode(&data),
+                size,
+                more,
+            })
+        }
+        Request::FileWrite {
+            name,
+            path,
+            data_base64,
+            append,
+            admin,
+        } => {
+            let data = BASE64
+                .decode(&data_base64)
+                .context("data_base64 is not valid base64")?;
+            m.file_write(&name, &path, &data, append, admin).await?;
+            json!({"bytes": data.len()})
         }
         Request::Rm { name } => {
             m.remove(&name).await?;
@@ -394,8 +429,7 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
 /// A screenshot as response data. Built by hand so the multi-MiB base64
 /// string is moved, not copied, into the JSON value.
 fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
-    use base64::Engine;
-    let png_base64 = base64::engine::general_purpose::STANDARD.encode(&shot.png);
+    let png_base64 = BASE64.encode(&shot.png);
     drop(shot.png);
     let mut v = json!({"width": shot.width, "height": shot.height});
     v["png_base64"] = Value::String(png_base64);

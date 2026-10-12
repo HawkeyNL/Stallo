@@ -64,6 +64,31 @@ pub enum Request {
         argv: Vec<String>,
         admin: bool,
         timeout_s: Option<u64>,
+        /// Text for the command's standard input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin: Option<String>,
+    },
+    /// Reads part of a guest file: up to `max_bytes` (default 1 MiB, at
+    /// most 16 MiB) from `offset`.
+    FileRead {
+        name: String,
+        path: String,
+        #[serde(default)]
+        offset: u64,
+        max_bytes: Option<u64>,
+        #[serde(default)]
+        admin: bool,
+    },
+    /// Writes a guest file (or appends to it). Requests are capped at
+    /// 1 MiB, so larger files go in appended chunks.
+    FileWrite {
+        name: String,
+        path: String,
+        data_base64: String,
+        #[serde(default)]
+        append: bool,
+        #[serde(default)]
+        admin: bool,
     },
     Rm {
         name: String,
@@ -191,6 +216,22 @@ pub struct ScreenResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,
 }
+
+/// Part of a guest file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileData {
+    pub data_base64: String,
+    /// Bytes in `data_base64`.
+    pub size: u64,
+    /// The file goes on past this part.
+    pub more: bool,
+}
+
+/// Default `max_bytes` of a file read (the largest is 16 MiB - 1).
+pub const FILE_READ_DEFAULT: u64 = 1 << 20;
+/// Raw bytes per `file_write` request: base64 of this plus the envelope
+/// stays under [`MAX_REQUEST`].
+pub const FILE_WRITE_CHUNK: usize = 512 << 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageInfo {

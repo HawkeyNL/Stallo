@@ -38,6 +38,11 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(300);
 pub const EXEC_OUTPUT_CAP: usize = 1 << 20;
 pub const EXEC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const EXEC_MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Largest file chunk read or written in one call. QGA captures at most
+/// 16 MiB of output, and a read asks for one byte more to see whether the
+/// file goes on.
+pub const FILE_MAX: usize = (16 << 20) - 1;
+const FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a guest command waits for the one before it to finish.
 const QGA_BUSY_WAIT: Duration = Duration::from_secs(30);
 /// Largest screendump read back from QEMU. The guest picks the resolution,
@@ -655,16 +660,17 @@ impl Manager {
         vm.send_key(&keys, CHORD_HOLD).await
     }
 
-    /// Runs `argv` in the guest. Without `admin` it runs as the guest user.
-    /// Only one guest command runs per VM at a time.
+    /// Runs `argv` in the guest with `stdin` as its input. Without `admin`
+    /// it runs as the guest user. Only one guest command runs per VM at a
+    /// time.
     pub async fn exec(
         &self,
         name: &str,
         argv: &[String],
         admin: bool,
         limit: Duration,
+        stdin: Option<&[u8]>,
     ) -> Result<ExecOutput> {
-        self.check_exists(name)?;
         ensure!(!argv.is_empty(), "nothing to run");
         ensure!(
             limit >= Duration::from_secs(1),
@@ -674,9 +680,20 @@ impl Manager {
             limit <= EXEC_MAX_TIMEOUT,
             "timeout is at most {EXEC_MAX_TIMEOUT:?}"
         );
-        let vm = self
-            .running(name)
-            .with_context(|| format!("{name} is not running"))?;
+        self.run_guest(name, argv, admin, limit, EXEC_OUTPUT_CAP, stdin)
+            .await
+    }
+
+    async fn run_guest(
+        &self,
+        name: &str,
+        argv: &[String],
+        admin: bool,
+        limit: Duration,
+        cap: usize,
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecOutput> {
+        let vm = self.running_vm(name)?;
         let (path, args) = guest_command(argv, admin, limit);
         // One guest-agent operation per VM at a time; do not queue forever.
         let _qga = tokio::time::timeout(QGA_BUSY_WAIT, vm.qga_lock.lock())
@@ -684,13 +701,57 @@ impl Manager {
             .map_err(|_| anyhow::anyhow!("{name} is busy with another guest command"))?;
         let mut qga = Qga::connect(&vm.qga_sock, Duration::from_secs(5)).await?;
         let started = Instant::now();
-        let out = qga.exec(&path, &args, limit, EXEC_OUTPUT_CAP).await?;
+        let out = qga.exec(&path, &args, stdin, limit, cap).await?;
         // The scope's SIGKILL shows up as signal 9.
         ensure!(
             !(out.exit_code == 137 && started.elapsed() >= limit),
             "command timed out after {limit:?} and was killed"
         );
         Ok(out)
+    }
+
+    /// Reads up to `max` bytes of the guest file `path` from `offset`, as the
+    /// guest user unless `admin`. Returns the bytes and whether the file
+    /// goes on.
+    pub async fn file_read(
+        &self,
+        name: &str,
+        path: &str,
+        offset: u64,
+        max: usize,
+        admin: bool,
+    ) -> Result<(Vec<u8>, bool)> {
+        ensure!(
+            (1..=FILE_MAX).contains(&max),
+            "max_bytes must be between 1 and {FILE_MAX}"
+        );
+        let argv = file_read_argv(path, offset, max)?;
+        let out = self
+            .run_guest(name, &argv, admin, FILE_TIMEOUT, max + 1, None)
+            .await?;
+        file_status(&out, "read", path)?;
+        Ok(split_more(out.stdout, max))
+    }
+
+    /// Writes `data` to the guest file `path` (replacing it, or appending),
+    /// as the guest user unless `admin`.
+    pub async fn file_write(
+        &self,
+        name: &str,
+        path: &str,
+        data: &[u8],
+        append: bool,
+        admin: bool,
+    ) -> Result<()> {
+        ensure!(
+            data.len() <= FILE_MAX,
+            "at most {FILE_MAX} bytes per write; append the rest"
+        );
+        let argv = file_write_argv(path, append)?;
+        let out = self
+            .run_guest(name, &argv, admin, FILE_TIMEOUT, 4096, Some(data))
+            .await?;
+        file_status(&out, "write", path)
     }
 }
 
@@ -991,6 +1052,70 @@ fn button_name(b: Button) -> &'static str {
 
 fn btn(button: &str, down: bool) -> Value {
     serde_json::json!({"type": "btn", "data": {"button": button, "down": down}})
+}
+
+/// Checks a guest path: absolute, no NUL (QGA passes C strings), bounded.
+fn check_guest_path(path: &str) -> Result<()> {
+    ensure!(path.len() <= 4096, "guest path is longer than 4096 bytes");
+    ensure!(!path.contains('\0'), "guest path contains a NUL byte");
+    ensure!(
+        path.starts_with('/'),
+        "guest path must be absolute: {path:?}"
+    );
+    Ok(())
+}
+
+/// `dd` reads `max + 1` bytes from `offset`, so the caller sees whether
+/// the file goes on. One program, no shell: the path is a single argument.
+fn file_read_argv(path: &str, offset: u64, max: usize) -> Result<Vec<String>> {
+    check_guest_path(path)?;
+    Ok(vec![
+        "dd".into(),
+        format!("if={path}"),
+        "bs=4M".into(),
+        "iflag=skip_bytes,count_bytes,fullblock".into(),
+        format!("skip={offset}"),
+        format!("count={}", max + 1),
+        "status=none".into(),
+    ])
+}
+
+/// `dd` writes its stdin to `path`, truncating it unless `append`.
+fn file_write_argv(path: &str, append: bool) -> Result<Vec<String>> {
+    check_guest_path(path)?;
+    let mut argv = vec!["dd".into(), format!("of={path}"), "bs=4M".into()];
+    if append {
+        argv.extend(["oflag=append".into(), "conv=notrunc".into()]);
+    }
+    argv.push("status=none".into());
+    Ok(argv)
+}
+
+/// `max + 1` bytes were asked for: whether the file goes on, and the
+/// data cut to `max`.
+fn split_more(mut data: Vec<u8>, max: usize) -> (Vec<u8>, bool) {
+    let more = data.len() > max;
+    data.truncate(max);
+    (data, more)
+}
+
+/// Turns a failed `dd` into "cannot read <path>: <its last error line>".
+/// The line comes from the guest: control characters are dropped and it is
+/// cut to 200 characters.
+fn file_status(out: &ExecOutput, what: &str, path: &str) -> Result<()> {
+    if out.exit_code == 0 {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+    let reason: String = last
+        .unwrap_or("failed")
+        .trim_start_matches("dd: ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    bail!("cannot {what} {}: {reason}", path.escape_debug())
 }
 
 /// QEMU's own memory on top of guest RAM: `max(minimum, memory / 16)`.
@@ -1317,6 +1442,37 @@ mod tests {
         assert!(err.to_string().contains("paused"), "{err}");
         assert!(vm.mouse_move(1, 1).await.is_err());
         assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_commands() {
+        assert_eq!(
+            file_read_argv("/etc/a b", 5, 10).unwrap().join(" "),
+            "dd if=/etc/a b bs=4M iflag=skip_bytes,count_bytes,fullblock skip=5 count=11 status=none"
+        );
+        assert_eq!(
+            file_write_argv("/tmp/x", false).unwrap().join(" "),
+            "dd of=/tmp/x bs=4M status=none"
+        );
+        assert_eq!(
+            file_write_argv("/tmp/x", true).unwrap().join(" "),
+            "dd of=/tmp/x bs=4M oflag=append conv=notrunc status=none"
+        );
+        for bad in ["relative", "", "/a\0b", &format!("/{}", "a".repeat(4096))] {
+            assert!(file_read_argv(bad, 0, 1).is_err(), "{bad:?}");
+            assert!(file_write_argv(bad, false).is_err(), "{bad:?}");
+        }
+        let failed = ExecOutput {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"dd: failed to open '/x': Permission denied\n".to_vec(),
+            truncated: false,
+        };
+        let err = file_status(&failed, "read", "/x").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "cannot read /x: failed to open '/x': Permission denied"
+        );
     }
 
     #[test]
