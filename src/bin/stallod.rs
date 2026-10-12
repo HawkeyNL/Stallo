@@ -388,6 +388,19 @@ async fn dispatch(m: &Arc<Manager>, via: Via, request: Request) -> Result<Value>
             m.file_write(&name, &path, &data, append, admin).await?;
             json!({"bytes": data.len()})
         }
+        Request::Info { name } => {
+            let vm = info(m, &m.load(&name)?).await;
+            let (addresses, disk_used_bytes) = m.details(&name).await?;
+            json!(api::VmDetails {
+                vm,
+                addresses,
+                disk_used_bytes
+            })
+        }
+        Request::Reset { name } => {
+            m.reset(&name).await?;
+            Value::Null
+        }
         Request::Rm { name } => {
             m.remove(&name).await?;
             Value::Null

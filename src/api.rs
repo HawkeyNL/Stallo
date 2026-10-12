@@ -93,6 +93,14 @@ pub enum Request {
     Rm {
         name: String,
     },
+    /// A VM with its guest IP addresses and disk use.
+    Info {
+        name: String,
+    },
+    /// Hardware reset.
+    Reset {
+        name: String,
+    },
     Screenshot {
         name: String,
     },
@@ -193,6 +201,18 @@ pub struct VmInfo {
     pub agent_control: bool,
 }
 
+/// `info`: a VM plus what only a running guest or the disk can tell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmDetails {
+    #[serde(flatten)]
+    pub vm: VmInfo,
+    /// `(interface, address/prefix)`; empty when stopped, `None` when the
+    /// guest agent is busy or does not answer.
+    pub addresses: Option<Vec<(String, String)>>,
+    /// Host disk space the VM's disk uses (its overlay, not the base).
+    pub disk_used_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewResult {
     pub vm: VmInfo,
@@ -272,6 +292,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | FileRead { name, .. }
         | FileWrite { name, .. }
         | Screenshot { name }
+        | Info { name }
+        | Reset { name }
         | WaitForScreen { name, .. }
         | MouseMove { name, .. }
         | Click { name, .. }

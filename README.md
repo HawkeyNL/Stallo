@@ -63,6 +63,28 @@ systemd-run --user --unit=stallod-dev -p Delegate=yes -p CPUWeight=50 \
 Dev mode is not a security boundary against other processes of your own
 user: they can reach the daemon socket just like `stallo` can.
 
+## Agents (MCP)
+
+`stallo mcp` is an MCP server on stdin/stdout. Register it with Claude Code
+for your user:
+
+```sh
+stallo mcp install    # runs `claude mcp add --scope user stallo -- <stallo> mcp`
+```
+
+Without `claude` on `PATH` it prints the JSON for other MCP clients.
+Agents may only control VMs where you turned agent control on:
+
+```sh
+stallo agent dev on
+```
+
+Tools: `vm_list`, `vm_info`, `vm_create` (only with `agents_can_create =
+true` in `stallod.toml`), `vm_start`, `vm_stop`, `vm_reset`, `screenshot`,
+`wait_for_screen`, `mouse_move`, `click`, `drag`, `scroll`, `type_text`,
+`key`, `exec`, `file_read`, `file_write`. There is no delete tool. Every
+call is logged in `<data>/audit/`; see SECURITY.md.
+
 ## Licence
 
 Licence: to be decided.

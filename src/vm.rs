@@ -443,6 +443,30 @@ impl Manager {
         host::admit(&self.host()?, &ask, &self.config.host)
     }
 
+    /// The guest's IP addresses (from the guest agent; `None` if it is busy
+    /// or does not answer) and the disk space the VM's disk uses on the host.
+    pub async fn details(&self, name: &str) -> Result<(Option<Vec<(String, String)>>, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        self.check_exists(name)?;
+        let disk =
+            fs::metadata(self.paths.vm_dir(name).join(qemu::DISK)).map_or(0, |m| m.blocks() * 512);
+        let ips = match self.running(name) {
+            // Not behind a long exec: ask only if the agent is free.
+            Some(vm) => vm.addresses().await.ok(),
+            None => Some(Vec::new()),
+        };
+        Ok((ips, disk))
+    }
+
+    /// Resets the VM like a hardware reset button.
+    pub async fn reset(&self, name: &str) -> Result<()> {
+        self.running_vm(name)?
+            .qmp
+            .execute("system_reset", None)
+            .await?;
+        Ok(())
+    }
+
     /// Turns agent control of a VM on or off (stored in `vm.toml`).
     pub async fn set_agent(&self, name: &str, on: bool) -> Result<()> {
         self.check_exists(name)?;
@@ -926,6 +950,12 @@ impl Running {
             .context("cannot take a screenshot")?;
         // Off the async workers: a read of up to MAX_SCREEN_BYTES.
         tokio::task::spawn_blocking(move || take_capped(&path, MAX_SCREEN_BYTES)).await?
+    }
+
+    async fn addresses(&self) -> Result<Vec<(String, String)>> {
+        let _qga = tokio::time::timeout(Duration::from_millis(100), self.qga_lock.lock()).await?;
+        let mut qga = Qga::connect(&self.qga_sock, Duration::from_secs(2)).await?;
+        qga.addresses().await
     }
 
     async fn ping(&self) -> Result<()> {

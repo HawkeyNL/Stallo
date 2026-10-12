@@ -107,6 +107,8 @@ pub fn describe(r: &Request) -> Described<'_> {
             )
         }
         Request::Rm { name } => ("rm", Some(name), vec![], None),
+        Request::Info { name } => ("info", Some(name), vec![], None),
+        Request::Reset { name } => ("reset", Some(name), vec![], None),
         Request::Screenshot { name } => ("screenshot", Some(name), vec![], None),
         Request::WaitForScreen { name, .. } => ("wait_for_screen", Some(name), vec![], None),
         Request::MouseMove { name, .. } => ("mouse_move", Some(name), vec![], None),

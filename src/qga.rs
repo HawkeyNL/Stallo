@@ -194,6 +194,42 @@ impl Qga {
         unwrap_reply(serde_json::from_slice(&self.line)?).with_context(|| format!("QGA {command}"))
     }
 
+    /// The guest's IP addresses with their interface names, e.g.
+    /// `("lo", "127.0.0.1/8")`. Guest data: only valid addresses, names cut
+    /// to 15 bytes (IFNAMSIZ), at most 64 entries.
+    pub async fn addresses(&mut self) -> Result<Vec<(String, String)>> {
+        #[derive(Deserialize)]
+        struct Iface {
+            name: String,
+            #[serde(rename = "ip-addresses", default)]
+            ips: Vec<Ip>,
+        }
+        #[derive(Deserialize)]
+        struct Ip {
+            #[serde(rename = "ip-address")]
+            addr: String,
+            prefix: Option<u64>,
+        }
+        let ifaces: Vec<Iface> = self.call("guest-network-get-interfaces", json!({})).await?;
+        Ok(ifaces
+            .into_iter()
+            .flat_map(|i| {
+                let name: String = i
+                    .name
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic())
+                    .take(15)
+                    .collect();
+                i.ips.into_iter().filter_map(move |ip| {
+                    let addr: std::net::IpAddr = ip.addr.parse().ok()?;
+                    let prefix = ip.prefix.filter(|&p| p <= 128)?;
+                    Some((name.clone(), format!("{addr}/{prefix}")))
+                })
+            })
+            .take(64)
+            .collect())
+    }
+
     pub async fn ping(&mut self) -> Result<()> {
         self.call::<IgnoredAny>("guest-ping", json!({}))
             .await
@@ -338,6 +374,39 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn lists_addresses() {
+        let (_d, path) = fake(b"", |_| {
+            Some(
+                json!({"return": [
+                    {"name": "lo", "ip-addresses": [
+                        {"ip-address": "127.0.0.1", "ip-address-type": "ipv4", "prefix": 8},
+                        {"ip-address": "::1", "ip-address-type": "ipv6", "prefix": 128}]},
+                    {"name": "eth0"},
+                    {"name": "evil\u{1b}[2Jname-that-is-far-too-long", "ip-addresses": [
+                        {"ip-address": "not an ip", "prefix": 8},
+                        {"ip-address": "10.0.0.2", "prefix": 300},
+                        {"ip-address": "10.0.0.3", "prefix": 24}]}
+                ]})
+                .to_string()
+                .into_bytes()
+                .into_iter()
+                .chain(*b"\n")
+                .collect(),
+            )
+        })
+        .await;
+        let mut qga = Qga::connect(&path, WAIT).await.unwrap();
+        assert_eq!(
+            qga.addresses().await.unwrap(),
+            [
+                ("lo".to_owned(), "127.0.0.1/8".to_owned()),
+                ("lo".to_owned(), "::1/128".to_owned()),
+                ("evil[2Jname-tha".to_owned(), "10.0.0.3/24".to_owned())
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn sync_skips_stale_bytes_then_pings() {

@@ -100,13 +100,24 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Serve the agent tools over MCP on stdin/stdout.
-    Mcp,
+    /// Serve the agent tools over MCP on stdin/stdout, or register them
+    /// with Claude Code (`stallo mcp install`).
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpCmd>,
+    },
     /// List images, or download one.
     Images {
         #[command(subcommand)]
         action: Option<ImagesCmd>,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Add `stallo mcp` to Claude Code's user config (`claude mcp add`), or
+    /// print the JSON for other MCP clients if `claude` is not installed.
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -134,7 +145,7 @@ const STALLO_ERROR: u8 = 125;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // stdout is the MCP channel for `stallo mcp`: errors go to stderr.
-    let json = cli.json && !matches!(cli.command, Cmd::Mcp);
+    let json = cli.json && !matches!(cli.command, Cmd::Mcp { action: None });
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -161,10 +172,10 @@ fn fail(e: &anyhow::Error, json: bool) -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    let socket = match cli
+    let explicit_socket = cli
         .socket
-        .or_else(|| std::env::var_os("STALLO_SOCKET").map(PathBuf::from))
-    {
+        .or_else(|| std::env::var_os("STALLO_SOCKET").map(PathBuf::from));
+    let socket = match explicit_socket.clone() {
         Some(s) => s,
         None => stallo::paths::Paths::dev()?.api_socket(),
     };
@@ -327,7 +338,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{vm}  removed");
             }
         }
-        Cmd::Mcp => stallo::mcp::serve_stdio(socket).await?,
+        Cmd::Mcp { action: None } => stallo::mcp::serve_stdio(socket).await?,
+        Cmd::Mcp {
+            action: Some(McpCmd::Install),
+        } => {
+            let exe = std::env::current_exe()?;
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            // Claude Code starts the server from a project directory.
+            let socket = explicit_socket.map(std::path::absolute).transpose()?;
+            print!("{}", mcp_install(&exe, socket.as_deref(), &path)?);
+        }
         Cmd::Images { action } => {
             let request = match action {
                 None => Request::Images,
@@ -346,6 +366,54 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The arguments `stallo mcp` needs: `[--socket <path>] mcp`.
+fn mcp_args(socket: Option<&std::path::Path>) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    if let Some(s) = socket {
+        args.extend(["--socket".into(), s.as_os_str().to_owned()]);
+    }
+    args.push("mcp".into());
+    args
+}
+
+/// Registers `stallo mcp` with Claude Code for this user when `claude` is
+/// on `path`; otherwise returns the JSON snippet for any MCP client.
+fn mcp_install(
+    exe: &std::path::Path,
+    socket: Option<&std::path::Path>,
+    path: &std::ffi::OsStr,
+) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+    // Only absolute PATH entries: an empty or relative one would run a
+    // `claude` from the current directory.
+    let claude = std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join("claude"))
+        .find(|c| {
+            std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+    let Some(claude) = claude else {
+        let args: Vec<String> = mcp_args(socket)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let snippet = serde_json::json!({"mcpServers": {"stallo": {
+            "command": exe, "args": args}}});
+        return Ok(format!(
+            "claude is not installed; add this to your MCP client's config:\n{}\n",
+            serde_json::to_string_pretty(&snippet)?
+        ));
+    };
+    let status = std::process::Command::new(&claude)
+        .args(["mcp", "add", "--scope", "user", "stallo", "--"])
+        .arg(exe)
+        .args(mcp_args(socket))
+        .status()
+        .with_context(|| format!("cannot run {}", claude.display()))?;
+    ensure!(status.success(), "claude mcp add failed ({status})");
+    Ok("stallo is now an MCP server in Claude Code (user scope)\n".to_owned())
 }
 
 /// `vm:/abs/path` names a guest file; anything else is a host path.
@@ -673,6 +741,84 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
             "no .part left"
+        );
+    }
+
+    /// Uses a fake `claude` in a temporary PATH: the real Claude Code
+    /// config is never touched.
+    #[test]
+    fn mcp_install_uses_claude_or_prints_json() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let exe = std::path::Path::new("/opt/stallo/bin/stallo");
+
+        let out = mcp_install(exe, None, bin.as_os_str()).unwrap();
+        assert!(out.contains("not installed"), "{out}");
+        let json = &out[out.find('{').unwrap()..];
+        let v: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            v["mcpServers"]["stallo"]["command"],
+            "/opt/stallo/bin/stallo"
+        );
+        assert_eq!(
+            v["mcpServers"]["stallo"]["args"],
+            serde_json::json!(["mcp"])
+        );
+
+        let log = dir.path().join("args");
+        let fake = bin.join("claude");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sock = std::path::Path::new("/run/x/api.sock");
+        // A script just written can be "busy" if another test thread forked
+        // meanwhile (ETXTBSY): retry.
+        let run = |sock| {
+            for _ in 0..20 {
+                match mcp_install(exe, sock, bin.as_os_str()) {
+                    Err(e) if format!("{e:#}").contains("busy") => {
+                        std::thread::sleep(std::time::Duration::from_millis(50))
+                    }
+                    r => return r,
+                }
+            }
+            panic!("text file stays busy")
+        };
+        run(Some(sock)).unwrap();
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "mcp",
+                "add",
+                "--scope",
+                "user",
+                "stallo",
+                "--",
+                "/opt/stallo/bin/stallo",
+                "--socket",
+                "/run/x/api.sock",
+                "mcp"
+            ]
+        );
+
+        std::fs::write(&fake, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(run(None).is_err());
+
+        // A relative PATH entry is never searched; a non-executable file is
+        // not a program.
+        let out = mcp_install(exe, None, std::ffi::OsStr::new("bin:.")).unwrap();
+        assert!(out.contains("not installed"));
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            mcp_install(exe, None, bin.as_os_str())
+                .unwrap()
+                .contains("not installed")
         );
     }
 
