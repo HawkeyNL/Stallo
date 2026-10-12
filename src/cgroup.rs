@@ -107,6 +107,15 @@ impl Cgroups {
         Ok(dir)
     }
 
+    /// Kills every process in `vm-<name>`; the process owner reaps them and
+    /// removes the cgroup.
+    pub fn kill_vm(&self, name: &str) -> Result<()> {
+        match fs::write(self.vm_dir(name).join("cgroup.kill"), b"1") {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r.with_context(|| format!("cannot kill cgroup vm-{name}")),
+        }
+    }
+
     /// Kills every process in `vm-<name>` and removes the cgroup.
     pub async fn remove_vm(&self, name: &str) -> Result<()> {
         kill_and_remove(&self.vm_dir(name)).await

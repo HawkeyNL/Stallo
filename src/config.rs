@@ -195,7 +195,10 @@ pub struct HostConfig {
     /// Free space on the data filesystem that VMs may never eat into, in GiB.
     pub disk_floor_gib: u64,
     /// Minimum QEMU overhead on top of guest RAM, in MiB. The cgroup gets
-    /// `memory.max = memory + max(this, memory / 16)`.
+    /// `memory.max = memory + max(this, memory / 16)`. Measured on Ubuntu
+    /// 26.04 / QEMU 10.2 with a 2 GiB guest: QEMU's own RSS is about 60 MiB
+    /// and the cgroup peaked 241 MiB above the resident guest RAM, page
+    /// cache and kernel memory included.
     pub qemu_overhead_mib: u64,
 }
 

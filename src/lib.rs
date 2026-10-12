@@ -8,8 +8,10 @@ pub mod config;
 pub mod images;
 pub mod paths;
 pub mod qemu;
+pub mod qga;
 pub mod qmp;
 pub mod seed;
+pub mod vm;
 
 use std::process::Stdio;
 use std::time::Duration;
