@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
-use crate::{confine, images, qemu, seed};
+use crate::{confine, images, input, qemu, seed};
 
 /// Graceful power-off budget before QEMU is told to quit.
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -40,6 +40,26 @@ pub const EXEC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const EXEC_MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 /// How long a guest command waits for the one before it to finish.
 const QGA_BUSY_WAIT: Duration = Duration::from_secs(30);
+/// Largest screendump read back from QEMU. The guest picks the resolution,
+/// but bochs-display has 16 MiB of video memory: at most 4 Mi pixels at
+/// 32 bpp, a 12 MiB PPM. (A 16 bpp mode with more pixels exceeds this and
+/// only fails that VM's own screen tools.)
+const MAX_SCREEN_BYTES: u64 = 16 << 20;
+/// Screendumps read at once across all VMs, to bound daemon memory.
+static SCREENS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// `wait_for_screen` compares frames this often.
+const SCREEN_POLL: Duration = Duration::from_millis(250);
+pub const SCREEN_DEFAULT_STABLE: Duration = Duration::from_millis(1000);
+pub const SCREEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const SCREEN_MAX_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A screenshot as PNG, with the size from its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Screenshot {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// What a new VM looks like.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +78,9 @@ pub struct Running {
     pub pid: u32,
     pub qmp: Qmp,
     qga_sock: PathBuf,
+    rt_dir: PathBuf,
+    /// One screendump at a time (they share files).
+    screen_lock: tokio::sync::Mutex<()>,
     /// One guest-agent operation at a time.
     qga_lock: tokio::sync::Mutex<()>,
     /// Paused by the disk watchdog.
@@ -258,6 +281,14 @@ impl Manager {
         let rt_dir = self.paths.vm_runtime_dir(name);
         safe_remove(&self.paths.runtime, &rt_dir)?;
         ensure_private_dir(&rt_dir)?;
+        // QEMU may only overwrite these (confine.rs), never create files.
+        for f in qemu::SCREEN_FILES {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(rt_dir.join(f))?;
+        }
         let argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
 
         // Held until the VM is registered as running, so concurrent starts
@@ -329,6 +360,8 @@ impl Manager {
             pid,
             qmp,
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
+            rt_dir: rt_dir.clone(),
+            screen_lock: tokio::sync::Mutex::new(()),
             qga_lock: tokio::sync::Mutex::new(()),
             disk_full: AtomicBool::new(false),
             exited: rx,
@@ -516,6 +549,41 @@ impl Manager {
         Ok(())
     }
 
+    fn running_vm(&self, name: &str) -> Result<Arc<Running>> {
+        self.check_exists(name)?;
+        self.running(name)
+            .with_context(|| format!("{name} is not running; start it with `stallo start {name}`"))
+    }
+
+    /// The guest screen as PNG.
+    pub async fn screenshot(&self, name: &str) -> Result<Screenshot> {
+        self.running_vm(name)?.screenshot().await
+    }
+
+    /// Waits until the screen has not changed for `stable`, at most
+    /// `limit`, and returns it. `false` means it never settled; the last
+    /// screen is returned anyway.
+    pub async fn wait_for_screen(
+        &self,
+        name: &str,
+        stable: Duration,
+        limit: Duration,
+    ) -> Result<(Screenshot, bool)> {
+        ensure!(
+            (SCREEN_POLL..=Duration::from_secs(60)).contains(&stable),
+            "stable_ms must be between 250 and 60000"
+        );
+        ensure!(
+            (stable..=SCREEN_MAX_TIMEOUT).contains(&limit),
+            "timeout_ms must be between stable_ms and 300000"
+        );
+        // The returned PNG is taken after the screen settled; on a screen
+        // that keeps changing it can differ from the last compared frame.
+        let vm = self.running_vm(name)?;
+        let settled = settle(|| vm.screendump("screen.ppm", "ppm"), stable, limit).await?;
+        Ok((vm.screenshot().await?, settled))
+    }
+
     /// Runs `argv` in the guest. Without `admin` it runs as the guest user.
     /// Only one guest command runs per VM at a time.
     pub async fn exec(
@@ -556,6 +624,28 @@ impl Manager {
 }
 
 impl Running {
+    async fn screenshot(&self) -> Result<Screenshot> {
+        let png = self.screendump("screen.png", "png").await?;
+        let (width, height) = input::png_size(&png)?;
+        Ok(Screenshot { png, width, height })
+    }
+
+    /// Has QEMU write the screen to `<rt>/<file>` and reads it back.
+    async fn screendump(&self, file: &str, format: &str) -> Result<Vec<u8>> {
+        let _screen = self.screen_lock.lock().await;
+        let _slot = SCREENS.acquire().await?;
+        let path = self.rt_dir.join(file);
+        self.qmp
+            .execute(
+                "screendump",
+                Some(serde_json::json!({"filename": path, "format": format})),
+            )
+            .await
+            .context("cannot take a screenshot")?;
+        // Off the async workers: a read of up to MAX_SCREEN_BYTES.
+        tokio::task::spawn_blocking(move || take_capped(&path, MAX_SCREEN_BYTES)).await?
+    }
+
     async fn ping(&self) -> Result<()> {
         let _qga = self.qga_lock.lock().await;
         let mut qga = Qga::connect(&self.qga_sock, Duration::from_secs(2)).await?;
@@ -592,6 +682,87 @@ impl Running {
     pub async fn status(&self) -> Result<String> {
         let v: Value = self.qmp.execute("query-status", None).await?;
         Ok(v["status"].as_str().unwrap_or("unknown").to_owned())
+    }
+}
+
+/// Reads a file that untrusted QEMU wrote, then empties it (it lives on
+/// tmpfs, in RAM): never follows a link, never blocks on a FIFO, accepts
+/// only a regular file of at most `cap` bytes.
+fn take_capped(path: &Path, cap: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let meta = f.metadata()?;
+    ensure!(meta.is_file(), "{} is not a file", path.display());
+    let mut data = Vec::with_capacity(meta.len().min(cap) as usize + 1);
+    (&mut f).take(cap + 1).read_to_end(&mut data)?;
+    f.set_len(0)?;
+    ensure!(
+        data.len() as u64 <= cap,
+        "screenshot is larger than {cap} bytes"
+    );
+    Ok(data)
+}
+
+/// Pixels that may change between "equal" frames: a blinking text cursor
+/// (a block of up to 16x32 pixels) must not keep a screen unsettled.
+// ponytail: fixed threshold; make it a parameter if GUIs with animations
+// need more.
+const FLICKER_PIXELS: usize = 1024;
+
+/// Whether two PPM frames differ in at most [`FLICKER_PIXELS`] pixels.
+fn nearly_equal(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(a), Some(b)) = (ppm_pixels(a), ppm_pixels(b)) else {
+        return false;
+    };
+    a.len() == b.len()
+        && a.chunks(3)
+            .zip(b.chunks(3))
+            .filter(|(x, y)| x != y)
+            .take(FLICKER_PIXELS + 1)
+            .count()
+            <= FLICKER_PIXELS
+}
+
+/// The pixel bytes of a PPM: after "P6", width, height and maxval, each
+/// followed by a newline (as QEMU writes it).
+fn ppm_pixels(f: &[u8]) -> Option<&[u8]> {
+    let mut newlines = f.iter().enumerate().filter(|(_, b)| **b == b'\n');
+    newlines.nth(2).map(|(i, _)| &f[i + 1..])
+}
+
+/// Polls `frame` (250 ms between frames) until the frames stay nearly equal
+/// to one reference frame for `stable` (true) or `limit` passes (false).
+/// A blinking cursor is ignored; slow changes add up against the reference.
+async fn settle<F, Fut>(mut frame: F, stable: Duration, limit: Duration) -> Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    use tokio::time::Instant;
+    let started = Instant::now();
+    let mut reference = frame().await?;
+    let mut since = Instant::now();
+    loop {
+        if since.elapsed() >= stable {
+            return Ok(true);
+        }
+        if started.elapsed() >= limit {
+            return Ok(false);
+        }
+        tokio::time::sleep(SCREEN_POLL).await;
+        let next = frame().await?;
+        if !nearly_equal(&next, &reference) {
+            reference = next;
+            since = Instant::now();
+        }
     }
 }
 
@@ -642,6 +813,116 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 64x64 PPM filled with `fill`, with the first `marked` pixels white.
+    fn ppm(fill: u8, marked: usize) -> Vec<u8> {
+        let mut f = b"P6\n64 64\n255\n".to_vec();
+        let start = f.len();
+        f.resize(start + 3 * 4096, fill);
+        f[start..start + 3 * marked].fill(255);
+        f
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screen_settles_or_times_out() {
+        use tokio::time::Instant;
+        let ms = Duration::from_millis;
+        // Changes for the first 4 frames (1 s), then stays the same.
+        let mut n = 0u8;
+        let changing_then_still = || {
+            n += 1;
+            let frame = ppm(n.min(4), 0);
+            async move { Ok(frame) }
+        };
+        let t = Instant::now();
+        assert!(
+            settle(changing_then_still, ms(1000), ms(5000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            (ms(1750)..=ms(2250)).contains(&t.elapsed()),
+            "{:?}",
+            t.elapsed()
+        );
+
+        let mut n = 0u8;
+        let always_changing = || {
+            n = n.wrapping_add(1);
+            let frame = ppm(n, 0);
+            async move { Ok(frame) }
+        };
+        let t = Instant::now();
+        assert!(!settle(always_changing, ms(1000), ms(3000)).await.unwrap());
+        assert!(t.elapsed() <= ms(3250));
+
+        let failing = || async { Err(anyhow::anyhow!("gone")) };
+        assert!(settle(failing, ms(1000), ms(3000)).await.is_err());
+
+        // A blinking cursor (a few pixels toggling) counts as settled.
+        let mut n = 0usize;
+        let blinking = || {
+            n += 1;
+            let frame = ppm(0, if n.is_multiple_of(2) { 100 } else { 0 });
+            async move { Ok(frame) }
+        };
+        assert!(settle(blinking, ms(1000), ms(3000)).await.unwrap());
+
+        // Small steps that add up (slow output) are not settled.
+        let mut n = 0usize;
+        let creeping = || {
+            n += 1;
+            let frame = ppm(0, (n * 300).min(4096));
+            async move { Ok(frame) }
+        };
+        assert!(!settle(creeping, ms(1000), ms(3000)).await.unwrap());
+    }
+
+    #[test]
+    fn flicker_threshold() {
+        let a = ppm(0, 0);
+        assert!(nearly_equal(&a, &ppm(0, FLICKER_PIXELS)));
+        assert!(!nearly_equal(&a, &ppm(0, FLICKER_PIXELS + 1)));
+        assert!(!nearly_equal(&a, &a[..20]));
+        assert!(!nearly_equal(b"junk", b"junk2"));
+        assert!(nearly_equal(b"same", b"same"));
+        assert_eq!(ppm_pixels(&a).unwrap().len(), 3 * 4096);
+    }
+
+    #[test]
+    fn untrusted_screen_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("screen.png");
+        fs::write(&file, b"png").unwrap();
+        assert_eq!(take_capped(&file, 3).unwrap(), b"png");
+        assert_eq!(
+            fs::metadata(&file).unwrap().len(),
+            0,
+            "emptied after reading"
+        );
+        fs::write(&file, b"png!").unwrap();
+        assert!(take_capped(&file, 3).is_err());
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(take_capped(&link, 3).is_err());
+        let fifo = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            take_capped(&fifo, 3).is_err(),
+            "a FIFO neither blocks nor passes"
+        );
+        let sock = dir.path().join("sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(take_capped(&sock, 3).is_err());
+        assert!(take_capped(dir.path(), 3).is_err());
+    }
 
     #[test]
     fn overhead() {

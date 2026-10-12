@@ -21,7 +21,10 @@ use stallo::config::{DaemonConfig, VmConfig};
 use stallo::images;
 use stallo::paths::{Paths, safe_remove};
 use stallo::read_line;
-use stallo::vm::{EXEC_DEFAULT_TIMEOUT, Manager, NewVm, READY_TIMEOUT};
+use stallo::vm::{
+    EXEC_DEFAULT_TIMEOUT, Manager, NewVm, READY_TIMEOUT, SCREEN_DEFAULT_STABLE,
+    SCREEN_DEFAULT_TIMEOUT, Screenshot,
+};
 use tokio::net::unix::UCred;
 
 /// Most API connections served at once.
@@ -217,6 +220,8 @@ fn op_name(r: &Request) -> &'static str {
         Request::Stop { .. } => "stop",
         Request::Exec { .. } => "exec",
         Request::Rm { .. } => "rm",
+        Request::Screenshot { .. } => "screenshot",
+        Request::WaitForScreen { .. } => "wait_for_screen",
         Request::Resume { .. } => "resume",
         Request::Host => "host",
         Request::Images => "images",
@@ -306,6 +311,18 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
             m.remove(&name).await?;
             Value::Null
         }
+        Request::Screenshot { name } => screen(m.screenshot(&name).await?, None),
+        Request::WaitForScreen {
+            name,
+            stable_ms,
+            timeout_ms,
+        } => {
+            let stable = stable_ms.map_or(SCREEN_DEFAULT_STABLE, Duration::from_millis);
+            let limit =
+                timeout_ms.map_or(SCREEN_DEFAULT_TIMEOUT.max(stable), Duration::from_millis);
+            let (shot, settled) = m.wait_for_screen(&name, stable, limit).await?;
+            screen(shot, Some(settled))
+        }
         Request::Resume { name } => {
             m.resume(&name).await?;
             Value::Null
@@ -326,6 +343,20 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
             Value::Null
         }
     })
+}
+
+/// A screenshot as response data. Built by hand so the multi-MiB base64
+/// string is moved, not copied, into the JSON value.
+fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
+    use base64::Engine;
+    let png_base64 = base64::engine::general_purpose::STANDARD.encode(&shot.png);
+    drop(shot.png);
+    let mut v = json!({"width": shot.width, "height": shot.height});
+    v["png_base64"] = Value::String(png_base64);
+    if let Some(stable) = stable {
+        v["stable"] = stable.into();
+    }
+    v
 }
 
 /// A VM as `ls` shows it; the state comes from QEMU when it runs.

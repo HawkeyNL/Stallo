@@ -233,6 +233,20 @@ impl Daemon {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    /// Sends one API request (as `via`) and returns its data.
+    pub fn api(
+        &self,
+        via: stallo::api::Via,
+        request: stallo::api::Request,
+    ) -> anyhow::Result<serde_json::Value> {
+        let envelope = stallo::api::Envelope { via, request };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(stallo::api::call(&self.socket, &envelope))
+    }
+
     pub fn vm_cgroup(&self, vm: &str) -> PathBuf {
         self.cgroup.join(format!("vm-{vm}"))
     }

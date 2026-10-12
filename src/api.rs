@@ -67,6 +67,14 @@ pub enum Request {
     Rm {
         name: String,
     },
+    Screenshot {
+        name: String,
+    },
+    WaitForScreen {
+        name: String,
+        stable_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+    },
     Resume {
         name: String,
     },
@@ -133,6 +141,18 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
+}
+
+/// A screenshot: PNG as base64, with its size (coordinates for the input
+/// tools are pixels of this image).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenResult {
+    pub png_base64: String,
+    pub width: u32,
+    pub height: u32,
+    /// `wait_for_screen` only: whether the screen settled in time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

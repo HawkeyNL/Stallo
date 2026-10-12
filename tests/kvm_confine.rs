@@ -56,6 +56,9 @@ fn run(base: &Path, runtime: &Path) {
     for f in [qemu::VARS, qemu::SEED] {
         fs::write(own.join(f), b"").unwrap();
     }
+    for f in qemu::SCREEN_FILES {
+        fs::write(rt.join(f), b"").unwrap();
+    }
 
     let qmp_sock = rt.join(qemu::QMP_SOCK);
     let mut argv: Vec<String> = [

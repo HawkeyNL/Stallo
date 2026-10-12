@@ -28,6 +28,8 @@ pub const VARS: &str = "vars.qcow2";
 pub const SEED: &str = "seed.iso";
 pub const QMP_SOCK: &str = "qmp.sock";
 pub const QGA_SOCK: &str = "qga.sock";
+/// Screendumps; created by the daemon, written by QEMU.
+pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
 
 const WAIT_ONLINE: &str = "systemd-networkd-wait-online.service";
 

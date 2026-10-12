@@ -57,7 +57,7 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> 
     let rw_file = ReadFile | WriteFile;
     // qcow2 may shrink its files (snapshot delete, discard).
     let disk = rw_file | Truncate;
-    vec![
+    [
         // The binary, its libraries, firmware and option ROMs. /etc/localtime
         // links into /usr/share/zoneinfo.
         ("/usr".into(), read | Execute),
@@ -77,6 +77,14 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> 
         // removes it again at exit.
         (rt_dir.into(), MakeSock | RemoveFile),
     ]
+    .into_iter()
+    // Screendumps overwrite files the daemon created (no new files).
+    .chain(
+        crate::qemu::SCREEN_FILES
+            .iter()
+            .map(|f| (rt_dir.join(f), WriteFile | Truncate)),
+    )
+    .collect()
 }
 
 /// Builds the ruleset in the daemon, so the child only has to enforce it.
@@ -380,6 +388,7 @@ mod tests {
         }
         fs::write(&img, b"base").unwrap();
         fs::write(own.join("secret"), b"pw").unwrap();
+        screen_files(&rt);
         let rules = qemu_rules(&own, &rt, &img);
         let q = |p: &Path| format!("'{}'", p.display());
         let disk = |d: &Path| q(&d.join(crate::qemu::DISK));
@@ -395,6 +404,11 @@ mod tests {
             confined(&rules, &format!("echo y >> {}", disk(&own))),
             Some(true)
         );
+        let screen = q(&rt.join("screen.png"));
+        assert_eq!(
+            confined(&rules, &format!("echo png > {screen}")),
+            Some(true)
+        );
         for denied in [
             format!("cat {}", disk(&other)),
             format!("echo y >> {}", disk(&other)),
@@ -402,6 +416,8 @@ mod tests {
             format!("cat {}", q(&own.join("secret"))),
             format!("chmod 666 {}", disk(&other)),
             format!("chmod 666 {}", q(&rt)),
+            format!("echo x > {}", q(&rt.join("other.png"))),
+            format!("cat {screen}"),
             format!("touch {}", q(&own.join("new"))),
             format!("ls {}", q(&root)),
             "cat /sys/fs/cgroup/cgroup.controllers".to_owned(),
@@ -411,6 +427,15 @@ mod tests {
             assert_eq!(confined(&rules, &denied), Some(false), "{denied}");
         }
         assert_eq!(fs::read(other.join(crate::qemu::DISK)).unwrap(), b"x");
+
+        // QEMU may delete its screen files but never put a link, FIFO or
+        // new file in their place.
+        for swap in ["ln -s /etc/passwd", "mkfifo", "touch"] {
+            screen_files(&rt);
+            let script = format!("rm {screen} && {swap} {screen}");
+            assert_eq!(confined(&rules, &script), Some(false), "{script}");
+            assert!(!rt.join("screen.png").exists(), "{script}");
+        }
     }
 
     /// The seccomp part: no `connect`, no sockets but Unix streams, no
@@ -427,6 +452,7 @@ mod tests {
             fs::write(f, b"").unwrap();
         }
         fs::write(root.join("img"), b"").unwrap();
+        screen_files(&rt);
         // Stands in for the daemon's API socket or another VM's QMP socket.
         let api = root.join("api.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&api).unwrap();
@@ -475,6 +501,12 @@ assert libc.syscall(250, 0, 0) == -1 and ctypes.get_errno() == 1, "keyctl"
             .unwrap();
         assert!(!free.status.success());
         assert!(String::from_utf8_lossy(&free.stderr).contains("connect"));
+    }
+
+    fn screen_files(rt: &Path) {
+        for f in crate::qemu::SCREEN_FILES {
+            fs::write(rt.join(f), b"").unwrap();
+        }
     }
 
     fn qemu_rules_files(dir: &Path) -> Vec<PathBuf> {
