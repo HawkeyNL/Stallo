@@ -45,9 +45,11 @@ available.
 
 ```sh
 cargo build --release
-systemd-run --user --unit=stallod-dev -p Delegate=yes \
+systemd-run --user --unit=stallod-dev -p Delegate=yes -p CPUWeight=50 \
     "$PWD/target/release/stallod" --dev
 ```
+
+`CPUWeight=50` makes VMs yield CPU to other services under contention.
 
 Dev mode is not a security boundary against other processes of your own
 user: they can reach the daemon socket just like `stallo` can.

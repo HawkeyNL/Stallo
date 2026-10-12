@@ -3,6 +3,7 @@
 //! `stallod` (the daemon) owns every VM; `stallo` (the CLI) talks to it over
 //! a Unix socket.
 
+pub mod cgroup;
 pub mod config;
 pub mod images;
 pub mod paths;
@@ -58,6 +59,7 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(
 pub async fn run_tool(cmd: &mut Command, limit: Duration) -> anyhow::Result<Vec<u8>> {
     let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     cmd.stdin(Stdio::null()).kill_on_drop(true);
+    cgroup::confine_tool(cmd)?;
     let out = tokio::time::timeout(limit, cmd.output())
         .await
         .map_err(|_| anyhow::anyhow!("{program} timed out after {limit:?}"))?
