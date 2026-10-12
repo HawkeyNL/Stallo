@@ -45,6 +45,9 @@ and run the daemon as a transient `systemd-run --user` unit:
 STALLO_IT=1 cargo test -- --ignored --test-threads=1
 ```
 
+Add `--nocapture` to see the `MEASURE` lines (boot time, screenshot,
+click and exec latency, daemon memory); `tests/kvm_perf.rs` collects them.
+
 Run the daemon in dev mode (being built in milestone M0). Dev mode runs as
 your own user under your systemd user manager, with cgroup delegation so it
 can set per-VM limits. Data lives

@@ -123,6 +123,14 @@ impl Qga {
         .context("guest agent")
     }
 
+    /// Re-synchronises a connection kept from an earlier operation, so a
+    /// guest agent that restarted (or stale bytes) is noticed.
+    pub async fn resync(&mut self, wait: Duration) -> Result<()> {
+        timeout(wait, self.sync())
+            .await
+            .map_err(|_| anyhow!("guest agent did not answer within {wait:?}"))?
+    }
+
     async fn sync(&mut self) -> Result<()> {
         let id = u64::from_ne_bytes(crate::random_bytes()?) >> 11; // < 2^53
         // The leading 0xFF makes the agent drop any partial request it holds.
@@ -255,7 +263,10 @@ impl Qga {
             arguments["input-data"] = BASE64.encode(input).into();
         }
         let pid = self.call::<Pid>("guest-exec", arguments).await?.pid;
-        let mut delay = Duration::from_millis(20);
+        // Short commands finish within ~100 ms (most of it the guest's
+        // systemd-run scope), so poll often at first, then back off: polls
+        // cost one small round trip each.
+        let mut delay = Duration::from_millis(5);
         loop {
             // Output can be large: two 16 MiB streams as base64.
             self.request(
@@ -269,13 +280,18 @@ impl Qga {
             let status: ExecStatus = unwrap_reply(serde_json::from_slice(&self.line)?)
                 .context("QGA guest-exec-status")?;
             if status.exited {
-                return parse_status(status, cap);
+                let out = parse_status(status, cap);
+                // A kept connection must not hold a large reply's buffer.
+                if self.line.capacity() > 1 << 20 {
+                    self.line = Vec::new();
+                }
+                return out;
             }
             if started.elapsed() >= limit + GRACE {
                 bail!("command did not finish within {limit:?} and the guest did not stop it");
             }
             sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_millis(500));
+            delay = (delay * 3 / 2).min(Duration::from_millis(500));
         }
     }
 }
@@ -417,6 +433,28 @@ mod tests {
         })
         .await;
         let mut qga = Qga::connect(&path, WAIT).await.unwrap();
+        qga.ping().await.unwrap();
+        // A kept connection syncs again before the next use.
+        qga.resync(WAIT).await.unwrap();
+        qga.ping().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resync_skips_a_late_reply() {
+        // After the first ping, the agent sends a late reply and junk
+        // before anything else: a kept connection must skip them.
+        let mut first = true;
+        let (_d, path) = fake(b"", move |_| {
+            let mut out = b"{\"return\": {}}\n".to_vec();
+            if std::mem::take(&mut first) {
+                out.extend(b"{\"return\": {\"pid\": 1}}\njunk");
+            }
+            Some(out)
+        })
+        .await;
+        let mut qga = Qga::connect(&path, WAIT).await.unwrap();
+        qga.ping().await.unwrap();
+        qga.resync(WAIT).await.unwrap();
         qga.ping().await.unwrap();
     }
 

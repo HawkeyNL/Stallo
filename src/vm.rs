@@ -115,7 +115,9 @@ pub struct Running {
     /// Screen size from the last screenshot; pointer coordinates use it.
     screen_size: Mutex<(u32, u32)>,
     /// One guest-agent operation at a time.
-    qga_lock: tokio::sync::Mutex<()>,
+    /// The guest-agent connection, kept between operations (the agent
+    /// sleeps ~100 ms after every disconnect), one operation at a time.
+    qga: tokio::sync::Mutex<Option<Qga>>,
     /// Paused by the disk watchdog.
     disk_full: AtomicBool,
     /// Becomes `true` once QEMU has exited and everything is cleaned up.
@@ -398,7 +400,7 @@ impl Manager {
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
             screen_size: Mutex::new(qemu::SCREEN),
-            qga_lock: tokio::sync::Mutex::new(()),
+            qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
             exited: rx,
         });
@@ -731,13 +733,12 @@ impl Manager {
     ) -> Result<ExecOutput> {
         let vm = self.running_vm(name)?;
         let (path, args) = guest_command(argv, admin, limit);
-        // One guest-agent operation per VM at a time; do not queue forever.
-        let _qga = tokio::time::timeout(QGA_BUSY_WAIT, vm.qga_lock.lock())
-            .await
-            .map_err(|_| anyhow::anyhow!("{name} is busy with another guest command"))?;
-        let mut qga = Qga::connect(&vm.qga_sock, Duration::from_secs(5)).await?;
         let started = Instant::now();
-        let out = qga.exec(&path, &args, stdin, limit, cap).await?;
+        let out = vm
+            .with_agent(QGA_BUSY_WAIT, Duration::from_secs(5), async |q| {
+                q.exec(&path, &args, stdin, limit, cap).await
+            })
+            .await?;
         // The scope's SIGKILL shows up as signal 9.
         ensure!(
             !(out.exit_code == 137 && started.elapsed() >= limit),
@@ -952,16 +953,64 @@ impl Running {
         tokio::task::spawn_blocking(move || take_capped(&path, MAX_SCREEN_BYTES)).await?
     }
 
+    /// Runs `op` on the guest-agent connection: the kept one after a quick
+    /// re-sync, or a new one, all within `connect`. Waits at most `busy`
+    /// for an operation before it. A failed operation drops the connection
+    /// (it may be out of step with the agent).
+    async fn with_agent<T>(
+        &self,
+        busy: Duration,
+        connect: Duration,
+        op: impl AsyncFnOnce(&mut Qga) -> Result<T>,
+    ) -> Result<T> {
+        let mut agent = tokio::time::timeout(busy, self.qga.lock())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("{} is busy with another guest command", self.config.name)
+            })?;
+        let ready = tokio::time::timeout(connect, async {
+            if let Some(q) = agent.as_mut()
+                && q.resync(connect).await.is_err()
+            {
+                *agent = None;
+            }
+            if agent.is_none() {
+                *agent = Some(Qga::connect(&self.qga_sock, connect).await?);
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match ready {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                *agent = None;
+                bail!("guest agent did not answer within {connect:?}");
+            }
+        }
+        let q = agent.as_mut().context("no guest agent connection")?;
+        let result = op(q).await;
+        if result.is_err() {
+            *agent = None;
+        }
+        result
+    }
+
     async fn addresses(&self) -> Result<Vec<(String, String)>> {
-        let _qga = tokio::time::timeout(Duration::from_millis(100), self.qga_lock.lock()).await?;
-        let mut qga = Qga::connect(&self.qga_sock, Duration::from_secs(2)).await?;
-        qga.addresses().await
+        // Only if the agent is free: never behind a long exec.
+        self.with_agent(
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+            async |q| q.addresses().await,
+        )
+        .await
     }
 
     async fn ping(&self) -> Result<()> {
-        let _qga = self.qga_lock.lock().await;
-        let mut qga = Qga::connect(&self.qga_sock, Duration::from_secs(2)).await?;
-        qga.ping().await
+        self.with_agent(QGA_BUSY_WAIT, Duration::from_secs(2), async |q| {
+            q.ping().await
+        })
+        .await
     }
 
     /// Marks the VM as paused by the disk watchdog and pauses it. Returns
@@ -1377,12 +1426,12 @@ mod tests {
             },
             pid: 0,
             qmp,
-            qga_sock: "/nonexistent".into(),
+            qga_sock: dir.path().join("qga.sock"),
             rt_dir: "/nonexistent".into(),
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
             screen_size: Mutex::new(qemu::SCREEN),
-            qga_lock: tokio::sync::Mutex::new(()),
+            qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
             exited,
         };
@@ -1459,6 +1508,73 @@ mod tests {
         log.lock().unwrap().clear();
         assert!(vm.drag((0, 0), (0, 800)).await.is_err());
         assert!(summary(&log).is_empty(), "nothing pressed for a bad drag");
+    }
+
+    /// A fake guest agent that counts connections and answers sync and
+    /// ping; it hangs up after `hang_up_after` replies on a connection.
+    fn fake_agent(path: &Path, hang_up_after: usize) -> Arc<std::sync::atomic::AtomicUsize> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = BufReader::new(r).split(b'\n');
+                    for _ in 0..hang_up_after {
+                        let Ok(Some(line)) = lines.next_segment().await else {
+                            return;
+                        };
+                        let req: Value =
+                            serde_json::from_slice(line.strip_prefix(&[0xFF]).unwrap_or(&line))
+                                .unwrap();
+                        let bytes = if req["execute"] == "guest-sync-delimited" {
+                            let id = &req["arguments"]["id"];
+                            [&[0xFF][..], format!("{{\"return\": {id}}}\n").as_bytes()].concat()
+                        } else {
+                            b"{\"return\": {}}\n".to_vec()
+                        };
+                        if w.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        accepted
+    }
+
+    const WAIT_AGENT: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn guest_agent_connection_is_kept() {
+        let (_d, vm, _) = fake_vm("running", None).await;
+        let accepted = fake_agent(&vm.qga_sock, usize::MAX);
+        for _ in 0..3 {
+            vm.ping().await.unwrap();
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "one connection for three pings"
+        );
+
+        // A failed operation drops the connection; the next use reconnects.
+        let failed: Result<()> = vm
+            .with_agent(QGA_BUSY_WAIT, WAIT_AGENT, async |_| bail!("broken"))
+            .await;
+        assert!(failed.is_err());
+        vm.ping().await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+        // An agent that hangs up is reconnected on the next use.
+        let (_d, vm, _) = fake_vm("running", None).await;
+        let accepted = fake_agent(&vm.qga_sock, 2);
+        vm.ping().await.unwrap();
+        vm.ping().await.unwrap();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
