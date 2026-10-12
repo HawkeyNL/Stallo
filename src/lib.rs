@@ -9,6 +9,7 @@ pub mod config;
 pub mod confine;
 pub mod host;
 pub mod images;
+pub mod mcp;
 pub mod paths;
 pub mod qemu;
 pub mod qga;

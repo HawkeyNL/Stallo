@@ -85,6 +85,8 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Serve the agent tools over MCP on stdin/stdout.
+    Mcp,
     /// List images, or download one.
     Images {
         #[command(subcommand)]
@@ -110,7 +112,8 @@ const STALLO_ERROR: u8 = 125;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let json = cli.json;
+    // stdout is the MCP channel for `stallo mcp`: errors go to stderr.
+    let json = cli.json && !matches!(cli.command, Cmd::Mcp);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -275,6 +278,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{vm}  removed");
             }
         }
+        Cmd::Mcp => stallo::mcp::serve_stdio(socket).await?,
         Cmd::Images { action } => {
             let request = match action {
                 None => Request::Images,
