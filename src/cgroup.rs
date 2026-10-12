@@ -107,6 +107,22 @@ impl Cgroups {
         Ok(dir)
     }
 
+    /// `memory.max - memory.current` of `vm-<name>`: memory the VM may still
+    /// take. 0 if unknown.
+    pub fn unused_memory_bytes(&self, name: &str) -> u64 {
+        let read = |f: &str| -> Option<u64> {
+            fs::read_to_string(self.vm_dir(name).join(f))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        match (read("memory.max"), read("memory.current")) {
+            (Some(max), Some(current)) => max.saturating_sub(current),
+            _ => 0,
+        }
+    }
+
     /// Kills every process in `vm-<name>`; the process owner reaps them and
     /// removes the cgroup.
     pub fn kill_vm(&self, name: &str) -> Result<()> {
@@ -327,6 +343,10 @@ mod tests {
         // Without cgroup.kill/events (a plain directory), it cannot be
         // cleared, and an existing directory is never silently reused.
         assert!(cg.create_vm("dev", limits).await.is_err());
+
+        fs::write(vm.join("memory.current"), "1048576\n").unwrap();
+        assert_eq!(cg.unused_memory_bytes("dev"), (1 << 30) - (1 << 20));
+        assert_eq!(cg.unused_memory_bytes("none"), 0);
         assert_eq!(
             fs::read_to_string(vm.join("cpu.max")).unwrap(),
             "100000 100000"

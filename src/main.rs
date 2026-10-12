@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Via, VmInfo};
 use stallo::config::NetProfile;
+use stallo::host::HostInfo;
 
 #[derive(Parser)]
 #[command(version, about = "Agent-first VMs on Ubuntu", propagate_version = true)]
@@ -73,6 +74,10 @@ enum Cmd {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Continue a paused VM (for example after the disk watchdog paused it).
+    Resume { vm: String },
+    /// Show host resources and what VMs use.
+    Host,
     /// Delete a stopped VM and all its files.
     Rm {
         vm: String,
@@ -245,6 +250,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
             return Ok(ExitCode::from(u8::try_from(r.exit_code).unwrap_or(255)));
+        }
+        Cmd::Resume { vm } => {
+            call(Request::Resume { name: vm.clone() }).await?;
+            if !json {
+                println!("{vm}  resumed");
+            }
+        }
+        Cmd::Host => {
+            let v = call(Request::Host).await?;
+            if json {
+                print_json(&v);
+            } else {
+                let h: HostInfo = serde_json::from_value(v)?;
+                print!("{h}");
+            }
         }
         Cmd::Rm { vm, yes } => {
             if !yes {

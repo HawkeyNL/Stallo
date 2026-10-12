@@ -226,6 +226,14 @@ impl DaemonConfig {
         if !(1..=90).contains(&cfg.host.memory_budget_pct) {
             bail!("host.memory_budget_pct must be between 1 and 90");
         }
+        ensure!(
+            cfg.host.disk_floor_gib <= 1 << 20 && cfg.host.reserve_mib <= MAX_MEMORY_MIB,
+            "host.disk_floor_gib or host.reserve_mib is out of range"
+        );
+        ensure!(
+            cfg.host.qemu_overhead_mib <= MAX_MEMORY_MIB,
+            "host.qemu_overhead_mib is out of range"
+        );
         Ok(cfg)
     }
 }

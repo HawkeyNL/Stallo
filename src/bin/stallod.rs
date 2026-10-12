@@ -92,6 +92,7 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups) -> Result<(
     let listener = UnixListener::bind(&sock).context("cannot bind the API socket")?;
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!("listening on {}", sock.display());
+    tokio::spawn(stallo::host::watchdog(manager.clone()));
 
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -216,6 +217,8 @@ fn op_name(r: &Request) -> &'static str {
         Request::Stop { .. } => "stop",
         Request::Exec { .. } => "exec",
         Request::Rm { .. } => "rm",
+        Request::Resume { .. } => "resume",
+        Request::Host => "host",
         Request::Images => "images",
         Request::Pull { .. } => "pull",
     }
@@ -303,6 +306,11 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
             m.remove(&name).await?;
             Value::Null
         }
+        Request::Resume { name } => {
+            m.resume(&name).await?;
+            Value::Null
+        }
+        Request::Host => json!(m.host()?),
         Request::Images => json!(
             images::catalog()
                 .into_iter()
@@ -324,7 +332,7 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
 async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
     let state = match m.running(&cfg.name) {
         None => "stopped".to_owned(),
-        Some(vm) => vm.status().await.unwrap_or_else(|_| "unknown".to_owned()),
+        Some(vm) => vm.state().await,
     };
     VmInfo {
         name: cfg.name.clone(),

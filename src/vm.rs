@@ -13,6 +13,7 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use tokio::sync::watch;
 
 use crate::cgroup::{Cgroups, Limits};
 use crate::config::{DaemonConfig, NetProfile, VmConfig, new_uuid, validate_name};
+use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
@@ -58,6 +60,8 @@ pub struct Running {
     qga_sock: PathBuf,
     /// One guest-agent operation at a time.
     qga_lock: tokio::sync::Mutex<()>,
+    /// Paused by the disk watchdog.
+    disk_full: AtomicBool,
     /// Becomes `true` once QEMU has exited and everything is cleaned up.
     exited: watch::Receiver<bool>,
 }
@@ -80,6 +84,8 @@ pub struct Manager {
     ops: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Serialises image downloads.
     pulls: tokio::sync::Mutex<()>,
+    /// Serialises admission: checking what fits and starting it is atomic.
+    admission: tokio::sync::Mutex<()>,
 }
 
 impl Manager {
@@ -91,6 +97,7 @@ impl Manager {
             running: Mutex::default(),
             ops: Mutex::default(),
             pulls: tokio::sync::Mutex::default(),
+            admission: tokio::sync::Mutex::default(),
         })
     }
 
@@ -180,6 +187,8 @@ impl Manager {
             agent_control: false,
         };
         cfg.validate()?;
+        // Refuse early, before downloading or writing anything.
+        self.admit(&cfg, cfg.disk_gib << 30)?;
         self.pull(&cfg.image).await?;
 
         let _op = self.lock(&new.name).await;
@@ -251,6 +260,10 @@ impl Manager {
         ensure_private_dir(&rt_dir)?;
         let argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
 
+        // Held until the VM is registered as running, so concurrent starts
+        // see each other.
+        let _admission = self.admission.lock().await;
+        self.admit(&cfg, 0)?;
         match self.spawn(&cfg, &argv).await {
             Ok(running) => Ok(running),
             Err(e) => {
@@ -309,6 +322,7 @@ impl Manager {
             qmp,
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
             qga_lock: tokio::sync::Mutex::new(()),
+            disk_full: AtomicBool::new(false),
             exited: rx,
         });
         self.running
@@ -318,6 +332,57 @@ impl Manager {
         tokio::spawn(self.clone().watch(name.clone(), child, tx));
         tracing::info!("{name}: started, pid {pid}");
         Ok(running)
+    }
+
+    /// Host resources and what running VMs use.
+    pub fn host(&self) -> Result<HostInfo> {
+        let running = self.all_running();
+        // Each VM counts with its full cgroup limit (guest RAM + overhead).
+        let vms: Vec<(u32, u64)> = running
+            .iter()
+            .map(|r| {
+                let m = r.config.memory_mib;
+                (r.config.vcpus, m + self.overhead_mib(m))
+            })
+            .collect();
+        // QEMU faults guest RAM in lazily, so MemAvailable does not yet
+        // show what running VMs may still take: memory.max - memory.current.
+        let unfaulted_mib: u64 = running
+            .iter()
+            .map(|r| self.cgroups.unused_memory_bytes(&r.config.name) >> 20)
+            .sum();
+        host::snapshot(&self.paths.data, &self.config.host, &vms, unfaulted_mib)
+    }
+
+    /// Whether `cfg` fits next to the running VMs, with `disk_bytes` of new
+    /// disk space.
+    fn admit(&self, cfg: &VmConfig, disk_bytes: u64) -> Result<()> {
+        let ask = Ask {
+            vcpus: cfg.vcpus,
+            memory_mib: cfg.memory_mib,
+            overhead_mib: self.overhead_mib(cfg.memory_mib),
+            disk_bytes,
+        };
+        host::admit(&self.host()?, &ask, &self.config.host)
+    }
+
+    /// Continues a paused VM, unless the disk is still below the floor.
+    pub async fn resume(&self, name: &str) -> Result<()> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await;
+        let vm = self
+            .running(name)
+            .with_context(|| format!("{name} is not running"))?;
+        ensure!(vm.status().await? != "running", "{name} is not paused");
+        let floor = self.config.host.disk_floor_gib;
+        ensure!(
+            !host::below_floor(host::disk_free(&self.paths.data)?, floor),
+            "the data disk is still below the {floor} GiB floor; free space first"
+        );
+        // Cleared first, so a watchdog tick after `cont` can pause it again.
+        vm.disk_full.store(false, Ordering::Relaxed);
+        vm.qmp.execute("cont", None).await?;
+        Ok(())
     }
 
     fn overhead_mib(&self, memory_mib: u64) -> u64 {
@@ -392,12 +457,16 @@ impl Manager {
         let vm = self
             .running(name)
             .with_context(|| format!("{name} is not running"))?;
-        if !force {
+        // A paused guest never sees the power button: go straight to quit.
+        let running = vm.status().await.is_ok_and(|s| s == "running");
+        if !force && running {
             match vm.qmp.execute("system_powerdown", None).await {
                 Ok(_) if vm.wait_exited(POWERDOWN_TIMEOUT).await => return Ok(()),
                 Ok(_) => tracing::warn!("{name}: no power-off after {POWERDOWN_TIMEOUT:?}"),
                 Err(e) => tracing::warn!("{name}: system_powerdown failed: {e:#}"),
             }
+        }
+        if !force {
             let _ = vm.qmp.execute("quit", None).await;
             if vm.wait_exited(Duration::from_secs(5)).await {
                 return Ok(());
@@ -483,6 +552,32 @@ impl Running {
         let _qga = self.qga_lock.lock().await;
         let mut qga = Qga::connect(&self.qga_sock, Duration::from_secs(2)).await?;
         qga.ping().await
+    }
+
+    /// Marks the VM as paused by the disk watchdog and pauses it. Returns
+    /// false if it already was.
+    pub async fn pause_disk_full(&self) -> Result<bool> {
+        if self.disk_full.swap(true, Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if let Err(e) = self.qmp.execute("stop", None).await {
+            // Not paused: let the next tick try again.
+            self.disk_full.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// What `ls` shows: QEMU's run state, e.g. `running`, `paused` or
+    /// `io-error`, or `paused (disk full)` after the watchdog paused it.
+    pub async fn state(&self) -> String {
+        match self.status().await {
+            Ok(s) if s == "paused" && self.disk_full.load(Ordering::Relaxed) => {
+                "paused (disk full)".to_owned()
+            }
+            Ok(s) => s,
+            Err(_) => "unknown".to_owned(),
+        }
     }
 
     /// QEMU's run state, e.g. `running`, `paused` or `io-error`.

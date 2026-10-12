@@ -67,6 +67,10 @@ pub enum Request {
     Rm {
         name: String,
     },
+    Resume {
+        name: String,
+    },
+    Host,
     Images,
     Pull {
         image: String,

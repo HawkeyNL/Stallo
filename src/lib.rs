@@ -6,6 +6,7 @@
 pub mod api;
 pub mod cgroup;
 pub mod config;
+pub mod host;
 pub mod images;
 pub mod paths;
 pub mod qemu;
