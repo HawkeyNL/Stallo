@@ -4,6 +4,7 @@
 //! a Unix socket.
 
 pub mod api;
+pub mod audit;
 pub mod cgroup;
 pub mod config;
 pub mod confine;

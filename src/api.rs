@@ -140,6 +140,11 @@ pub enum Request {
     Resume {
         name: String,
     },
+    /// Turns agent control of a VM on or off (humans only).
+    SetAgent {
+        name: String,
+        on: bool,
+    },
     Host,
     Images,
     Pull {
@@ -240,6 +245,69 @@ pub struct ImageInfo {
     pub cached: bool,
 }
 
+/// What an agent (`via: mcp`) may do with a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate<'a> {
+    /// Reads nothing of any VM's insides.
+    Open,
+    /// Only if agent control is on for this VM.
+    Vm(&'a str),
+    /// Only if the daemon allows agents to create VMs.
+    Create,
+    /// Never: irreversible or policy-changing operations stay with humans.
+    Closed,
+}
+
+/// The gate for `r` when an agent sends it. Exhaustive on purpose: a new
+/// operation must be placed here.
+pub fn agent_gate(r: &Request) -> Gate<'_> {
+    use Request::*;
+    match r {
+        List | Host | Images => Gate::Open,
+        New { .. } => Gate::Create,
+        Rm { .. } | Pull { .. } | Resume { .. } | SetAgent { .. } => Gate::Closed,
+        Start { name, .. }
+        | Stop { name, .. }
+        | Exec { name, .. }
+        | FileRead { name, .. }
+        | FileWrite { name, .. }
+        | Screenshot { name }
+        | WaitForScreen { name, .. }
+        | MouseMove { name, .. }
+        | Click { name, .. }
+        | Drag { name, .. }
+        | Scroll { name, .. }
+        | TypeText { name, .. }
+        | Key { name, .. } => Gate::Vm(name),
+    }
+}
+
+/// The agent policy for one request. CLI requests pass; agent (`mcp`)
+/// requests pass the [`agent_gate`]. `agent_control` reads a VM's switch.
+/// `via` is declared by the client, so this is policy, not a boundary
+/// against processes that can reach the socket (see SECURITY.md).
+pub fn check_agent(
+    via: Via,
+    request: &Request,
+    agents_can_create: bool,
+    agent_control: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    match via {
+        Via::Cli => return Ok(()),
+        Via::Mcp => {}
+    }
+    match agent_gate(request) {
+        Gate::Open => Ok(()),
+        Gate::Create if agents_can_create => Ok(()),
+        Gate::Create => bail!("agents may not create VMs on this host (agents_can_create is off)"),
+        Gate::Closed => bail!("this operation is only available to humans (stallo CLI)"),
+        Gate::Vm(name) if agent_control(name)? => Ok(()),
+        Gate::Vm(name) => {
+            bail!("agent control is off for {name}; a human can run: stallo agent {name} on")
+        }
+    }
+}
+
 /// Whether a peer may use the API: the daemon's own UID, root, or (in
 /// production) a member of the daemon's group via the primary GID.
 pub fn authorize(peer_uid: u32, peer_gid: u32, own_uid: u32, group: Option<u32>) -> bool {
@@ -299,6 +367,64 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Envelope>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn agent_gates() {
+        let name = || "dev".to_owned();
+        assert_eq!(agent_gate(&Request::List), Gate::Open);
+        assert_eq!(
+            agent_gate(&Request::SetAgent {
+                name: name(),
+                on: true
+            }),
+            Gate::Closed
+        );
+        assert_eq!(agent_gate(&Request::Rm { name: name() }), Gate::Closed);
+        assert_eq!(
+            agent_gate(&Request::TypeText {
+                name: name(),
+                text: "x".into()
+            }),
+            Gate::Vm("dev")
+        );
+        assert_eq!(
+            agent_gate(&Request::Screenshot { name: name() }),
+            Gate::Vm("dev")
+        );
+    }
+
+    /// S8: the policy, without a VM.
+    #[test]
+    fn agent_policy() {
+        let shot = Request::Screenshot { name: "dev".into() };
+        let new = Request::New {
+            name: "two".into(),
+            image: "ubuntu-26.04".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_gib: 10,
+            net: NetProfile::Offline,
+            wait: true,
+        };
+        let on = |_: &str| Ok(true);
+        let off = |_: &str| Ok(false);
+        let err = |via, r: &Request, create, f: fn(&str) -> Result<bool>| {
+            check_agent(via, r, create, f).unwrap_err().to_string()
+        };
+        assert!(check_agent(Via::Cli, &shot, false, off).is_ok());
+        assert!(check_agent(Via::Mcp, &shot, false, on).is_ok());
+        assert!(err(Via::Mcp, &shot, false, off).contains("agent control is off for dev"));
+        assert!(check_agent(Via::Mcp, &shot, false, |_| bail!("no VM")).is_err());
+        assert!(check_agent(Via::Mcp, &new, true, off).is_ok());
+        assert!(err(Via::Mcp, &new, false, on).contains("agents_can_create"));
+        assert!(check_agent(Via::Cli, &new, false, off).is_ok());
+        let closed = Request::SetAgent {
+            name: "dev".into(),
+            on: true,
+        };
+        assert!(err(Via::Mcp, &closed, true, on).contains("only available to humans"));
+        assert!(check_agent(Via::Mcp, &Request::List, false, off).is_ok());
     }
 
     /// S2.

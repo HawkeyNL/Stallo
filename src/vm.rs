@@ -97,6 +97,8 @@ pub struct NewVm {
     pub memory_mib: u64,
     pub disk_gib: u64,
     pub net: NetProfile,
+    /// Agents may control it from the start (only for VMs agents create).
+    pub agent_control: bool,
 }
 
 /// A running QEMU process.
@@ -161,6 +163,7 @@ impl Manager {
         safe_remove(&self.paths.runtime, &self.paths.vms_runtime_dir())?;
         ensure_private_dir(&self.paths.vms_runtime_dir())?;
         ensure_private_dir(&self.paths.vms_dir())?;
+        ensure_private_dir(&self.paths.audit_dir())?;
         Ok(())
     }
 
@@ -238,7 +241,7 @@ impl Manager {
             memory_mib: new.memory_mib,
             disk_gib: new.disk_gib,
             net: new.net,
-            agent_control: false,
+            agent_control: new.agent_control,
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
@@ -438,6 +441,15 @@ impl Manager {
             disk_bytes,
         };
         host::admit(&self.host()?, &ask, &self.config.host)
+    }
+
+    /// Turns agent control of a VM on or off (stored in `vm.toml`).
+    pub async fn set_agent(&self, name: &str, on: bool) -> Result<()> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await;
+        let mut cfg = self.load(name)?;
+        cfg.agent_control = on;
+        cfg.save(&self.paths.vm_dir(name))
     }
 
     /// Continues a paused VM, unless the disk is still below the floor.

@@ -17,9 +17,11 @@ use std::time::Instant;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
+use stallo::api::Via;
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Response, VmInfo};
+use stallo::audit;
 use stallo::cgroup::Cgroups;
-use stallo::config::{DaemonConfig, VmConfig};
+use stallo::config::{DaemonConfig, VmConfig, validate_name};
 use stallo::images;
 use stallo::paths::{Paths, safe_remove};
 use stallo::read_line;
@@ -168,7 +170,7 @@ async fn connection(manager: &Arc<Manager>, stream: UnixStream, own_uid: u32) ->
     if !got {
         return Ok(());
     }
-    let response = match serde_json::from_slice::<Envelope>(&line) {
+    let (response, audit) = match serde_json::from_slice::<Envelope>(&line) {
         Ok(env) => handle(manager, env, &cred).await,
         Err(e) => {
             tracing::info!(
@@ -176,12 +178,24 @@ async fn connection(manager: &Arc<Manager>, stream: UnixStream, own_uid: u32) ->
                 cred.uid(),
                 cred.pid()
             );
-            Response::err(&anyhow::anyhow!("invalid request: {e}"))
+            let e = anyhow::anyhow!("invalid request: {e}");
+            (Response::err(&e), None)
         }
     };
-    let mut out = serde_json::to_vec(&response)?;
-    if out.len() > api::MAX_RESPONSE {
+    let mut ok = response.ok;
+    let mut out = serde_json::to_vec(&response).unwrap_or_default();
+    drop(response);
+    if out.is_empty() || out.len() > api::MAX_RESPONSE {
+        ok = false;
         out = serde_json::to_vec(&Response::err(&anyhow::anyhow!("response too large")))?;
+    }
+    if let Some((mut file, mut entry)) = audit {
+        entry.result_bytes = out.len() as u64;
+        entry.ok = ok;
+        let written = tokio::task::spawn_blocking(move || audit::write(&mut file, &entry)).await;
+        if !matches!(written, Ok(Ok(()))) {
+            tracing::error!("cannot write the audit log: {written:?}");
+        }
     }
     out.push(b'\n');
     tokio::time::timeout(Duration::from_secs(30), w.write_all(&out))
@@ -191,55 +205,80 @@ async fn connection(manager: &Arc<Manager>, stream: UnixStream, own_uid: u32) ->
 }
 
 /// Runs one API request and logs it (operation, caller, result, duration;
-/// never arguments).
-async fn handle(m: &Arc<Manager>, env: Envelope, peer: &UCred) -> Response {
+/// never arguments). Returns the response and the open audit log with the
+/// entry to write (the caller adds the response size). An agent call that
+/// cannot be audited is refused.
+async fn handle(
+    m: &Arc<Manager>,
+    env: Envelope,
+    peer: &UCred,
+) -> (Response, Option<(std::fs::File, audit::Entry)>) {
     let started = Instant::now();
-    let op = op_name(&env.request);
-    let result = dispatch(m, env.request).await;
+    let (op, vm, args, argv0) = audit::describe(&env.request);
+    let log = vm
+        .filter(|n| validate_name(n).is_ok() && m.paths.vm_dir(n).is_dir())
+        .unwrap_or(audit::DAEMON)
+        .to_owned();
+    let dir = m.paths.audit_dir();
+    let file = tokio::task::spawn_blocking(move || audit::open(&dir, &log))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| Ok(r?));
+    let result = match (&file, env.via) {
+        (Err(e), Via::Mcp) => Err(anyhow::anyhow!(
+            "the audit log cannot be written ({e:#}); agent calls are refused"
+        )),
+        _ => match api::check_agent(env.via, &env.request, m.config.agents_can_create, |n| {
+            Ok(m.load(n)?.agent_control)
+        }) {
+            Ok(()) => dispatch(m, env.via, env.request).await,
+            Err(e) => Err(e),
+        },
+    };
+    let ms = started.elapsed().as_millis() as u64;
     tracing::info!(
-        "{op} via {:?} from uid {} pid {:?}: {} in {} ms",
+        "{op} via {:?} from uid {} pid {:?}: {} in {ms} ms",
         env.via,
         peer.uid(),
         peer.pid(),
         if result.is_ok() { "ok" } else { "error" },
-        started.elapsed().as_millis()
     );
-    match result {
+    let file = match file {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::error!("cannot open the audit log: {e:#}");
+            None
+        }
+    };
+    let audit = file.map(|f| {
+        let entry = audit::Entry {
+            time_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+            uid: peer.uid(),
+            pid: peer.pid(),
+            via: env.via,
+            op,
+            args: args.into_iter().collect(),
+            argv0,
+            result_bytes: 0,
+            ms,
+            ok: result.is_ok(),
+        };
+        (f, entry)
+    });
+    let response = match result {
         Ok(data) => Response {
             ok: true,
             data,
             error: None,
         },
         Err(e) => Response::err(&e),
-    }
+    };
+    (response, audit)
 }
 
-fn op_name(r: &Request) -> &'static str {
-    match r {
-        Request::New { .. } => "new",
-        Request::List => "list",
-        Request::Start { .. } => "start",
-        Request::Stop { .. } => "stop",
-        Request::Exec { .. } => "exec",
-        Request::FileRead { .. } => "file_read",
-        Request::FileWrite { .. } => "file_write",
-        Request::Rm { .. } => "rm",
-        Request::Screenshot { .. } => "screenshot",
-        Request::WaitForScreen { .. } => "wait_for_screen",
-        Request::MouseMove { .. } => "mouse_move",
-        Request::Click { .. } => "click",
-        Request::Drag { .. } => "drag",
-        Request::Scroll { .. } => "scroll",
-        Request::TypeText { .. } => "type_text",
-        Request::Key { .. } => "key",
-        Request::Resume { .. } => "resume",
-        Request::Host => "host",
-        Request::Images => "images",
-        Request::Pull { .. } => "pull",
-    }
-}
-
-async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
+async fn dispatch(m: &Arc<Manager>, via: Via, request: Request) -> Result<Value> {
     Ok(match request {
         Request::New {
             name,
@@ -257,6 +296,7 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
                 memory_mib,
                 disk_gib,
                 net,
+                agent_control: via == Via::Mcp,
             };
             let started = Instant::now();
             m.create(&new).await?;
@@ -402,6 +442,10 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
         }
         Request::Key { name, keys } => {
             m.key(&name, &keys).await?;
+            Value::Null
+        }
+        Request::SetAgent { name, on } => {
+            m.set_agent(&name, on).await?;
             Value::Null
         }
         Request::Resume { name } => {

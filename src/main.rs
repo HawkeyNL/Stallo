@@ -83,6 +83,12 @@ enum Cmd {
         #[arg(long)]
         admin: bool,
     },
+    /// Let agents (MCP) control a VM, or stop them.
+    Agent {
+        vm: String,
+        #[arg(value_enum)]
+        state: OnOff,
+    },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
     /// Show host resources and what VMs use.
@@ -107,6 +113,12 @@ enum Cmd {
 enum ImagesCmd {
     /// Download and verify an image.
     Pull { id: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -274,6 +286,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&serde_json::json!({"bytes": bytes}));
             } else {
                 println!("copied {bytes} bytes");
+            }
+        }
+        Cmd::Agent { vm, state } => {
+            let on = matches!(state, OnOff::On);
+            call(Request::SetAgent {
+                name: vm.clone(),
+                on,
+            })
+            .await?;
+            if !json {
+                if on {
+                    println!("{vm}  agent control on");
+                } else {
+                    println!("{vm}  agent control off (agent calls already running finish first)");
+                }
             }
         }
         Cmd::Resume { vm } => {

@@ -85,6 +85,11 @@ impl Paths {
         self.vms_dir().join(name)
     }
 
+    /// `<data>/audit`: the audit logs (outlive the VMs).
+    pub fn audit_dir(&self) -> PathBuf {
+        self.data.join("audit")
+    }
+
     pub fn images_dir(&self) -> PathBuf {
         self.data.join("images")
     }

@@ -81,7 +81,8 @@ pub struct VmConfig {
     pub memory_mib: u64,
     pub disk_gib: u64,
     pub net: NetProfile,
-    /// Whether agents (MCP) may control this VM. Off unless a human turns it on.
+    /// Whether agents (MCP) may control this VM. Off unless a human turns it
+    /// on, or an agent created the VM (`agents_can_create`).
     #[serde(default)]
     pub agent_control: bool,
 }
@@ -182,6 +183,9 @@ fn is_uuid(s: &str) -> bool {
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     pub host: HostConfig,
+    /// Whether agents (MCP) may create VMs; such VMs start with agent
+    /// control on. Agents never delete.
+    pub agents_can_create: bool,
 }
 
 /// The `[host]` table: admission control and host protection.
@@ -386,6 +390,8 @@ mod tests {
 
         fs::write(&path, "[host]\nmemory_budget_pct = 0\n").unwrap();
         assert!(DaemonConfig::load(&path).is_err());
+        fs::write(&path, "agents_can_create = true\n").unwrap();
+        assert!(DaemonConfig::load(&path).unwrap().agents_can_create);
         fs::write(&path, "[host]\ntypo = 1\n").unwrap();
         assert!(DaemonConfig::load(&path).is_err());
     }

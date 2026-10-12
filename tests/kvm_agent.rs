@@ -20,7 +20,118 @@ fn agent_drives_the_console() {
     let d = Daemon::start("agent", "");
     d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
     d.assert_safe("dev");
-    let call = |r: Request| d.api(Via::Cli, r).unwrap();
+    // S8: with agent control off (the default), every VM tool is refused
+    // to agents, before it reaches the VM.
+    let vm_tools = || {
+        let name = || "dev".to_owned();
+        vec![
+            Request::Screenshot { name: name() },
+            Request::WaitForScreen {
+                name: name(),
+                stable_ms: None,
+                timeout_ms: None,
+            },
+            Request::MouseMove {
+                name: name(),
+                x: 1,
+                y: 1,
+            },
+            Request::Click {
+                name: name(),
+                x: 1,
+                y: 1,
+                button: None,
+                double: false,
+                screenshot: false,
+            },
+            Request::Drag {
+                name: name(),
+                from_x: 1,
+                from_y: 1,
+                to_x: 2,
+                to_y: 2,
+            },
+            Request::Scroll {
+                name: name(),
+                x: 1,
+                y: 1,
+                dy: 1,
+            },
+            Request::TypeText {
+                name: name(),
+                text: "x".into(),
+            },
+            Request::Key {
+                name: name(),
+                keys: "enter".into(),
+            },
+            Request::Exec {
+                name: name(),
+                argv: vec!["true".into()],
+                admin: false,
+                timeout_s: None,
+                stdin: None,
+            },
+            Request::FileRead {
+                name: name(),
+                path: "/etc/hostname".into(),
+                offset: 0,
+                max_bytes: None,
+                admin: false,
+            },
+            Request::FileWrite {
+                name: name(),
+                path: "/tmp/x".into(),
+                data_base64: String::new(),
+                append: false,
+                admin: false,
+            },
+            Request::Stop {
+                name: name(),
+                force: true,
+            },
+            Request::Start {
+                name: name(),
+                wait: false,
+            },
+        ]
+    };
+    for r in vm_tools() {
+        let err = d.api(Via::Mcp, r.clone()).unwrap_err().to_string();
+        assert!(err.contains("agent control is off for dev"), "{r:?}: {err}");
+    }
+    assert!(d.ok(&["ls"]).contains("running"), "nothing was stopped");
+    // Humans-only operations stay closed even with agent control on.
+    d.ok(&["agent", "dev", "on"]);
+    let row = d.ok(&["ls"]);
+    let row = row.lines().find(|l| l.starts_with("dev ")).unwrap();
+    assert!(row.ends_with(" on"), "{row}");
+    for r in [
+        Request::SetAgent {
+            name: "dev".into(),
+            on: true,
+        },
+        Request::Rm { name: "dev".into() },
+        Request::Resume { name: "dev".into() },
+        Request::New {
+            name: "two".into(),
+            image: "ubuntu-26.04".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_gib: 10,
+            net: stallo::config::NetProfile::Offline,
+            wait: false,
+        },
+    ] {
+        let err = d.api(Via::Mcp, r.clone()).unwrap_err().to_string();
+        assert!(
+            err.contains("only available to humans") || err.contains("agents_can_create"),
+            "{r:?}: {err}"
+        );
+    }
+    assert!(!d.vm_dir("two").exists());
+    // From here on the test acts as the agent.
+    let call = |r: Request| d.api(Via::Mcp, r).unwrap();
     let screen = |r: Request| -> (ScreenResult, Vec<u8>) {
         let s: ScreenResult = serde_json::from_value(call(r)).unwrap();
         let png = BASE64.decode(&s.png_base64).unwrap();
@@ -353,6 +464,52 @@ fn agent_drives_the_console() {
         )
         .is_err()
     );
+
+    // S9: every call is in the VM's audit log, without content.
+    let audit = std::fs::read_to_string(d.data.join("audit/dev.jsonl")).unwrap();
+    for op in [
+        "screenshot",
+        "type_text",
+        "key",
+        "click",
+        "exec",
+        "file_write",
+        "file_read",
+        "agent",
+    ] {
+        assert!(audit.contains(&format!(r#""op":"{op}""#)), "{op} missing");
+    }
+    assert!(audit.contains(r#""via":"mcp""#) && audit.contains(r#""ok":false"#));
+    assert!(
+        audit
+            .lines()
+            .all(|l| l.contains(r#""uid":"#) && l.contains(r#""pid":"#))
+    );
+    for secret in [
+        "/tmp/typed",
+        "from stdin",
+        "home/agent/blob",
+        "abcdefghijklmnopqrstuvwxyz",
+        "/etc/shadow",
+    ] {
+        assert!(!audit.contains(secret), "audit leaks {secret}");
+    }
+    eprintln!("MEASURE audit lines: {}", audit.lines().count());
+    let daemon_log = std::fs::read_to_string(d.data.join("audit/_daemon.jsonl")).unwrap();
+    assert!(
+        daemon_log.contains(r#""op":"new""#),
+        "the refused agent create is logged"
+    );
+
+    // Off again: refused again.
+    d.ok(&["agent", "dev", "off"]);
+    for r in vm_tools() {
+        assert!(d.api(Via::Mcp, r).is_err());
+    }
+    // The audit log outlives the VM.
+    d.ok(&["stop", "dev", "--force"]);
+    d.ok(&["rm", "dev", "--yes"]);
+    assert!(d.data.join("audit/dev.jsonl").exists());
 }
 
 /// The `p`th percentile.
