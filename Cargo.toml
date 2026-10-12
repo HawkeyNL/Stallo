@@ -8,6 +8,12 @@ repository = "https://github.com/HawkeyNL/Stallo"
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [lints.rust]
 # Unsafe code is denied crate-wide; the few places that need it (pre_exec)
