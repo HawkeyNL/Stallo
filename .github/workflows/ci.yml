@@ -19,8 +19,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # qemu-img for the image checks in the unit tests (no VM is started).
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils
+      # qemu-img and xorriso for image and seed ISO checks in the unit tests
+      # (no VM is started).
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils xorriso
       # rust-toolchain.toml selects the pinned toolchain.
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings

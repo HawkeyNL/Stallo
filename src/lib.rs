@@ -6,7 +6,9 @@
 pub mod config;
 pub mod images;
 pub mod paths;
+pub mod qemu;
 pub mod qmp;
+pub mod seed;
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -70,6 +72,14 @@ pub async fn run_tool(cmd: &mut Command, limit: Duration) -> anyhow::Result<Vec<
         );
     }
     Ok(out.stdout)
+}
+
+/// `N` bytes from the kernel's CSPRNG.
+pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+    use std::io::Read;
+    let mut bytes = [0; N];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

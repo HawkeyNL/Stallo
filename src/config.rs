@@ -151,6 +151,22 @@ impl VmConfig {
     }
 }
 
+/// A random (version 4) UUID.
+pub fn new_uuid() -> Result<String> {
+    let mut b = crate::random_bytes::<16>()?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
+}
+
 /// Lower-case hyphenated UUID, e.g. `4f1c2b9e-0d3a-4c5e-8f7a-1b2c3d4e5f60`.
 fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
@@ -335,6 +351,15 @@ mod tests {
 
         let unknown = format!("{}extra = 1\n", toml::to_string(&vm()).unwrap());
         assert!(toml::from_str::<VmConfig>(&unknown).is_err());
+    }
+
+    #[test]
+    fn uuids_are_valid_v4_and_unique() {
+        let (a, b) = (new_uuid().unwrap(), new_uuid().unwrap());
+        assert!(is_uuid(&a), "{a}");
+        assert_eq!(&a[14..15], "4");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"));
+        assert_ne!(a, b);
     }
 
     #[test]
