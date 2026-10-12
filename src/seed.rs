@@ -51,7 +51,17 @@ users:
     passwd: "{password_hash}"
 disable_root: true
 ssh_pwauth: false
+write_files:
+  # The console logs in by itself: only the daemon reaches it (QMP), and
+  # agents that may use it can already run commands as this user.
+  - path: /etc/systemd/system/getty@tty1.service.d/autologin.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin {GUEST_USER} --noclear %I $TERM
 runcmd:
+  # The console logs in before the agent answers, so "ready" includes it.
+  - [sh, -c, "systemctl daemon-reload && systemctl restart getty@tty1"]
   - [sh, -c, "mkdir -p /run/stallo-seed && mount -o ro LABEL=CIDATA /run/stallo-seed && dpkg -i /run/stallo-seed/debs/*.deb; umount /run/stallo-seed; systemctl start qemu-guest-agent"]
 "#
     );
@@ -176,6 +186,10 @@ mod tests {
         );
         assert!(seed.user_data.starts_with("#cloud-config\n"));
         assert!(seed.user_data.contains("passwd: \"$6$salt$abc./XYZ\""));
+        assert!(
+            seed.user_data
+                .contains("agetty --autologin agent --noclear %I $TERM")
+        );
         assert!(
             seed.user_data
                 .contains("dpkg -i /run/stallo-seed/debs/*.deb")

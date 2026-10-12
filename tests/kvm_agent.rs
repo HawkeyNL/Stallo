@@ -56,6 +56,162 @@ fn agent_drives_the_console() {
     );
     save(&png, "idle");
 
+    // The console logged in by itself: type a command on it.
+    let text: String = (' '..='~').collect();
+    let t = Instant::now();
+    call(Request::TypeText {
+        name: "dev".into(),
+        text: "cat > /tmp/typed\n".into(),
+    });
+    call(Request::TypeText {
+        name: "dev".into(),
+        text: format!("{text}\n"),
+    });
+    call(Request::Key {
+        name: "dev".into(),
+        keys: "ctrl+d".into(),
+    });
+    let typed = 17 + text.len() + 1;
+    eprintln!("MEASURE type_text: {typed} characters in {:?}", t.elapsed());
+    let (_, png) = screen(Request::WaitForScreen {
+        name: "dev".into(),
+        stable_ms: Some(500),
+        timeout_ms: Some(10000),
+    });
+    save(&png, "typed");
+    let out = d.ok(&["exec", "dev", "--", "cat", "/tmp/typed"]);
+    assert_eq!(
+        out,
+        format!("{text}\n"),
+        "every printable character arrives"
+    );
+    let owner = d.ok(&["exec", "dev", "--", "stat", "-c", "%U", "/tmp/typed"]);
+    assert_eq!(owner.trim(), "agent", "the console is the agent user");
+
+    // Pointer events reach the guest's tablet as sent: read its evdev node
+    // while clicking and scrolling.
+    let events = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            d.ok(&[
+                "exec", "dev", "--admin", "--", "sh", "-c",
+                "ev=$(awk '/Virtio Tablet/{f=1} f && /^H:/{for(i=1;i<=NF;i++) if($i ~ /^event/) print $i; exit}' /proc/bus/input/devices); \
+                 timeout 3 cat /dev/input/$ev | od -An -v -tx1 -w24; true",
+            ])
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        call(Request::Click {
+            name: "dev".into(),
+            x: 640,
+            y: 400,
+            button: None,
+            double: false,
+            screenshot: false,
+        });
+        call(Request::Scroll {
+            name: "dev".into(),
+            x: 640,
+            y: 400,
+            dy: -2,
+        });
+        reader.join().unwrap()
+    });
+    let events: Vec<(u16, u16, i32)> = events
+        .lines()
+        .filter_map(|l| {
+            let b: Vec<u8> = l
+                .split_whitespace()
+                .map(|h| u8::from_str_radix(h, 16).unwrap())
+                .collect();
+            (b.len() == 24).then(|| {
+                (
+                    u16::from_le_bytes([b[16], b[17]]),
+                    u16::from_le_bytes([b[18], b[19]]),
+                    i32::from_le_bytes([b[20], b[21], b[22], b[23]]),
+                )
+            })
+        })
+        .collect();
+    let (x, y) = (
+        stallo::input::abs_axis(640, 1280).unwrap() as i32,
+        stallo::input::abs_axis(400, 800).unwrap() as i32,
+    );
+    for want in [(3, 0, x), (3, 1, y), (1, 0x110, 1), (1, 0x110, 0)] {
+        assert!(events.contains(&want), "{want:?} not in {events:?}");
+    }
+    let wheel_up = events.iter().filter(|e| **e == (2, 8, 1)).count();
+    assert_eq!(wheel_up, 2, "{events:?}");
+
+    // Pointer: moves, clicks (with a screenshot), drags and scrolls work;
+    // off-screen coordinates are refused.
+    call(Request::MouseMove {
+        name: "dev".into(),
+        x: 640,
+        y: 400,
+    });
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        let v = call(Request::Click {
+            name: "dev".into(),
+            x: 10,
+            y: 10,
+            button: None,
+            double: false,
+            screenshot: true,
+        });
+        times.push(t.elapsed());
+        let s: ScreenResult = serde_json::from_value(v).unwrap();
+        assert_eq!(s.width, 1280);
+    }
+    eprintln!(
+        "MEASURE click + screenshot p50 {:?} p95 {:?}",
+        pct(&mut times, 50),
+        pct(&mut times, 95)
+    );
+    call(Request::Drag {
+        name: "dev".into(),
+        from_x: 0,
+        from_y: 0,
+        to_x: 1279,
+        to_y: 799,
+    });
+    call(Request::Scroll {
+        name: "dev".into(),
+        x: 5,
+        y: 5,
+        dy: -3,
+    });
+    for bad in [
+        Request::MouseMove {
+            name: "dev".into(),
+            x: 1280,
+            y: 0,
+        },
+        Request::Drag {
+            name: "dev".into(),
+            from_x: 0,
+            from_y: 0,
+            to_x: 0,
+            to_y: 800,
+        },
+        Request::Scroll {
+            name: "dev".into(),
+            x: 0,
+            y: 0,
+            dy: 0,
+        },
+        Request::TypeText {
+            name: "dev".into(),
+            text: "café".into(),
+        },
+        Request::Key {
+            name: "dev".into(),
+            keys: "ctrl+hyper".into(),
+        },
+    ] {
+        assert!(d.api(Via::Cli, bad).is_err());
+    }
+
     // A screen that keeps changing does not settle: the guest prints a
     // line every 100 ms on the console for 4 s.
     let writer = std::thread::scope(|scope| {

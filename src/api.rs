@@ -12,6 +12,7 @@ use tokio::net::UnixStream;
 
 use crate::config::NetProfile;
 use crate::read_line;
+pub use crate::vm::Button;
 
 /// Longest request line the daemon accepts.
 pub const MAX_REQUEST: usize = 1 << 20;
@@ -74,6 +75,42 @@ pub enum Request {
         name: String,
         stable_ms: Option<u64>,
         timeout_ms: Option<u64>,
+    },
+    MouseMove {
+        name: String,
+        x: u32,
+        y: u32,
+    },
+    Click {
+        name: String,
+        x: u32,
+        y: u32,
+        button: Option<Button>,
+        #[serde(default)]
+        double: bool,
+        #[serde(default)]
+        screenshot: bool,
+    },
+    Drag {
+        name: String,
+        from_x: u32,
+        from_y: u32,
+        to_x: u32,
+        to_y: u32,
+    },
+    Scroll {
+        name: String,
+        x: u32,
+        y: u32,
+        dy: i32,
+    },
+    TypeText {
+        name: String,
+        text: String,
+    },
+    Key {
+        name: String,
+        keys: String,
     },
     Resume {
         name: String,

@@ -52,6 +52,28 @@ const SCREEN_POLL: Duration = Duration::from_millis(250);
 pub const SCREEN_DEFAULT_STABLE: Duration = Duration::from_millis(1000);
 pub const SCREEN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SCREEN_MAX_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a typed key is held, and the pause after it.
+const KEY_HOLD: Duration = Duration::from_millis(5);
+/// How long a chord from `key` is held.
+const CHORD_HOLD: Duration = Duration::from_millis(50);
+/// Pause between the clicks of a double click and the steps of a drag.
+const POINTER_STEP: Duration = Duration::from_millis(20);
+/// Time for the guest to draw the result of a click before the screenshot.
+const CLICK_SETTLE: Duration = Duration::from_millis(50);
+const DRAG_STEPS: u32 = 10;
+/// How long an input action waits for the one before it.
+const INPUT_BUSY_WAIT: Duration = Duration::from_secs(30);
+/// Most wheel clicks in one scroll.
+const MAX_SCROLL: u32 = 50;
+
+/// A pointer button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+}
 
 /// A screenshot as PNG, with the size from its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +103,10 @@ pub struct Running {
     rt_dir: PathBuf,
     /// One screendump at a time (they share files).
     screen_lock: tokio::sync::Mutex<()>,
+    /// One input action at a time, so typed text never interleaves.
+    input_lock: tokio::sync::Mutex<()>,
+    /// Screen size from the last screenshot; pointer coordinates use it.
+    screen_size: Mutex<(u32, u32)>,
     /// One guest-agent operation at a time.
     qga_lock: tokio::sync::Mutex<()>,
     /// Paused by the disk watchdog.
@@ -362,6 +388,8 @@ impl Manager {
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
             rt_dir: rt_dir.clone(),
             screen_lock: tokio::sync::Mutex::new(()),
+            input_lock: tokio::sync::Mutex::new(()),
+            screen_size: Mutex::new(qemu::SCREEN),
             qga_lock: tokio::sync::Mutex::new(()),
             disk_full: AtomicBool::new(false),
             exited: rx,
@@ -584,6 +612,49 @@ impl Manager {
         Ok((vm.screenshot().await?, settled))
     }
 
+    /// Moves the pointer to pixel (`x`, `y`) of the last screenshot.
+    pub async fn mouse_move(&self, name: &str, x: u32, y: u32) -> Result<()> {
+        self.running_vm(name)?.mouse_move(x, y).await
+    }
+
+    /// Clicks at (`x`, `y`); with `screenshot`, returns the screen shortly
+    /// after.
+    pub async fn click(
+        &self,
+        name: &str,
+        (x, y): (u32, u32),
+        button: Button,
+        double: bool,
+        screenshot: bool,
+    ) -> Result<Option<Screenshot>> {
+        let vm = self.running_vm(name)?;
+        vm.click((x, y), button, double, screenshot).await
+    }
+
+    /// Presses the left button at `from`, moves to `to` in steps, releases.
+    pub async fn drag(&self, name: &str, from: (u32, u32), to: (u32, u32)) -> Result<()> {
+        self.running_vm(name)?.drag(from, to).await
+    }
+
+    /// Scrolls at (`x`, `y`): `dy` wheel clicks, positive is down.
+    pub async fn scroll(&self, name: &str, x: u32, y: u32, dy: i32) -> Result<()> {
+        self.running_vm(name)?.scroll((x, y), dy).await
+    }
+
+    /// Types `text` on a US keyboard layout.
+    pub async fn type_text(&self, name: &str, text: &str) -> Result<()> {
+        let keys = input::text_keys(text)?;
+        self.running_vm(name)?.type_keys(&keys).await
+    }
+
+    /// Presses a chord such as `ctrl+alt+t`.
+    pub async fn key(&self, name: &str, chord: &str) -> Result<()> {
+        let keys = input::chord(chord)?;
+        let vm = self.running_vm(name)?;
+        let _input = vm.input().await?;
+        vm.send_key(&keys, CHORD_HOLD).await
+    }
+
     /// Runs `argv` in the guest. Without `admin` it runs as the guest user.
     /// Only one guest command runs per VM at a time.
     pub async fn exec(
@@ -624,10 +695,148 @@ impl Manager {
 }
 
 impl Running {
+    /// Takes the input lock (waiting a bounded time) and checks that the
+    /// guest runs: input into a paused VM would be lost without an error.
+    async fn input(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = tokio::time::timeout(INPUT_BUSY_WAIT, self.input_lock.lock())
+            .await
+            .map_err(|_| anyhow::anyhow!("{} is busy with other input", self.config.name))?;
+        let status = self.status().await?;
+        ensure!(
+            status == "running",
+            "{} is {status}; input would be lost",
+            self.config.name
+        );
+        Ok(guard)
+    }
+
+    async fn mouse_move(&self, x: u32, y: u32) -> Result<()> {
+        let _input = self.input().await?;
+        self.send_events(self.move_events(x, y)?).await
+    }
+
+    async fn click(
+        &self,
+        (x, y): (u32, u32),
+        button: Button,
+        double: bool,
+        screenshot: bool,
+    ) -> Result<Option<Screenshot>> {
+        let _input = self.input().await?;
+        self.send_events(self.move_events(x, y)?).await?;
+        for i in 0..if double { 2 } else { 1 } {
+            if i > 0 {
+                tokio::time::sleep(POINTER_STEP).await;
+            }
+            self.press_release(button_name(button)).await?;
+        }
+        if !screenshot {
+            return Ok(None);
+        }
+        // Still holding the input lock: no other input between the click
+        // and its screenshot.
+        tokio::time::sleep(CLICK_SETTLE).await;
+        Ok(Some(self.screenshot().await?))
+    }
+
+    async fn drag(&self, from: (u32, u32), to: (u32, u32)) -> Result<()> {
+        let _input = self.input().await?;
+        // Check both ends before pressing anything.
+        self.move_events(to.0, to.1)?;
+        self.send_events(self.move_events(from.0, from.1)?).await?;
+        let pressed = self.send_events(vec![btn("left", true)]).await;
+        let result = async {
+            pressed?;
+            for step in 1..=DRAG_STEPS {
+                tokio::time::sleep(POINTER_STEP).await;
+                let x = lerp(from.0, to.0, step, DRAG_STEPS);
+                let y = lerp(from.1, to.1, step, DRAG_STEPS);
+                self.send_events(self.move_events(x, y)?).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        // Never leave the button down.
+        let released = self.send_events(vec![btn("left", false)]).await;
+        result.and(released)
+    }
+
+    async fn scroll(&self, (x, y): (u32, u32), dy: i32) -> Result<()> {
+        ensure!(
+            dy != 0 && dy.unsigned_abs() <= MAX_SCROLL,
+            "dy must be between -{MAX_SCROLL} and {MAX_SCROLL}, and not 0"
+        );
+        let _input = self.input().await?;
+        self.send_events(self.move_events(x, y)?).await?;
+        let wheel = if dy > 0 { "wheel-down" } else { "wheel-up" };
+        for _ in 0..dy.unsigned_abs() {
+            self.press_release(wheel).await?;
+        }
+        Ok(())
+    }
+
+    async fn type_keys(&self, keys: &[Vec<&str>]) -> Result<()> {
+        let _input = self.input().await?;
+        for k in keys {
+            self.send_key(k, KEY_HOLD).await?;
+        }
+        Ok(())
+    }
+
+    /// Presses and releases a button in separate frames, as a real mouse
+    /// does. The release is sent even if the press failed.
+    async fn press_release(&self, button: &str) -> Result<()> {
+        let pressed = self.send_events(vec![btn(button, true)]).await;
+        let released = self.send_events(vec![btn(button, false)]).await;
+        pressed.and(released)
+    }
+
     async fn screenshot(&self) -> Result<Screenshot> {
         let png = self.screendump("screen.png", "png").await?;
         let (width, height) = input::png_size(&png)?;
+        *self.screen_size.lock().unwrap() = (width, height);
         Ok(Screenshot { png, width, height })
+    }
+
+    /// Absolute pointer events for pixel (`x`, `y`) of the last screenshot.
+    fn move_events(&self, x: u32, y: u32) -> Result<Vec<Value>> {
+        let (w, h) = *self.screen_size.lock().unwrap();
+        let axis = |name: &str, v: u32| serde_json::json!({"type": "abs", "data": {"axis": name, "value": v}});
+        Ok(vec![
+            axis("x", input::abs_axis(x, w)?),
+            axis("y", input::abs_axis(y, h)?),
+        ])
+    }
+
+    async fn send_events(&self, events: Vec<Value>) -> Result<()> {
+        self.qmp
+            .execute(
+                "input-send-event",
+                Some(serde_json::json!({"events": events})),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Presses `keys` together, holds them for `hold` and releases them in
+    /// reverse order. Sent as plain input events (not `send-key`, whose
+    /// internal queue silently drops keys when typing is fast) and paced
+    /// here, so the guest sees every key.
+    async fn send_key(&self, keys: &[&str], hold: Duration) -> Result<()> {
+        let event = |k: &str, down: bool| {
+            serde_json::json!({"type": "key", "data": {"down": down,
+                "key": {"type": "qcode", "data": k}}})
+        };
+        let pressed = self
+            .send_events(keys.iter().map(|k| event(k, true)).collect())
+            .await;
+        tokio::time::sleep(hold).await;
+        // Released even if the press failed: never leave a modifier down.
+        let released = self
+            .send_events(keys.iter().rev().map(|k| event(k, false)).collect())
+            .await;
+        tokio::time::sleep(hold).await;
+        pressed.and(released)
     }
 
     /// Has QEMU write the screen to `<rt>/<file>` and reads it back.
@@ -764,6 +973,24 @@ where
             since = Instant::now();
         }
     }
+}
+
+/// The point `step / steps` of the way from `a` to `b`.
+fn lerp(a: u32, b: u32, step: u32, steps: u32) -> u32 {
+    let (a, b) = (i64::from(a), i64::from(b));
+    (a + (b - a) * i64::from(step) / i64::from(steps)) as u32
+}
+
+fn button_name(b: Button) -> &'static str {
+    match b {
+        Button::Left => "left",
+        Button::Right => "right",
+        Button::Middle => "middle",
+    }
+}
+
+fn btn(button: &str, down: bool) -> Value {
+    serde_json::json!({"type": "btn", "data": {"button": button, "down": down}})
 }
 
 /// QEMU's own memory on top of guest RAM: `max(minimum, memory / 16)`.
@@ -922,6 +1149,183 @@ mod tests {
         let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(take_capped(&sock, 3).is_err());
         assert!(take_capped(dir.path(), 3).is_err());
+    }
+
+    /// A fake QEMU that records commands, reports `status` and fails the
+    /// `fail_at`th `input-send-event` (1-based).
+    async fn fake_vm(
+        status: &'static str,
+        fail_at: Option<usize>,
+    ) -> (tempfile::TempDir, Running, Arc<Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            w.write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n")
+                .await
+                .unwrap();
+            let mut events = 0;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let reply = match req["execute"].as_str().unwrap() {
+                    "query-status" => serde_json::json!({"return": {"status": status}}),
+                    "input-send-event" => {
+                        events += 1;
+                        seen.lock()
+                            .unwrap()
+                            .push(req["arguments"]["events"].clone());
+                        if Some(events) == fail_at {
+                            serde_json::json!({"error": {"class": "GenericError", "desc": "x"}})
+                        } else {
+                            serde_json::json!({"return": {}})
+                        }
+                    }
+                    _ => serde_json::json!({"return": {}}),
+                };
+                let mut reply = reply;
+                if let Some(id) = req.get("id") {
+                    reply["id"] = id.clone();
+                }
+                w.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+            }
+        });
+        let qmp = Qmp::connect(&path, Duration::from_secs(5)).await.unwrap();
+        let (_tx, exited) = watch::channel(false);
+        let vm = Running {
+            config: VmConfig {
+                name: "dev".into(),
+                uuid: "4f1c2b9e-0d3a-4c5e-8f7a-1b2c3d4e5f60".into(),
+                image: "ubuntu-26.04".into(),
+                vcpus: 1,
+                memory_mib: 512,
+                disk_gib: 10,
+                net: NetProfile::Offline,
+                agent_control: false,
+            },
+            pid: 0,
+            qmp,
+            qga_sock: "/nonexistent".into(),
+            rt_dir: "/nonexistent".into(),
+            screen_lock: tokio::sync::Mutex::new(()),
+            input_lock: tokio::sync::Mutex::new(()),
+            screen_size: Mutex::new(qemu::SCREEN),
+            qga_lock: tokio::sync::Mutex::new(()),
+            disk_full: AtomicBool::new(false),
+            exited,
+        };
+        (dir, vm, log)
+    }
+
+    /// The recorded events as compact strings, e.g. `btn left 1`.
+    fn summary(log: &Mutex<Vec<Value>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|events| {
+                events
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| {
+                        let d = &e["data"];
+                        match e["type"].as_str().unwrap() {
+                            "abs" => format!("{}={}", d["axis"].as_str().unwrap(), d["value"]),
+                            "btn" => format!("btn {} {}", d["button"].as_str().unwrap(), d["down"]),
+                            "key" => {
+                                format!("key {} {}", d["key"]["data"].as_str().unwrap(), d["down"])
+                            }
+                            t => panic!("{t}"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn input_events() {
+        let (_d, vm, log) = fake_vm("running", None).await;
+        vm.click((640, 400), Button::Right, true, false)
+            .await
+            .unwrap();
+        let (x, y) = (
+            input::abs_axis(640, 1280).unwrap(),
+            input::abs_axis(400, 800).unwrap(),
+        );
+        assert_eq!(
+            summary(&log),
+            [
+                format!("x={x} y={y}"),
+                "btn right true".into(),
+                "btn right false".into(),
+                "btn right true".into(),
+                "btn right false".into(),
+            ]
+        );
+        log.lock().unwrap().clear();
+        vm.scroll((0, 0), -2).await.unwrap();
+        assert_eq!(
+            summary(&log)[1..],
+            [
+                "btn wheel-up true",
+                "btn wheel-up false",
+                "btn wheel-up true",
+                "btn wheel-up false"
+            ]
+        );
+        assert!(vm.scroll((0, 0), 51).await.is_err());
+        log.lock().unwrap().clear();
+        vm.send_key(&input::chord("ctrl+c").unwrap(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary(&log),
+            ["key ctrl true key c true", "key c false key ctrl false"]
+        );
+        log.lock().unwrap().clear();
+        assert!(vm.drag((0, 0), (0, 800)).await.is_err());
+        assert!(summary(&log).is_empty(), "nothing pressed for a bad drag");
+    }
+
+    #[tokio::test]
+    async fn releases_after_errors() {
+        // The press fails: the release is still sent.
+        let (_d, vm, log) = fake_vm("running", Some(1)).await;
+        assert!(vm.send_key(&["shift", "a"], Duration::ZERO).await.is_err());
+        assert_eq!(summary(&log)[1], "key a false key shift false");
+        // A drag step fails: the button is still released.
+        let (_d, vm, log) = fake_vm("running", Some(3)).await;
+        assert!(vm.drag((0, 0), (10, 10)).await.is_err());
+        assert_eq!(summary(&log).last().unwrap(), "btn left false");
+        // The second click of a double click fails to press.
+        let (_d, vm, log) = fake_vm("running", Some(4)).await;
+        assert!(vm.click((1, 1), Button::Left, true, false).await.is_err());
+        assert_eq!(summary(&log).last().unwrap(), "btn left false");
+    }
+
+    #[tokio::test]
+    async fn no_input_into_a_paused_vm() {
+        let (_d, vm, log) = fake_vm("paused", None).await;
+        let err = vm.type_keys(&[vec!["a"]]).await.unwrap_err();
+        assert!(err.to_string().contains("paused"), "{err}");
+        assert!(vm.mouse_move(1, 1).await.is_err());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drag_path() {
+        assert_eq!(lerp(0, 1279, 0, 10), 0);
+        assert_eq!(lerp(0, 1279, 5, 10), 639);
+        assert_eq!(lerp(0, 1279, 10, 10), 1279);
+        assert_eq!(lerp(100, 0, 10, 10), 0);
+        assert_eq!(lerp(100, 0, 3, 10), 70);
     }
 
     #[test]

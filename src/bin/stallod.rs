@@ -22,7 +22,7 @@ use stallo::images;
 use stallo::paths::{Paths, safe_remove};
 use stallo::read_line;
 use stallo::vm::{
-    EXEC_DEFAULT_TIMEOUT, Manager, NewVm, READY_TIMEOUT, SCREEN_DEFAULT_STABLE,
+    Button, EXEC_DEFAULT_TIMEOUT, Manager, NewVm, READY_TIMEOUT, SCREEN_DEFAULT_STABLE,
     SCREEN_DEFAULT_TIMEOUT, Screenshot,
 };
 use tokio::net::unix::UCred;
@@ -222,6 +222,12 @@ fn op_name(r: &Request) -> &'static str {
         Request::Rm { .. } => "rm",
         Request::Screenshot { .. } => "screenshot",
         Request::WaitForScreen { .. } => "wait_for_screen",
+        Request::MouseMove { .. } => "mouse_move",
+        Request::Click { .. } => "click",
+        Request::Drag { .. } => "drag",
+        Request::Scroll { .. } => "scroll",
+        Request::TypeText { .. } => "type_text",
+        Request::Key { .. } => "key",
         Request::Resume { .. } => "resume",
         Request::Host => "host",
         Request::Images => "images",
@@ -322,6 +328,46 @@ async fn dispatch(m: &Arc<Manager>, request: Request) -> Result<Value> {
                 timeout_ms.map_or(SCREEN_DEFAULT_TIMEOUT.max(stable), Duration::from_millis);
             let (shot, settled) = m.wait_for_screen(&name, stable, limit).await?;
             screen(shot, Some(settled))
+        }
+        Request::MouseMove { name, x, y } => {
+            m.mouse_move(&name, x, y).await?;
+            Value::Null
+        }
+        Request::Click {
+            name,
+            x,
+            y,
+            button,
+            double,
+            screenshot,
+        } => {
+            let button = button.unwrap_or(Button::Left);
+            match m.click(&name, (x, y), button, double, screenshot).await? {
+                Some(shot) => screen(shot, None),
+                None => Value::Null,
+            }
+        }
+        Request::Drag {
+            name,
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+        } => {
+            m.drag(&name, (from_x, from_y), (to_x, to_y)).await?;
+            Value::Null
+        }
+        Request::Scroll { name, x, y, dy } => {
+            m.scroll(&name, x, y, dy).await?;
+            Value::Null
+        }
+        Request::TypeText { name, text } => {
+            m.type_text(&name, &text).await?;
+            Value::Null
+        }
+        Request::Key { name, keys } => {
+            m.key(&name, &keys).await?;
+            Value::Null
         }
         Request::Resume { name } => {
             m.resume(&name).await?;

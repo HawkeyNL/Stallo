@@ -5,8 +5,9 @@
 
 use anyhow::{Result, bail, ensure};
 
-/// Longest `type_text` input.
-pub const MAX_TEXT: usize = 4096;
+/// Longest `type_text` input. Typing takes ~15 ms per key and holds the
+/// VM's input for that long; bulk text belongs in `file_write`.
+pub const MAX_TEXT: usize = 1024;
 /// Most keys pressed together in one chord.
 const MAX_CHORD: usize = 6;
 /// QEMU's absolute pointer axes run from 0 to this value.
