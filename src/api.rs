@@ -148,6 +148,25 @@ pub enum Request {
     Resume {
         name: String,
     },
+    /// Takes a snapshot (default name `snap<N>`); with RAM if the VM runs.
+    Snapshot {
+        name: String,
+        tag: Option<String>,
+    },
+    /// Lists a VM's snapshots, oldest first.
+    Snapshots {
+        name: String,
+    },
+    /// Restores a snapshot (default: the newest).
+    Restore {
+        name: String,
+        tag: Option<String>,
+    },
+    /// Deletes a snapshot (humans only).
+    SnapshotDelete {
+        name: String,
+        tag: String,
+    },
     /// Turns agent control of a VM on or off (humans only).
     SetAgent {
         name: String,
@@ -285,7 +304,9 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
     match r {
         List | Host | Images => Gate::Open,
         New { .. } => Gate::Create,
-        Rm { .. } | Pull { .. } | Resume { .. } | SetAgent { .. } => Gate::Closed,
+        Rm { .. } | Pull { .. } | Resume { .. } | SetAgent { .. } | SnapshotDelete { .. } => {
+            Gate::Closed
+        }
         Start { name, .. }
         | Stop { name, .. }
         | Exec { name, .. }
@@ -300,7 +321,10 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | Drag { name, .. }
         | Scroll { name, .. }
         | TypeText { name, .. }
-        | Key { name, .. } => Gate::Vm(name),
+        | Key { name, .. }
+        | Snapshot { name, .. }
+        | Snapshots { name }
+        | Restore { name, .. } => Gate::Vm(name),
     }
 }
 
@@ -403,6 +427,20 @@ mod tests {
             Gate::Closed
         );
         assert_eq!(agent_gate(&Request::Rm { name: name() }), Gate::Closed);
+        assert_eq!(
+            agent_gate(&Request::SnapshotDelete {
+                name: name(),
+                tag: "s1".into()
+            }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::Restore {
+                name: name(),
+                tag: None
+            }),
+            Gate::Vm("dev")
+        );
         assert_eq!(
             agent_gate(&Request::TypeText {
                 name: name(),

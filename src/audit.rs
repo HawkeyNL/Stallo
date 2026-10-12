@@ -120,6 +120,22 @@ pub fn describe(r: &Request) -> Described<'_> {
         }
         Request::Key { name, keys } => ("key", Some(name), vec![("keys", len(keys))], None),
         Request::Resume { name } => ("resume", Some(name), vec![], None),
+        Request::Snapshot { name, tag } => (
+            "snapshot",
+            Some(name),
+            vec![("tag", tag.as_deref().map_or(0, len))],
+            None,
+        ),
+        Request::Snapshots { name } => ("snapshots", Some(name), vec![], None),
+        Request::Restore { name, tag } => (
+            "restore",
+            Some(name),
+            vec![("tag", tag.as_deref().map_or(0, len))],
+            None,
+        ),
+        Request::SnapshotDelete { name, tag } => {
+            ("snapshot_delete", Some(name), vec![("tag", len(tag))], None)
+        }
         Request::SetAgent { name, on } => ("agent", Some(name), vec![("on", u64::from(*on))], None),
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),

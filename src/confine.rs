@@ -7,7 +7,8 @@
 //! Before `exec`, each QEMU child restricts itself with a Landlock ruleset
 //! built from [`qemu_rules`]:
 //!
-//! - its own disk, firmware variables and seed, and the read-only base image;
+//! - its own disk, firmware variables, snapshot state and seed, and the
+//!   read-only base image;
 //! - its own runtime directory (QMP and QGA sockets);
 //! - the read-only system files QEMU loads (`/usr`, `ld.so.cache`, a few
 //!   `/sys` and `/proc/sys` entries) and the device nodes it uses;
@@ -72,6 +73,7 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> 
         (base_image.into(), ReadFile.into()),
         (vm_dir.join(crate::qemu::DISK), disk),
         (vm_dir.join(crate::qemu::VARS), disk),
+        (vm_dir.join(crate::qemu::STATE), disk),
         (vm_dir.join(crate::qemu::SEED), ReadFile.into()),
         // QEMU removes a stale socket and creates a new one at start, and
         // removes it again at exit.
@@ -510,9 +512,14 @@ assert libc.syscall(250, 0, 0) == -1 and ctypes.get_errno() == 1, "keyctl"
     }
 
     fn qemu_rules_files(dir: &Path) -> Vec<PathBuf> {
-        [crate::qemu::DISK, crate::qemu::VARS, crate::qemu::SEED]
-            .iter()
-            .map(|f| dir.join(f))
-            .collect()
+        [
+            crate::qemu::DISK,
+            crate::qemu::VARS,
+            crate::qemu::STATE,
+            crate::qemu::SEED,
+        ]
+        .iter()
+        .map(|f| dir.join(f))
+        .collect()
     }
 }

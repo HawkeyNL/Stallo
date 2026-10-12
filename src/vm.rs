@@ -44,7 +44,7 @@ pub const EXEC_MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 pub const FILE_MAX: usize = (16 << 20) - 1;
 const FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a guest command waits for the one before it to finish.
-const QGA_BUSY_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const QGA_BUSY_WAIT: Duration = Duration::from_secs(30);
 /// Largest screendump read back from QEMU. The guest picks the resolution,
 /// but bochs-display has 16 MiB of video memory: at most 4 Mi pixels at
 /// 32 bpp, a 12 MiB PPM. (A 16 bpp mode with more pixels exceeds this and
@@ -114,12 +114,11 @@ pub struct Running {
     input_lock: tokio::sync::Mutex<()>,
     /// Screen size from the last screenshot; pointer coordinates use it.
     screen_size: Mutex<(u32, u32)>,
-    /// One guest-agent operation at a time.
     /// The guest-agent connection, kept between operations (the agent
     /// sleeps ~100 ms after every disconnect), one operation at a time.
-    qga: tokio::sync::Mutex<Option<Qga>>,
+    pub(crate) qga: tokio::sync::Mutex<Option<Qga>>,
     /// Paused by the disk watchdog.
-    disk_full: AtomicBool,
+    pub(crate) disk_full: AtomicBool,
     /// Becomes `true` once QEMU has exited and everything is cleaned up.
     exited: watch::Receiver<bool>,
 }
@@ -172,7 +171,7 @@ impl Manager {
     // ponytail: entries are never removed (removing one would let two
     // callers hold different locks for one name); the map grows by the
     // number of distinct VM names ever used.
-    async fn lock(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(crate) async fn lock(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self
             .ops
             .lock()
@@ -212,7 +211,7 @@ impl Manager {
 
     /// Validates `name` and checks that its directory exists, before any
     /// lock is taken for it.
-    fn check_exists(&self, name: &str) -> Result<()> {
+    pub(crate) fn check_exists(&self, name: &str) -> Result<()> {
         validate_name(name)?;
         ensure!(
             self.paths.vm_dir(name).exists(),
@@ -284,6 +283,7 @@ impl Manager {
         );
         qemu::create_disk(&base, &dir.join(qemu::DISK), cfg.disk_gib).await?;
         qemu::create_vars(&dir.join(qemu::VARS)).await?;
+        qemu::create_state(&dir.join(qemu::STATE)).await?;
 
         let password = seed::generate_password()?;
         fs::OpenOptions::new()
@@ -324,6 +324,10 @@ impl Manager {
                 .create_new(true)
                 .mode(0o600)
                 .open(rt_dir.join(f))?;
+        }
+        // VMs created before snapshots existed have no state image yet.
+        if !vm_dir.join(qemu::STATE).exists() {
+            qemu::create_state(&vm_dir.join(qemu::STATE)).await?;
         }
         let argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
 
@@ -620,7 +624,7 @@ impl Manager {
         Ok(())
     }
 
-    fn running_vm(&self, name: &str) -> Result<Arc<Running>> {
+    pub(crate) fn running_vm(&self, name: &str) -> Result<Arc<Running>> {
         self.check_exists(name)?;
         self.running(name)
             .with_context(|| format!("{name} is not running; start it with `stallo start {name}`"))
@@ -1199,13 +1203,7 @@ fn file_status(out: &ExecOutput, what: &str, path: &str) -> Result<()> {
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-    let reason: String = last
-        .unwrap_or("failed")
-        .trim_start_matches("dd: ")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect();
+    let reason = crate::printable(last.unwrap_or("failed").trim_start_matches("dd: "), 200);
     bail!("cannot {what} {}: {reason}", path.escape_debug())
 }
 

@@ -465,6 +465,13 @@ async fn dispatch(m: &Arc<Manager>, via: Via, request: Request) -> Result<Value>
             m.resume(&name).await?;
             Value::Null
         }
+        Request::Snapshot { name, tag } => json!(m.snapshot(&name, tag.as_deref()).await?),
+        Request::Snapshots { name } => json!(m.snapshots(&name).await?),
+        Request::Restore { name, tag } => json!(m.restore(&name, tag.as_deref()).await?),
+        Request::SnapshotDelete { name, tag } => {
+            m.delete_snapshot(&name, &tag).await?;
+            Value::Null
+        }
         Request::Host => json!(m.host()?),
         Request::Images => json!(
             images::catalog()

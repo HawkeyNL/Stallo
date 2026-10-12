@@ -38,6 +38,10 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Event {
     pub event: String,
     pub data: Value,
+    /// When QEMU emitted it, in microseconds of QEMU's wall clock (0 if
+    /// missing). Events are queued while QEMU's main loop is busy (for
+    /// example during a snapshot), so the arrival time can be much later.
+    pub micros: u64,
 }
 
 type Reply = std::result::Result<Value, String>;
@@ -203,9 +207,16 @@ async fn read_loop(
                 continue;
             }
             // An error only means nobody is subscribed right now.
+            let t = &msg["timestamp"];
+            let micros = t["seconds"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_mul(1_000_000)
+                .saturating_add(t["microseconds"].as_u64().unwrap_or(0).min(999_999));
             let _ = events.send(Event {
                 event: name.to_owned(),
                 data: msg["data"].take(),
+                micros,
             });
             continue;
         }
@@ -307,6 +318,7 @@ mod tests {
         assert_eq!(b.unwrap()["cmd"], "query-name");
         let ev = events.recv().await.unwrap();
         assert_eq!(ev.event, "STOP");
+        assert_eq!(ev.micros, 0, "no timestamp");
     }
 
     #[tokio::test]

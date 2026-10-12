@@ -17,6 +17,7 @@ pub mod qemu;
 pub mod qga;
 pub mod qmp;
 pub mod seed;
+pub mod snapshot;
 pub mod vm;
 
 use std::process::Stdio;
@@ -84,6 +85,25 @@ pub async fn run_tool(cmd: &mut Command, limit: Duration) -> anyhow::Result<Vec<
     Ok(out.stdout)
 }
 
+/// Text from an untrusted peer (guest, QEMU), made safe to show: at most
+/// `max` characters, without control characters or the Unicode format
+/// characters that reorder or hide text (bidi overrides, zero-width).
+pub fn printable(s: &str, max: usize) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{FEFF}'
+                )
+        })
+        .take(max)
+        .collect()
+}
+
 /// `N` bytes from the kernel's CSPRNG.
 pub fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     use std::io::Read;
@@ -115,6 +135,14 @@ mod tests {
 
         let mut empty: &[u8] = b"";
         assert!(!read_line(&mut empty, &mut buf, 4).await.unwrap());
+    }
+
+    #[test]
+    fn printable_drops_control_and_bidi() {
+        use super::printable;
+        let s = "a\nb\u{1b}[0m\u{202E}c\u{200B}d";
+        assert_eq!(printable(s, 200), "ab[0mcd");
+        assert_eq!(printable(&"é".repeat(300), 200).chars().count(), 200);
     }
 
     #[tokio::test]

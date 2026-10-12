@@ -150,6 +150,20 @@ pub fn snapshot(
     })
 }
 
+/// Whether a snapshot fits: `need_bytes` (the guest RAM it stores; 0 for
+/// disk only) must fit above the floor. Checked before every snapshot.
+pub fn check_snapshot_space(free_bytes: u64, floor_gib: u64, need_bytes: u64) -> Result<()> {
+    let need = floor_gib.saturating_mul(GIB).saturating_add(need_bytes);
+    ensure!(
+        free_bytes >= need,
+        "not enough disk space for a snapshot: {:.1} GiB free, {:.1} GiB needed ({floor_gib} GiB floor + {:.1} GiB of guest RAM)",
+        free_bytes as f64 / GIB as f64,
+        need as f64 / GIB as f64,
+        need_bytes as f64 / GIB as f64
+    );
+    Ok(())
+}
+
 /// Whether free space is below the floor.
 pub fn below_floor(free_bytes: u64, floor_gib: u64) -> bool {
     free_bytes < floor_gib.saturating_mul(GIB)
@@ -282,6 +296,15 @@ mod tests {
     fn floor() {
         assert!(below_floor(19 * GIB, 20));
         assert!(!below_floor(20 * GIB, 20));
+    }
+
+    #[test]
+    fn snapshot_space() {
+        assert!(check_snapshot_space(22 * GIB, 20, 2 * GIB).is_ok());
+        let err = check_snapshot_space(22 * GIB - 1, 20, 2 * GIB).unwrap_err();
+        assert!(err.to_string().contains("22.0 GiB needed"), "{err}");
+        assert!(check_snapshot_space(20 * GIB, 20, 0).is_ok());
+        assert!(check_snapshot_space(u64::MAX, u64::MAX, u64::MAX).is_ok());
     }
 
     #[test]
