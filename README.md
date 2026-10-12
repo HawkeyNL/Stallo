@@ -36,6 +36,15 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
+KVM integration tests boot real, offline VMs (one at a time, at most
+2 vCPUs and 2 GiB each) and are skipped unless asked for. They need the
+Ubuntu 26.04 image in the dev-mode cache (`stallo images pull ubuntu-26.04`)
+and run the daemon as a transient `systemd-run --user` unit:
+
+```sh
+STALLO_IT=1 cargo test -- --ignored --test-threads=1
+```
+
 Run the daemon in dev mode (being built in milestone M0). Dev mode runs as
 your own user under your systemd user manager, with cgroup delegation so it
 can set per-VM limits. Data lives
