@@ -10,13 +10,15 @@ publish = false
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
-rustix = { version = "1.1.5", features = ["fs"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.8"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

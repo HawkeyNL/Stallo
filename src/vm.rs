@@ -448,6 +448,7 @@ impl Manager {
         admin: bool,
         limit: Duration,
     ) -> Result<ExecOutput> {
+        self.check_exists(name)?;
         ensure!(!argv.is_empty(), "nothing to run");
         ensure!(
             limit >= Duration::from_secs(1),

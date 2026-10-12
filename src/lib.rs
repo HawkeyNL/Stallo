@@ -3,6 +3,7 @@
 //! `stallod` (the daemon) owns every VM; `stallo` (the CLI) talks to it over
 //! a Unix socket.
 
+pub mod api;
 pub mod cgroup;
 pub mod config;
 pub mod images;
