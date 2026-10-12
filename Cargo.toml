@@ -1,0 +1,15 @@
+[package]
+name = "stallo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Agent-first VM manager for Ubuntu (QEMU/KVM)"
+repository = "https://github.com/HawkeyNL/Stallo"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+# Unsafe code is denied crate-wide; the few places that need it (pre_exec)
+# opt in locally with a SAFETY comment.
+unsafe_code = "deny"
