@@ -53,7 +53,8 @@ fn run(base: &Path, runtime: &Path) {
             .success();
         assert!(ok);
     }
-    for f in [qemu::VARS, qemu::STATE, qemu::SEED] {
+    fs::create_dir(own.join(qemu::STATES)).unwrap();
+    for f in [qemu::VARS, qemu::SEED] {
         fs::write(own.join(f), b"").unwrap();
     }
     for f in qemu::SCREEN_FILES {

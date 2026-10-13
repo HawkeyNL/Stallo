@@ -106,18 +106,23 @@ impl Cgroups {
         Ok(dir)
     }
 
-    /// `memory.max - memory.current` of `vm-<name>`: memory the VM may still
-    /// take. 0 if unknown.
+    /// `memory.max - (memory.current - file)` of `vm-<name>`: memory the VM
+    /// may still take. Page cache (`file`, e.g. snapshot RAM images) is left
+    /// out: the host counts it as available too, and it can be reclaimed.
+    /// 0 if unknown.
     pub fn unused_memory_bytes(&self, name: &str) -> u64 {
-        let read = |f: &str| -> Option<u64> {
-            fs::read_to_string(self.vm_dir(name).join(f))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
-        };
+        let dir = self.vm_dir(name);
+        let read =
+            |f: &str| -> Option<u64> { fs::read_to_string(dir.join(f)).ok()?.trim().parse().ok() };
+        let file = fs::read_to_string(dir.join("memory.stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.lines()
+                    .find_map(|l| l.strip_prefix("file ")?.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
         match (read("memory.max"), read("memory.current")) {
-            (Some(max), Some(current)) => max.saturating_sub(current),
+            (Some(max), Some(current)) => max.saturating_sub(current.saturating_sub(file)),
             _ => 0,
         }
     }
@@ -351,6 +356,13 @@ mod tests {
 
         fs::write(vm.join("memory.current"), "1048576\n").unwrap();
         assert_eq!(cg.unused_memory_bytes("dev"), (1 << 30) - (1 << 20));
+        // Page cache in the VM's cgroup is not memory it still takes.
+        fs::write(
+            vm.join("memory.stat"),
+            "anon 524288\nfile 524288\nfile_dirty 0\n",
+        )
+        .unwrap();
+        assert_eq!(cg.unused_memory_bytes("dev"), (1 << 30) - (1 << 19));
         assert_eq!(cg.unused_memory_bytes("none"), 0);
         assert_eq!(
             fs::read_to_string(vm.join("cpu.max")).unwrap(),

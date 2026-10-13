@@ -11,12 +11,15 @@
 //! - one VM at a time: tests take a file lock, and refuse to start while any
 //!   other QEMU of this user runs;
 //! - the daemon runs as a transient systemd user unit (`Delegate=yes`, as in
-//!   dev mode) that the kernel confines: `MemoryMax=3G`, `CPUQuota=400%`
+//!   dev mode) that the kernel confines: `MemoryMax=3G` (guest RAM cap +
+//!   1 GiB), `CPUQuota=400%`
 //!   (admission then sees 4 cores, so 2 vCPUs fit), only
 //!   `AF_UNIX`/`AF_NETLINK` sockets (no IP at all), and
 //!   `RuntimeMaxSec=900` as a dead-man switch if the test process dies;
 //! - every QEMU in the unit must be offline (`-nic none`, no network
-//!   device or host listener), with at most 2 vCPUs and 2 GiB;
+//!   device or host listener), with at most 2 vCPUs and 2 GiB (one
+//!   measurement may ask for 4 GiB with [`Daemon::start_sized`], and only
+//!   while the host keeps 6 GiB available besides);
 //! - data lives in `$HOME/.cache/stallo-it/<test>/`, runtime files in
 //!   `$XDG_RUNTIME_DIR/stallo-it-<test>/`;
 //! - a guard kills the unit's whole cgroup and removes both directories
@@ -36,6 +39,10 @@ use stallo::paths::safe_remove;
 
 pub const MAX_VCPUS: u32 = 2;
 pub const MAX_MEMORY_MIB: u64 = 2048;
+/// The most any test may ask for, see [`Daemon::start_sized`].
+pub const MAX_SIZED_MIB: u64 = 4096;
+/// MemAvailable that must remain besides a sized test's VM.
+pub const HEADROOM_MIB: u64 = 6144;
 
 pub struct Daemon {
     pub name: String,
@@ -47,6 +54,8 @@ pub struct Daemon {
     pub runtime: PathBuf,
     pub socket: PathBuf,
     pub cgroup: PathBuf,
+    /// Largest guest RAM allowed in this daemon's VMs, in MiB.
+    max_memory_mib: u64,
     log: PathBuf,
     _lock: fs::File,
 }
@@ -120,6 +129,28 @@ pub fn exclusive() -> (fs::File, PathBuf) {
 impl Daemon {
     /// Starts stallod for test `name` with `config` as its stallod.toml.
     pub fn start(name: &str, config: &str) -> Self {
+        Self::start_sized(name, config, MAX_MEMORY_MIB)
+    }
+
+    /// MemAvailable of the host, in MiB.
+    pub fn host_available_mib() -> u64 {
+        let meminfo = fs::read_to_string("/proc/meminfo").unwrap();
+        let line = meminfo
+            .lines()
+            .find(|l| l.starts_with("MemAvailable:"))
+            .unwrap();
+        line.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            / 1024
+    }
+
+    /// [`Daemon::start`] for guests of up to `max_memory_mib` (at most
+    /// [`MAX_SIZED_MIB`]). The unit's `MemoryMax` is that plus 1 GiB.
+    pub fn start_sized(name: &str, config: &str, max_memory_mib: u64) -> Self {
+        assert!(max_memory_mib <= MAX_SIZED_MIB);
         let home = env_path("HOME");
         let (lock, cache_root) = exclusive();
 
@@ -157,7 +188,7 @@ impl Daemon {
             .args(["-p", "Delegate=yes", "-p", "CPUWeight=50"])
             .args([
                 "-p",
-                "MemoryMax=3G",
+                &format!("MemoryMax={}M", max_memory_mib + 1024),
                 "-p",
                 "MemorySwapMax=0",
                 "-p",
@@ -202,6 +233,7 @@ impl Daemon {
             runtime,
             socket,
             cgroup,
+            max_memory_mib,
             log,
             _lock: lock,
         };
@@ -281,7 +313,7 @@ impl Daemon {
                     .filter(|a| !a.is_empty())
                     .map(|a| String::from_utf8_lossy(a).into_owned())
                     .collect();
-                check_argv(&argv);
+                check_argv_max(&argv, self.max_memory_mib);
             }
         }
     }
@@ -305,6 +337,10 @@ fn pids_in(cgroup: &Path) -> Vec<u32> {
 
 /// The harness rules for a QEMU command line.
 pub fn check_argv(argv: &[String]) {
+    check_argv_max(argv, MAX_MEMORY_MIB);
+}
+
+fn check_argv_max(argv: &[String], max_memory_mib: u64) {
     // `--nic` and `-nic` are the same option to QEMU.
     let flag = |a: &str| format!("-{}", a.trim_start_matches('-'));
     let after = |name: &str| -> Vec<&str> {
@@ -344,7 +380,7 @@ pub fn check_argv(argv: &[String]) {
     for mem in after("-m") {
         let mem: u64 = mem.parse().unwrap();
         assert!(
-            mem <= MAX_MEMORY_MIB,
+            mem <= max_memory_mib,
             "too much memory for this host: {mem}"
         );
     }

@@ -73,7 +73,10 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, backing: &[PathBuf]) -> Vec<Rule
         ("/dev/urandom".into(), ReadFile.into()),
         (vm_dir.join(crate::qemu::DISK), disk),
         (vm_dir.join(crate::qemu::VARS), disk),
-        (vm_dir.join(crate::qemu::STATE), disk),
+        // The images of RAM snapshots: the daemon creates them; QEMU may
+        // read and write them, never create, link or remove files there.
+        // (It is asked to open one only during a snapshot job.)
+        (vm_dir.join(crate::qemu::STATES), disk),
         (vm_dir.join(crate::qemu::SEED), ReadFile.into()),
         // QEMU removes a stale socket and creates a new one at start, and
         // removes it again at exit.
@@ -415,9 +418,8 @@ mod tests {
         for d in [&own, &other, &rt] {
             fs::create_dir_all(d).unwrap();
         }
-        for f in [qemu_rules_files(&own), qemu_rules_files(&other)].concat() {
-            fs::write(f, b"x").unwrap();
-        }
+        vm_files(&own, b"x");
+        vm_files(&other, b"x");
         fs::write(&img, b"base").unwrap();
         fs::write(own.join("secret"), b"pw").unwrap();
         screen_files(&rt);
@@ -436,6 +438,23 @@ mod tests {
             confined(&rules, &format!("echo y >> {}", disk(&own))),
             Some(true)
         );
+        // Its RAM snapshot images: read and write, never create or swap.
+        let states = |d: &Path| d.join(crate::qemu::STATES);
+        let own_state = q(&states(&own).join("s1.qcow2"));
+        assert_eq!(
+            confined(&rules, &format!("cat {own_state} && echo y >> {own_state}")),
+            Some(true)
+        );
+        for denied in [
+            format!("touch {}", q(&states(&own).join("new.qcow2"))),
+            format!("ln -s /etc/passwd {}", q(&states(&own).join("l.qcow2"))),
+            format!("rm {own_state}"),
+            format!("mv {own_state} {}", q(&states(&own).join("s2.qcow2"))),
+            format!("ln {own_state} {}", q(&states(&own).join("h.qcow2"))),
+            format!("cat {}", q(&states(&other).join("s1.qcow2"))),
+        ] {
+            assert_eq!(confined(&rules, &denied), Some(false), "{denied}");
+        }
         let screen = q(&rt.join("screen.png"));
         assert_eq!(
             confined(&rules, &format!("echo png > {screen}")),
@@ -493,9 +512,7 @@ mod tests {
         for d in [&vm, &rt] {
             fs::create_dir(d).unwrap();
         }
-        for f in qemu_rules_files(&vm) {
-            fs::write(f, b"").unwrap();
-        }
+        vm_files(&vm, b"");
         fs::write(root.join("img"), b"").unwrap();
         screen_files(&rt);
         // Stands in for the daemon's API socket or another VM's QMP socket.
@@ -554,15 +571,14 @@ assert libc.syscall(250, 0, 0) == -1 and ctypes.get_errno() == 1, "keyctl"
         }
     }
 
-    fn qemu_rules_files(dir: &Path) -> Vec<PathBuf> {
-        [
-            crate::qemu::DISK,
-            crate::qemu::VARS,
-            crate::qemu::STATE,
-            crate::qemu::SEED,
-        ]
-        .iter()
-        .map(|f| dir.join(f))
-        .collect()
+    /// A VM's files with `content`, and its RAM snapshot directory with
+    /// one image.
+    fn vm_files(dir: &Path, content: &[u8]) {
+        use crate::qemu::{DISK, SEED, STATES, VARS};
+        for f in [DISK, VARS, SEED] {
+            fs::write(dir.join(f), content).unwrap();
+        }
+        fs::create_dir(dir.join(STATES)).unwrap();
+        fs::write(dir.join(STATES).join("s1.qcow2"), content).unwrap();
     }
 }

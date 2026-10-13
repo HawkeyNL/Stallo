@@ -26,8 +26,8 @@ pub const SCREEN: (u32, u32) = (1280, 800);
 pub const DISK: &str = "disk.qcow2";
 pub const VARS: &str = "vars.qcow2";
 pub const SEED: &str = "seed.iso";
-/// Holds the RAM of snapshots (see [`create_state`]).
-pub const STATE: &str = "state.qcow2";
+/// Directory with one image per RAM snapshot (see `snapshot.rs`).
+pub const STATES: &str = "states";
 pub const QMP_SOCK: &str = "qmp.sock";
 pub const QGA_SOCK: &str = "qga.sock";
 /// Screendumps; created by the daemon, written by QEMU.
@@ -57,11 +57,10 @@ pub fn argv(vm: &VmConfig, vm_dir: &Path, rt_dir: &Path) -> Result<Vec<String>> 
         NetProfile::Internet => bail!("only the offline network profile is available"),
     };
     let file = |dir: &Path, name: &str| opt_path(&dir.join(name));
-    let (disk, vars, seed, state) = (
+    let (disk, vars, seed) = (
         file(vm_dir, DISK)?,
         file(vm_dir, VARS)?,
         file(vm_dir, SEED)?,
-        file(vm_dir, STATE)?,
     );
     let (qmp, qga) = (file(rt_dir, QMP_SOCK)?, file(rt_dir, QGA_SOCK)?);
     let (name, uuid) = (&vm.name, &vm.uuid);
@@ -90,11 +89,6 @@ pub fn argv(vm: &VmConfig, vm_dir: &Path, rt_dir: &Path) -> Result<Vec<String>> 
         ),
         "-blockdev driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap".into(),
         "-device virtio-blk-pci,drive=disk0,bootindex=1,werror=stop,rerror=stop".into(),
-        // Snapshot RAM only; no device sees it.
-        format!(
-            "-blockdev driver=file,node-name=state-file,filename={state},cache.direct=on,aio=native,discard=unmap"
-        ),
-        "-blockdev driver=qcow2,node-name=state,file=state-file,discard=unmap".into(),
         format!("-blockdev driver=file,node-name=seed,filename={seed},read-only=on"),
         "-device virtio-blk-pci,drive=seed".into(),
         // No legacy VGA and no USB controller: less emulated hardware.
@@ -160,33 +154,6 @@ pub async fn create_vars(vars: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Creates the qcow2 that stores snapshot RAM, so the disk never does.
-///
-/// A RAM snapshot holds hundreds of MiB per GiB of guest RAM. After a
-/// restore, the image's active state still points at the restored
-/// snapshot's RAM clusters, so the next save copies every shared cluster
-/// before overwriting it (QEMU does not drop them on load). With the disk's
-/// 64 KiB clusters that took 30 s for a 2 GiB guest; 2 MiB clusters here
-/// make it 32 times fewer copies. Its virtual size is irrelevant: RAM is
-/// stored past the end.
-pub async fn create_state(state: &Path) -> Result<()> {
-    ensure!(!state.exists(), "{} already exists", state.display());
-    run_tool(
-        Command::new("qemu-img")
-            .args(["create", "-q", "-f", "qcow2", "-o", "cluster_size=2M"])
-            .arg(state)
-            .arg("2M"),
-        Duration::from_secs(30),
-    )
-    .await
-    .inspect_err(|_| {
-        // A partial file would be used as is at the next start.
-        let _ = std::fs::remove_file(state);
-    })
-    .context("cannot create the snapshot state image")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,8 +191,6 @@ mod tests {
 -blockdev driver=file,node-name=disk0-file,filename=/d/vms/dev/disk.qcow2,cache.direct=on,aio=native,discard=unmap \
 -blockdev driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap \
 -device virtio-blk-pci,drive=disk0,bootindex=1,werror=stop,rerror=stop \
--blockdev driver=file,node-name=state-file,filename=/d/vms/dev/state.qcow2,cache.direct=on,aio=native,discard=unmap \
--blockdev driver=qcow2,node-name=state,file=state-file,discard=unmap \
 -blockdev driver=file,node-name=seed,filename=/d/vms/dev/seed.iso,read-only=on \
 -device virtio-blk-pci,drive=seed \
 -device bochs-display,edid=on,xres=1280,yres=800 \

@@ -121,7 +121,7 @@ impl Manager {
         .await
         .context("cannot create the clone's disk")?;
         fs::copy(from.join(qemu::VARS), to.join(qemu::VARS))?;
-        qemu::create_state(&to.join(qemu::STATE)).await?;
+        crate::paths::ensure_private_dir(&to.join(qemu::STATES))?;
         fs::hard_link(from.join(qemu::SEED), to.join(qemu::SEED))?;
         VmConfig {
             name: name.to_owned(),

@@ -244,3 +244,103 @@ fn stopped_snapshots() {
     let list = call(Request::Snapshots { name: "dev".into() }).unwrap();
     assert!(list.as_array().unwrap().is_empty());
 }
+
+/// Plan M2-5 / D8: guest pause of a RAM snapshot for 2 GiB and 4 GiB
+/// guests, idle and with half the RAM in use, and the restore. 4 GiB only
+/// if the host keeps [`common::HEADROOM_MIB`] available besides it.
+#[test]
+#[ignore = "boots VMs; run with STALLO_IT=1"]
+fn pause_times() {
+    if !common::enabled() {
+        return;
+    }
+    measure(2048);
+    // Guest RAM, QEMU's overhead (its cgroup allows 256 MiB) and slack.
+    const OVERHEAD_MIB: u64 = 512;
+    let need = 4096 + OVERHEAD_MIB + common::HEADROOM_MIB;
+    let available = Daemon::host_available_mib();
+    if available < need {
+        eprintln!("MEASURE 4 GiB skipped: {available} MiB available, {need} MiB needed");
+        return;
+    }
+    measure(4096);
+}
+
+fn measure(mib: u64) {
+    let d = Daemon::start_sized(&format!("pause-{mib}"), "", mib);
+    let mem = format!("{mib}M");
+    d.ok(&["new", "dev", "--cpus", "2", "--mem", &mem, "--disk", "20G"]);
+    d.assert_safe("dev");
+    let call = |r: Request| d.api(Via::Cli, r).unwrap();
+    let snap = |tag: &str| {
+        call(Request::Snapshot {
+            name: "dev".into(),
+            tag: Some(tag.into()),
+        })
+    };
+    let gib = mib / 1024;
+    let idle = snap("idle");
+    eprintln!("MEASURE {gib} GiB idle snapshot: {idle}");
+    // Half the RAM in use, with data that does not compress or dedupe.
+    let fill = mib / 2 - 128;
+    sh(
+        &d,
+        &format!(
+            "mount -o remount,size=90% /dev/shm && head -c {fill}M /dev/urandom > /dev/shm/fill"
+        ),
+    );
+    let busy = snap("busy");
+    eprintln!("MEASURE {gib} GiB snapshot, {fill} MiB of RAM filled: {busy}");
+    let t = Instant::now();
+    let restored = call(Request::Restore {
+        name: "dev".into(),
+        tag: Some("busy".into()),
+    });
+    sh(&d, "true");
+    eprintln!(
+        "MEASURE {gib} GiB restore: {restored}; restore -> exec ok {:?}",
+        t.elapsed()
+    );
+    let again = snap("again");
+    eprintln!("MEASURE {gib} GiB snapshot after that restore: {again}");
+    // Nearly all RAM faulted in (a long-running guest): the RAM image's
+    // page cache then has only QEMU's overhead to live in.
+    let more = mib * 3 / 4 - fill;
+    sh(&d, &format!("head -c {more}M /dev/urandom > /dev/shm/more"));
+    let full = snap("full");
+    eprintln!(
+        "MEASURE {gib} GiB snapshot, {} MiB of RAM filled: {full}",
+        fill + more
+    );
+    let list = call(Request::Snapshots { name: "dev".into() });
+    eprintln!("MEASURE {gib} GiB snapshots: {list}");
+    let ram_files: u64 = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["ram_bytes"].as_u64().unwrap())
+        .sum();
+    eprintln!(
+        "MEASURE {gib} GiB RAM images on disk: {} MiB",
+        ram_files >> 20
+    );
+    // The RAM images go through the page cache, which counts against the
+    // VM's cgroup: it must never get QEMU killed.
+    let cg = d.vm_cgroup("dev");
+    let events = std::fs::read_to_string(cg.join("memory.events")).unwrap();
+    assert!(events.contains("oom_kill 0"), "{events}");
+    let peak = std::fs::read_to_string(cg.join("memory.peak")).unwrap();
+    let max = std::fs::read_to_string(cg.join("memory.max")).unwrap();
+    eprintln!(
+        "MEASURE {gib} GiB cgroup memory.peak {} MiB of memory.max {} MiB",
+        peak.trim().parse::<u64>().unwrap() >> 20,
+        max.trim().parse::<u64>().unwrap() >> 20
+    );
+    for tag in ["idle", "busy", "again", "full"] {
+        call(Request::SnapshotDelete {
+            name: "dev".into(),
+            tag: tag.into(),
+        });
+    }
+    assert!(busy["pause_ms"].as_u64().unwrap() < 60_000);
+}

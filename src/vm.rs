@@ -338,7 +338,7 @@ impl Manager {
         );
         qemu::create_disk(&base, &dir.join(qemu::DISK), cfg.disk_gib).await?;
         qemu::create_vars(&dir.join(qemu::VARS)).await?;
-        qemu::create_state(&dir.join(qemu::STATE)).await?;
+        ensure_private_dir(&dir.join(qemu::STATES))?;
 
         let password = seed::generate_password()?;
         fs::OpenOptions::new()
@@ -390,10 +390,8 @@ impl Manager {
                 .mode(0o600)
                 .open(rt_dir.join(f))?;
         }
-        // VMs created before snapshots existed have no state image yet.
-        if !vm_dir.join(qemu::STATE).exists() {
-            qemu::create_state(&vm_dir.join(qemu::STATE)).await?;
-        }
+        // VMs created before snapshots existed have no directory for them.
+        ensure_private_dir(&vm_dir.join(qemu::STATES))?;
         let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
         if paused {
             argv.push("-S".to_owned());

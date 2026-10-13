@@ -1,13 +1,20 @@
 //! Snapshots: internal qcow2 snapshots of a VM's disk and firmware
-//! variables.
+//! variables, plus the RAM of a running VM in a file of its own.
 //!
 //! A stopped VM gets disk-only snapshots through `qemu-img` (confined like
-//! QEMU). A running VM is snapshotted with QMP jobs (`snapshot-save`, `-load`,
-//! `-delete`). Its RAM ("vmstate") is written to the `state` image, and
-//! the guest is paused meanwhile (see [`crate::qemu::create_state`] for why
-//! RAM has an image of its own). Every snapshot covers all three writable
-//! nodes, `disk0`, `fw-vars` and `state`, so firmware variables always
-//! match the disk.
+//! QEMU). A running VM is snapshotted with QMP jobs (`snapshot-save`,
+//! `-load`, `-delete`) on `disk0` and `fw-vars`, so firmware variables
+//! always match the disk; the guest is paused while its RAM ("vmstate") is
+//! written.
+//!
+//! **Each RAM snapshot gets its own image**, `states/<name>.qcow2`, added to
+//! QEMU (`blockdev-add`) only for the job. Measured reason: QEMU's qcow2
+//! drops the RAM clusters from an image's active state after a save, but
+//! not after a load. RAM stored in an image that a restore went through is
+//! therefore copied cluster by cluster before the next save overwrites it:
+//! with the RAM in the disk image, a snapshot taken after a restore paused
+//! a 2 GiB guest for 30 s instead of 2.3 s. A fresh image per snapshot is
+//! never shared, and deleting a snapshot frees its RAM at once.
 //!
 //! QEMU is untrusted: snapshot lists are parsed into typed values, names
 //! that Stallo would never create are dropped, and job errors are cut and
@@ -25,13 +32,14 @@ use tokio::process::Command;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::config::validate_tag;
+use crate::paths::safe_remove;
 use crate::qmp::Qmp;
 use crate::vm::{Manager, QGA_BUSY_WAIT, Running};
-use crate::{cgroup, confine, host, qemu};
+use crate::{cgroup, confine, host, qemu, run_tool};
 
-/// The block nodes in every snapshot (named in `qemu::argv`).
-const DEVICES: [&str; 3] = ["disk0", "fw-vars", VMSTATE];
-/// The node that stores the RAM, and whose snapshot list is the VM's.
+/// The block nodes every snapshot covers (named in `qemu::argv`).
+const DEVICES: [&str; 2] = ["disk0", "fw-vars"];
+/// The node name of a RAM snapshot's image while a job uses it.
 const VMSTATE: &str = "state";
 /// Longest a snapshot job may take, every QMP reply included. RAM is
 /// written at hundreds of MB/s, so this only trips on a stuck job.
@@ -50,7 +58,7 @@ pub const MAX_SNAPSHOTS: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub name: String,
-    /// Bytes of saved RAM; 0 for a disk-only snapshot.
+    /// Host disk space its saved RAM takes; 0 for a disk-only snapshot.
     pub ram_bytes: u64,
     /// When it was taken: seconds since the Unix epoch (host clock).
     pub created: u64,
@@ -62,8 +70,6 @@ pub struct Snapshot {
 #[derive(Deserialize)]
 struct RawSnapshot {
     name: String,
-    #[serde(rename = "vm-state-size")]
-    vm_state_size: u64,
     #[serde(rename = "date-sec")]
     date_sec: u64,
     #[serde(rename = "date-nsec")]
@@ -75,7 +81,8 @@ struct RawSnapshot {
 }
 
 /// Parses a `snapshots` array (missing means none), oldest first. Names
-/// Stallo would never create are dropped.
+/// Stallo would never create are dropped. `ram_bytes` is filled in later
+/// ([`with_ram`]).
 pub fn parse_list(v: Value) -> Result<Vec<Snapshot>> {
     if v.is_null() {
         return Ok(Vec::new());
@@ -87,7 +94,7 @@ pub fn parse_list(v: Value) -> Result<Vec<Snapshot>> {
         .into_iter()
         .map(|s| Snapshot {
             name: s.name,
-            ram_bytes: s.vm_state_size,
+            ram_bytes: 0,
             created: s.date_sec,
             vm_clock_ms: s
                 .vm_clock_sec
@@ -95,6 +102,25 @@ pub fn parse_list(v: Value) -> Result<Vec<Snapshot>> {
                 .saturating_add(s.vm_clock_nsec / 1_000_000),
         })
         .collect())
+}
+
+/// The image that holds the RAM of snapshot `tag` (tags are valid file
+/// names: letters, digits, `.`, `_`, `-`, starting with a letter).
+pub fn state_file(vm_dir: &Path, tag: &str) -> PathBuf {
+    vm_dir.join(qemu::STATES).join(format!("{tag}.qcow2"))
+}
+
+/// Sets `ram_bytes` from the snapshots' RAM images (space used on disk).
+fn with_ram(mut list: Vec<Snapshot>, vm_dir: &Path) -> Vec<Snapshot> {
+    use std::os::unix::fs::MetadataExt;
+    for s in &mut list {
+        if let Ok(m) = std::fs::symlink_metadata(state_file(vm_dir, &s.name))
+            && m.is_file()
+        {
+            s.ram_bytes = (m.blocks() * 512).max(1);
+        }
+    }
+    list
 }
 
 /// The first free name of the form `snap<N>`.
@@ -105,9 +131,9 @@ pub fn next_name(names: &[String]) -> String {
         .expect("a free name exists")
 }
 
-/// A running VM's snapshots (from the `state` node), and every snapshot
-/// name in use on any of its nodes: a save that failed halfway can leave a
-/// name on `disk0` or `fw-vars` only, and QEMU refuses to reuse it.
+/// A running VM's snapshots (from `disk0`, without RAM sizes), and every
+/// snapshot name in use on either node: a save that failed halfway can
+/// leave a name on one of them only, and QEMU refuses to reuse it.
 pub async fn list_live(qmp: &Qmp) -> Result<(Vec<Snapshot>, Vec<String>)> {
     let mut nodes = qmp
         .execute("query-named-block-nodes", Some(json!({"flat": true})))
@@ -118,26 +144,95 @@ pub async fn list_live(qmp: &Qmp) -> Result<(Vec<Snapshot>, Vec<String>)> {
         let Some(n) = node["node-name"].as_str().filter(|n| DEVICES.contains(n)) else {
             continue;
         };
-        let is_state = n == VMSTATE;
+        let is_disk = n == DEVICES[0];
         let snaps = parse_list(node["image"]["snapshots"].take())?;
         names.extend(snaps.iter().map(|s| s.name.clone()));
-        if is_state {
+        if is_disk {
             list = Some(snaps);
         }
     }
     names.sort();
     names.dedup();
-    let list = list.context("QEMU did not report the snapshot state image")?;
+    let list = list.context("QEMU did not report the disk")?;
     Ok((list, names))
 }
 
-/// Saves the running VM's disk, firmware variables and RAM as `tag`. Returns
-/// how long the guest was paused. QEMU resumes the guest itself; if it does
-/// not, `cont` follows unless `hold` is set.
-pub async fn save(qmp: &Qmp, tag: &str, hold: &AtomicBool) -> Result<Option<Duration>> {
+/// Creates the empty image for the RAM of a new snapshot (replacing one
+/// that a failure left behind). 2 MiB clusters: few metadata updates.
+async fn create_state_file(vm_dir: &Path, file: &Path) -> Result<()> {
+    safe_remove(vm_dir, file)?;
+    run_tool(
+        Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2", "-o", "cluster_size=2M"])
+            .arg(file)
+            .arg("2M"),
+        Duration::from_secs(30),
+    )
+    .await
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(file);
+    })
+    .context("cannot create the image for the snapshot's RAM")?;
+    Ok(())
+}
+
+/// Runs a snapshot job with `file` attached as node [`VMSTATE`]. The page
+/// cache is used for it (no `cache.direct`): RAM is written and read in
+/// one sequential stream, about twice as fast, and the pages count against
+/// the VM's own cgroup. QEMU flushes the image before the snapshot counts.
+async fn with_state<T>(qmp: &Qmp, file: &Path, job: impl AsyncFnOnce() -> Result<T>) -> Result<T> {
+    // A node left by an interrupted job would block the name.
+    let _ = qmp
+        .execute("blockdev-del", Some(json!({"node-name": VMSTATE})))
+        .await;
+    // Never a backing file, whatever QEMU wrote into the image's header.
+    let node = json!({"driver": "qcow2", "node-name": VMSTATE, "discard": "unmap",
+        "backing": null,
+        "file": {"driver": "file", "filename": file, "discard": "unmap"}});
+    qmp.execute("blockdev-add", Some(node))
+        .await
+        .context("cannot attach the snapshot's RAM image")?;
+    let result = job().await;
+    if let Err(e) = qmp
+        .execute("blockdev-del", Some(json!({"node-name": VMSTATE})))
+        .await
+    {
+        tracing::warn!("cannot detach the snapshot's RAM image: {e:#}");
+    }
+    drop_cache(file);
+    result
+}
+
+/// Drops the RAM image's pages from the page cache (they are clean once
+/// QEMU flushed and closed it), so they neither crowd the VM's cgroup nor
+/// make the host look fuller than it is. Best effort.
+fn drop_cache(file: &Path) {
+    use rustix::fs::{Advice, Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let dropped = rustix::fs::open(file, flags, Mode::empty())
+        .and_then(|fd| rustix::fs::fadvise(&fd, 0, None, Advice::DontNeed));
+    if let Err(e) = dropped {
+        tracing::debug!("cannot drop the page cache of {}: {e}", file.display());
+    }
+}
+
+/// Saves the running VM's disk and firmware variables as `tag`, and its RAM
+/// into `file` (an empty image). Returns how long the guest was paused.
+/// QEMU resumes the guest itself; if it does not, `cont` follows unless
+/// `hold` is set.
+pub async fn save(
+    qmp: &Qmp,
+    tag: &str,
+    file: &Path,
+    hold: &AtomicBool,
+) -> Result<Option<Duration>> {
     let was_running = status(qmp).await? == "running";
-    let args = json!({"tag": tag, "vmstate": VMSTATE, "devices": DEVICES});
-    let pause = run_job(qmp, "snapshot-save", args, JOB_TIMEOUT).await?;
+    let args =
+        json!({"tag": tag, "vmstate": VMSTATE, "devices": [DEVICES[0], DEVICES[1], VMSTATE]});
+    let pause = with_state(qmp, file, async || {
+        run_job(qmp, "snapshot-save", args, JOB_TIMEOUT).await
+    })
+    .await?;
     if was_running {
         cont_unless_held(qmp, hold).await?;
     }
@@ -153,17 +248,29 @@ pub struct Loaded {
     pub continued: bool,
 }
 
-/// Loads `tag` (disk, firmware variables and RAM). With `run`, the guest
-/// runs afterwards: QEMU resumes a guest that ran before the load, and
-/// `cont` covers the rest (a guest started paused), unless `hold` is set.
-pub async fn load(qmp: &Qmp, tag: &str, run: bool, hold: &AtomicBool) -> Result<Loaded> {
-    let args = json!({"tag": tag, "vmstate": VMSTATE, "devices": DEVICES});
-    let pause = run_job(qmp, "snapshot-load", args, JOB_TIMEOUT).await?;
+/// Loads `tag`: disk, firmware variables, and RAM from `file`. With `run`,
+/// the guest runs afterwards: QEMU resumes a guest that ran before the
+/// load, and `cont` covers the rest (a guest started paused), unless
+/// `hold` is set.
+pub async fn load(
+    qmp: &Qmp,
+    tag: &str,
+    file: &Path,
+    run: bool,
+    hold: &AtomicBool,
+) -> Result<Loaded> {
+    let args =
+        json!({"tag": tag, "vmstate": VMSTATE, "devices": [DEVICES[0], DEVICES[1], VMSTATE]});
+    let pause = with_state(qmp, file, async || {
+        run_job(qmp, "snapshot-load", args, JOB_TIMEOUT).await
+    })
+    .await?;
     let continued = run && cont_unless_held(qmp, hold).await?;
     Ok(Loaded { pause, continued })
 }
 
-/// Deletes `tag` from every node that has it.
+/// Deletes `tag` from the disk and firmware variables of a running VM (its
+/// RAM image is a file the caller removes).
 pub async fn delete(qmp: &Qmp, tag: &str) -> Result<()> {
     let args = json!({"tag": tag, "devices": DEVICES});
     run_job(qmp, "snapshot-delete", args, JOB_TIMEOUT).await?;
@@ -306,14 +413,14 @@ fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
 
-/// The files of a stopped VM that hold snapshots, in [`DEVICES`] order.
-fn offline_files(vm_dir: &Path) -> [PathBuf; 3] {
-    [qemu::DISK, qemu::VARS, qemu::STATE].map(|f| vm_dir.join(f))
+/// The images of a stopped VM that hold snapshots, in [`DEVICES`] order.
+fn offline_files(vm_dir: &Path) -> [PathBuf; 2] {
+    [qemu::DISK, qemu::VARS].map(|f| vm_dir.join(f))
 }
 
 const QEMU_IMG: &str = "/usr/bin/qemu-img";
 
-/// `qemu-img` on a stopped VM's own files. A compromised QEMU may have
+/// `qemu-img` on a stopped VM's own images. A compromised QEMU may have
 /// crafted them, so it runs confined like QEMU (Landlock and seccomp, only
 /// these files writable) and never opens a backing file: the image is named
 /// as `json:{..., "backing": null}`.
@@ -336,29 +443,23 @@ async fn image_snapshots(image: &Path, files: &[PathBuf]) -> Result<Vec<Snapshot
     parse_list(info["snapshots"].take())
 }
 
-/// A stopped VM's snapshots (from `state.qcow2`). A VM that has not started
-/// since snapshots existed has no state image and no snapshots.
+/// A stopped VM's snapshots (from its disk, without RAM sizes).
 pub async fn list_offline(vm_dir: &Path) -> Result<Vec<Snapshot>> {
     let files = offline_files(vm_dir);
-    if !files[2].exists() {
-        return Ok(Vec::new());
-    }
-    image_snapshots(&files[2], &files).await
+    image_snapshots(&files[0], &files).await
 }
 
 /// The snapshot names in each image of a stopped VM ([`DEVICES`] order).
 /// They differ only after a failure.
-pub async fn names_offline(vm_dir: &Path) -> Result<[Vec<String>; 3]> {
+pub async fn names_offline(vm_dir: &Path) -> Result<[Vec<String>; 2]> {
     let files = offline_files(vm_dir);
-    let mut names: [Vec<String>; 3] = Default::default();
-    if files[2].exists() {
-        for (f, n) in files.iter().zip(&mut names) {
-            *n = image_snapshots(f, &files)
-                .await?
-                .into_iter()
-                .map(|s| s.name)
-                .collect();
-        }
+    let mut names: [Vec<String>; 2] = Default::default();
+    for (f, n) in files.iter().zip(&mut names) {
+        *n = image_snapshots(f, &files)
+            .await?
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
     }
     Ok(names)
 }
@@ -371,14 +472,10 @@ fn all_names(per_image: &[Vec<String>]) -> Vec<String> {
     names
 }
 
-/// Takes a disk-only snapshot of a stopped VM: `tag` on all three images,
-/// or on none (a failure removes it again).
+/// Takes a disk-only snapshot of a stopped VM: `tag` on both images, or on
+/// none (a failure removes it again).
 pub async fn create_offline(vm_dir: &Path, tag: &str) -> Result<()> {
     let files = offline_files(vm_dir);
-    // VMs created before snapshots existed have no state image yet.
-    if !files[2].exists() {
-        qemu::create_state(&files[2]).await?;
-    }
     for (i, f) in files.iter().enumerate() {
         if let Err(e) = qemu_img(&["snapshot", "-c", tag], f, &files).await {
             // Also the failed image: it may have the tag anyway (timeout).
@@ -392,9 +489,9 @@ pub async fn create_offline(vm_dir: &Path, tag: &str) -> Result<()> {
 }
 
 /// Reverts a stopped VM's disk and firmware variables to `tag` (the RAM is
-/// not used). Refused unless all three images have it, so a restore never
-/// stops halfway for that reason.
-pub async fn apply_offline(vm_dir: &Path, tag: &str, names: &[Vec<String>; 3]) -> Result<()> {
+/// not used). Refused unless both images have it, so a restore never stops
+/// halfway for that reason.
+pub async fn apply_offline(vm_dir: &Path, tag: &str, names: &[Vec<String>; 2]) -> Result<()> {
     ensure!(
         names.iter().all(|n| n.iter().any(|t| t == tag)),
         "snapshot {tag} is incomplete (a step that created or deleted it failed); delete it"
@@ -409,7 +506,7 @@ pub async fn apply_offline(vm_dir: &Path, tag: &str, names: &[Vec<String>; 3]) -
 }
 
 /// Deletes `tag` from every image of a stopped VM that has it.
-pub async fn delete_offline(vm_dir: &Path, tag: &str, names: &[Vec<String>; 3]) -> Result<()> {
+pub async fn delete_offline(vm_dir: &Path, tag: &str, names: &[Vec<String>; 2]) -> Result<()> {
     let files = offline_files(vm_dir);
     for (f, n) in files.iter().zip(names) {
         if n.iter().any(|t| t == tag) {
@@ -428,10 +525,11 @@ impl Manager {
         let started = Instant::now();
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
+        let vm_dir = self.paths.vm_dir(name);
         let vm = self.running(name);
         let names = match &vm {
             Some(vm) => list_live(&vm.qmp).await?.1,
-            None => all_names(&names_offline(&self.paths.vm_dir(name)).await?),
+            None => all_names(&names_offline(&vm_dir).await?),
         };
         let tag = pick_new_name(&names, tag)?;
         let ram = vm.as_ref().map_or(0, |vm| vm.config.memory_mib << 20);
@@ -441,9 +539,22 @@ impl Manager {
             ram,
         )?;
         let pause = match &vm {
-            Some(vm) => save(&vm.qmp, &tag, &vm.disk_full).await?,
+            Some(vm) => {
+                let file = state_file(&vm_dir, &tag);
+                create_state_file(&vm_dir, &file).await?;
+                let saved = save(&vm.qmp, &tag, &file, &vm.disk_full).await;
+                if saved.is_err() {
+                    // The tag may be on the disk already: without its RAM it
+                    // would look like a disk-only snapshot.
+                    if let Err(e) = delete(&vm.qmp, &tag).await {
+                        tracing::warn!("{name}: cannot remove failed snapshot {tag}: {e:#}");
+                    }
+                    let _ = safe_remove(&vm_dir, &file);
+                }
+                saved?
+            }
             None => {
-                create_offline(&self.paths.vm_dir(name), &tag).await?;
+                create_offline(&vm_dir, &tag).await?;
                 None
             }
         };
@@ -460,10 +571,17 @@ impl Manager {
     pub async fn snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
-        Ok(match self.running(name) {
+        self.list_snapshots(name).await
+    }
+
+    /// The VM's snapshots with their RAM sizes (lifecycle lock held).
+    async fn list_snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
+        let vm_dir = self.paths.vm_dir(name);
+        let list = match self.running(name) {
             Some(vm) => list_live(&vm.qmp).await?.0,
-            None => list_offline(&self.paths.vm_dir(name)).await?,
-        })
+            None => list_offline(&vm_dir).await?,
+        };
+        Ok(with_ram(list, &vm_dir))
     }
 
     /// Restores snapshot `tag` (default: the newest).
@@ -481,15 +599,14 @@ impl Manager {
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
         let vm_dir = self.paths.vm_dir(name);
-        let (vm, list) = match self.running(name) {
-            Some(vm) => {
-                let list = list_live(&vm.qmp).await?.0;
-                (Some(vm), list)
-            }
-            None => (None, list_offline(&vm_dir).await?),
-        };
-        let snap = pick_existing(&list, name, tag)?;
-        let pause = match vm {
+        let snap = pick_existing(&self.list_snapshots(name).await?, name, tag)?;
+        ensure!(
+            !ram_missing(&snap),
+            "the RAM image of {} is missing; it cannot be restored, delete it",
+            snap.name
+        );
+        let file = state_file(&vm_dir, &snap.name);
+        let pause = match self.running(name) {
             Some(vm) => {
                 ensure!(
                     snap.ram_bytes > 0,
@@ -497,13 +614,12 @@ impl Manager {
                     snap.name
                 );
                 let run = vm.status().await? == "running";
-                self.load_into(&vm, &snap.name, run).await?
+                self.load_into(&vm, &snap.name, &file, run).await?
             }
             None if snap.ram_bytes > 0 => {
-                // Not `-loadvm`: it looks for the RAM on the first image
-                // that has the snapshot (the firmware variables) and fails.
+                // Not `-loadvm`: it cannot be told where the RAM is.
                 let vm = self.start_locked(name, true).await?;
-                match self.load_into(&vm, &snap.name, true).await {
+                match self.load_into(&vm, &snap.name, &file, true).await {
                     Ok(pause) => pause,
                     Err(e) => {
                         if let Err(stop) = self.stop_locked(name, true).await {
@@ -547,16 +663,23 @@ impl Manager {
         })
     }
 
-    /// Loads RAM snapshot `tag` into the running QEMU of `vm` and drops the
-    /// kept guest-agent connection. Returns how long the guest was paused.
-    async fn load_into(&self, vm: &Running, tag: &str, run: bool) -> Result<Option<Duration>> {
+    /// Loads RAM snapshot `tag` (RAM in `file`) into the running QEMU of
+    /// `vm` and drops the kept guest-agent connection. Returns how long the
+    /// guest was paused.
+    async fn load_into(
+        &self,
+        vm: &Running,
+        tag: &str,
+        file: &Path,
+        run: bool,
+    ) -> Result<Option<Duration>> {
         // No guest-agent operation may straddle the load.
         let mut agent = tokio::time::timeout(QGA_BUSY_WAIT, vm.qga.lock())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("{} is busy with a guest command; try again", vm.config.name)
             })?;
-        let loaded = load(&vm.qmp, tag, run, &vm.disk_full).await;
+        let loaded = load(&vm.qmp, tag, file, run, &vm.disk_full).await;
         *agent = None;
         let loaded =
             loaded.with_context(|| format!("cannot restore {tag}; the VM may be left paused"))?;
@@ -564,28 +687,46 @@ impl Manager {
         Ok(loaded.pause)
     }
 
-    /// Deletes snapshot `tag`, also one that a failed save left on some
-    /// images only.
+    /// Deletes snapshot `tag` and its RAM image, also a snapshot that a
+    /// failed save left on some images only.
     pub async fn delete_snapshot(&self, name: &str, tag: &str) -> Result<()> {
         validate_tag(tag)?;
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
         let vm_dir = self.paths.vm_dir(name);
-        let vm = self.running(name);
+        let file = state_file(&vm_dir, tag);
+        // A RAM image without tags (a delete that failed halfway) still goes.
+        let only_file = std::fs::symlink_metadata(&file).is_ok();
         let no_such = || anyhow::anyhow!("{name} has no snapshot named {tag}");
-        match vm {
+        match self.running(name) {
             Some(vm) => {
                 let names = list_live(&vm.qmp).await?.1;
-                ensure!(names.iter().any(|n| n == tag), no_such());
-                delete(&vm.qmp, tag).await
+                if names.iter().any(|n| n == tag) {
+                    delete(&vm.qmp, tag).await?;
+                } else {
+                    ensure!(only_file, no_such());
+                }
             }
             None => {
                 let names = names_offline(&vm_dir).await?;
-                ensure!(all_names(&names).iter().any(|n| n == tag), no_such());
-                delete_offline(&vm_dir, tag, &names).await
+                if all_names(&names).iter().any(|n| n == tag) {
+                    delete_offline(&vm_dir, tag, &names).await?;
+                } else {
+                    ensure!(only_file, no_such());
+                }
             }
         }
+        safe_remove(&vm_dir, &file)?;
+        Ok(())
     }
+}
+
+/// Whether `snap` was taken from a running guest (its clock ran) but its
+/// RAM image is gone: restoring only the disk would revert to a
+/// crash-consistent state without saying so. Disk-only snapshots of stopped
+/// VMs have a guest clock of 0.
+fn ram_missing(snap: &Snapshot) -> bool {
+    snap.vm_clock_ms > 0 && snap.ram_bytes == 0
 }
 
 /// The name for a new snapshot, given the names in use: `tag` if it is
@@ -646,7 +787,6 @@ mod tests {
         let list = parse_list(v).unwrap();
         let names: Vec<&str> = list.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["a", "c", "b"]);
-        assert_eq!(list[0].ram_bytes, 1 << 30);
         assert_eq!(list[0].vm_clock_ms, 12_345);
         assert_eq!(list[2].created, 20);
         assert!(parse_list(Value::Null).unwrap().is_empty());
@@ -676,6 +816,18 @@ mod tests {
         assert!(err.to_string().contains("no snapshot named nope"));
         assert!(pick_existing(&[], "dev", None).is_err());
         assert!(pick_existing(&list, "dev", Some("../x")).is_err());
+        // raw() has a running guest clock: without a RAM image it is broken.
+        assert!(ram_missing(&list[0]));
+        let disk_only = Snapshot {
+            vm_clock_ms: 0,
+            ..list[0].clone()
+        };
+        assert!(!ram_missing(&disk_only));
+        let with_ram = Snapshot {
+            ram_bytes: 1,
+            ..list[0].clone()
+        };
+        assert!(!ram_missing(&with_ram));
     }
 
     /// How the fake QEMU behaves.
@@ -693,6 +845,8 @@ mod tests {
         stuck: bool,
         /// `query-jobs` answers this late (QEMU's main loop is busy).
         jobs_delay: Duration,
+        /// `blockdev-add` fails.
+        no_add: bool,
     }
 
     /// A fake QEMU that runs `script` for every snapshot job and records
@@ -732,6 +886,19 @@ mod tests {
                         tokio::time::sleep(script.jobs_delay).await;
                         json!([job])
                     }
+                    "blockdev-add" if script.no_add => {
+                        let e = json!({"error": {"class": "GenericError", "desc": "no"}, "id": req["id"]});
+                        w.write_all(format!("{e}\n").as_bytes()).await.unwrap();
+                        continue;
+                    }
+                    "blockdev-add" => {
+                        assert_eq!(req["arguments"]["node-name"], VMSTATE);
+                        assert!(req["arguments"]["backing"].is_null());
+                        assert!(req["arguments"].get("backing").is_some());
+                        assert_eq!(req["arguments"]["file"]["filename"], "/x/s1.qcow2");
+                        json!({})
+                    }
+                    "blockdev-del" => json!({}),
                     "job-dismiss" => {
                         assert_eq!(req["arguments"]["id"], job["id"]);
                         json!({})
@@ -779,6 +946,8 @@ mod tests {
         (dir, qmp, log)
     }
 
+    const F_PATH: &str = "/x/s1.qcow2";
+
     fn cmds(log: &Mutex<Vec<String>>) -> Vec<String> {
         log.lock()
             .unwrap()
@@ -797,7 +966,7 @@ mod tests {
             ..Script::default()
         })
         .await;
-        let pause = save(&qmp, "s1", &hold).await.unwrap();
+        let pause = save(&qmp, "s1", Path::new(F_PATH), &hold).await.unwrap();
         assert_eq!(
             pause,
             Some(Duration::from_millis(1002)),
@@ -805,8 +974,15 @@ mod tests {
         );
         assert_eq!(
             cmds(&log),
-            ["snapshot-save", "query-jobs", "job-dismiss"],
-            "no cont: QEMU resumed the guest"
+            [
+                "blockdev-del",
+                "blockdev-add",
+                "snapshot-save",
+                "query-jobs",
+                "job-dismiss",
+                "blockdev-del"
+            ],
+            "the RAM image is attached for the job only; no cont: QEMU resumed the guest"
         );
     }
 
@@ -818,7 +994,9 @@ mod tests {
             ..Script::default()
         })
         .await;
-        let loaded = load(&qmp, "s1", true, &hold).await.unwrap();
+        let loaded = load(&qmp, "s1", Path::new(F_PATH), true, &hold)
+            .await
+            .unwrap();
         assert!(loaded.continued && loaded.pause.is_none());
         assert_eq!(cmds(&log).last().unwrap(), "cont");
 
@@ -828,7 +1006,12 @@ mod tests {
             ..Script::default()
         })
         .await;
-        assert!(load(&qmp, "s1", true, &hold).await.unwrap().continued);
+        assert!(
+            load(&qmp, "s1", Path::new(F_PATH), true, &hold)
+                .await
+                .unwrap()
+                .continued
+        );
         assert_eq!(cmds(&log).last().unwrap(), "cont");
 
         // Paused by the disk watchdog: stays paused.
@@ -838,8 +1021,13 @@ mod tests {
             ..Script::default()
         })
         .await;
-        assert!(!load(&qmp, "s1", true, &hold).await.unwrap().continued);
-        assert!(save(&qmp, "s2", &hold).await.is_ok());
+        assert!(
+            !load(&qmp, "s1", Path::new(F_PATH), true, &hold)
+                .await
+                .unwrap()
+                .continued
+        );
+        assert!(save(&qmp, "s2", Path::new(F_PATH), &hold).await.is_ok());
         assert!(!cmds(&log).contains(&"cont".to_owned()));
     }
 
@@ -853,10 +1041,29 @@ mod tests {
             ..Script::default()
         })
         .await;
-        let err = save(&qmp, "s1", &hold).await.unwrap_err().to_string();
+        let err = save(&qmp, "s1", Path::new(F_PATH), &hold)
+            .await
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, "snapshot-save failed: Device 'disk0' is full[0m");
-        assert!(cmds(&log).contains(&"job-dismiss".to_owned()));
+        let seen = cmds(&log);
+        assert!(seen.contains(&"job-dismiss".to_owned()));
+        assert_eq!(
+            seen.last().unwrap(),
+            "blockdev-del",
+            "detached after a failure too"
+        );
         assert!(delete(&qmp, "s1").await.is_err());
+
+        // An image that cannot be attached: no job starts.
+        let (_d, qmp, log) = fake(Script {
+            status: "running",
+            no_add: true,
+            ..Script::default()
+        })
+        .await;
+        assert!(save(&qmp, "s1", Path::new(F_PATH), &hold).await.is_err());
+        assert!(!cmds(&log).iter().any(|c| c.starts_with("snapshot-")));
     }
 
     #[tokio::test]
@@ -933,7 +1140,6 @@ mod tests {
             "1G",
         ]);
         qemu_img_create(&[dir.join(qemu::VARS).to_str().unwrap(), "1M"]);
-        qemu_img_create(&[dir.join(qemu::STATE).to_str().unwrap(), "2M"]);
     }
 
     #[tokio::test]
@@ -959,7 +1165,7 @@ mod tests {
         apply_offline(&dir, "s1", &per_image).await.unwrap();
         delete_offline(&dir, "s1", &per_image).await.unwrap();
         let per_image = names_offline(&dir).await.unwrap();
-        assert_eq!(per_image, [["s2"], ["s2"], ["s2"]]);
+        assert_eq!(per_image, [["s2"], ["s2"]]);
         assert!(apply_offline(&dir, "s1", &per_image).await.is_err());
         // The disk still names its backing file (the VM must still boot).
         let out = std::process::Command::new("qemu-img")
@@ -970,28 +1176,35 @@ mod tests {
         let info: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(info["backing-filename"], "/nonexistent/base.qcow2");
         // An incomplete snapshot is not applied.
-        let partial = [vec!["s2".to_owned()], vec![], vec!["s2".to_owned()]];
+        let partial = [vec!["s2".to_owned()], vec![]];
         let err = apply_offline(&dir, "s2", &partial).await.unwrap_err();
         assert!(err.to_string().contains("incomplete"), "{err}");
 
-        // A state image that cannot take the snapshot: none of the images
-        // keeps it.
-        std::fs::write(dir.join(qemu::STATE), b"not qcow2").unwrap();
+        // Firmware variables that cannot take the snapshot: the disk does
+        // not keep it either.
+        std::fs::write(dir.join(qemu::VARS), b"not qcow2").unwrap();
         assert!(create_offline(&dir, "s3").await.is_err());
         let files = offline_files(&dir);
-        for f in &files[..2] {
-            let snaps = image_snapshots(f, &files).await.unwrap();
-            assert!(snaps.iter().all(|s| s.name != "s3"), "{}", f.display());
-        }
+        let snaps = image_snapshots(&files[0], &files).await.unwrap();
+        assert!(snaps.iter().all(|s| s.name != "s3"));
+    }
 
-        // A VM without a state image (made before snapshots existed).
-        std::fs::remove_file(dir.join(qemu::STATE)).unwrap();
-        assert_eq!(
-            names_offline(&dir).await.unwrap(),
-            <[Vec<String>; 3]>::default()
-        );
-        create_offline(&dir, "s4").await.unwrap();
-        assert_eq!(list_offline(&dir).await.unwrap()[0].name, "s4");
+    #[test]
+    fn ram_sizes_come_from_the_ram_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let states = tmp.path().join(qemu::STATES);
+        std::fs::create_dir(&states).unwrap();
+        std::fs::write(states.join("a.qcow2"), vec![1; 8192]).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", states.join("c.qcow2")).unwrap();
+        let list = parse_list(json!([
+            raw("a", 0, 1, 0),
+            raw("b", 0, 2, 0),
+            raw("c", 0, 3, 0)
+        ]));
+        let list = with_ram(list.unwrap(), tmp.path());
+        let ram: Vec<u64> = list.iter().map(|s| s.ram_bytes).collect();
+        assert_eq!(ram, [8192, 0, 0], "a symlink is not a RAM image");
+        assert_eq!(state_file(tmp.path(), "a"), states.join("a.qcow2"));
     }
 
     #[tokio::test]
@@ -1019,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_list_reads_the_state_node() {
+    async fn live_list_reads_the_disk_node() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("qmp.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1033,9 +1246,9 @@ mod tests {
                 let ret = if req["execute"] == "query-named-block-nodes" {
                     assert_eq!(req["arguments"]["flat"], true);
                     json!([
-                        {"node-name": "disk0", "image": {"snapshots": [raw("x", 0, 1, 0)]}},
+                        {"node-name": "disk0", "image": {"snapshots": [raw("s1", 0, 1, 0)]}},
                         {"node-name": "base", "image": {"snapshots": [raw("y", 0, 1, 0)]}},
-                        {"node-name": "state", "image": {"snapshots": [raw("s1", 9, 1, 0)]}},
+                        {"node-name": "fw-vars", "image": {"snapshots": [raw("x", 0, 1, 0)]}},
                     ])
                 } else {
                     json!({})
@@ -1051,7 +1264,7 @@ mod tests {
         assert_eq!(
             names,
             ["s1", "x"],
-            "a leftover on disk0 counts, other nodes not"
+            "a leftover on fw-vars counts, other nodes not"
         );
     }
 }

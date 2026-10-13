@@ -37,7 +37,9 @@ cargo test --locked
 ```
 
 KVM integration tests boot real, offline VMs (one at a time, at most
-2 vCPUs and 2 GiB each) and are skipped unless asked for. They need the
+2 vCPUs and 2 GiB each; the snapshot pause measurement also uses one 4 GiB
+guest, only while the host keeps 6 GiB available besides) and are skipped
+unless asked for. They need the
 Ubuntu 26.04 image in the dev-mode cache (`stallo images pull ubuntu-26.04`)
 and run the daemon as a transient `systemd-run --user` unit:
 
