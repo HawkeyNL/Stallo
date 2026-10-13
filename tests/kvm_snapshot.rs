@@ -279,7 +279,8 @@ fn measure(mib: u64) {
         let (v, io) = sampled(&cg, || d.api(Via::Cli, r).unwrap());
         eprintln!("MEASURE io {io}");
         // The RAM image's page cache is dropped after every job
-        // (docs/ram-snapshot-io.md).
+        // (docs/ram-snapshot-io.md). `file` is the whole cgroup's, so the
+        // margin also absorbs guest reads of the cached base image.
         let file = |i: usize| io["file"][i].as_u64().unwrap();
         assert!(file(2) <= file(0) + 32, "page cache left behind: {io}");
         v
@@ -361,13 +362,13 @@ fn field_mib(text: &str, key: &str) -> u64 {
     let v: u64 = text
         .lines()
         .find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or_else(|| panic!("no {key:?} in {text}"));
     if key.ends_with(':') { v >> 10 } else { v >> 20 }
 }
 
 /// The VM cgroup's `file` and `anon` and the host's `Cached`, in MiB.
 fn usage(cg: &Path) -> [u64; 3] {
-    let stat = std::fs::read_to_string(cg.join("memory.stat")).unwrap_or_default();
+    let stat = std::fs::read_to_string(cg.join("memory.stat")).unwrap();
     let info = std::fs::read_to_string("/proc/meminfo").unwrap();
     [
         field_mib(&stat, "file "),
@@ -393,8 +394,17 @@ fn sampled<T>(cg: &Path, f: impl FnOnce() -> T) -> (T, Value) {
             }
             peak
         });
-        let out = f();
-        done.store(true, Ordering::Relaxed);
+        // Stops the sampler even if `f` panics, so the scope cannot hang.
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let out = {
+            let _stop = Stop(&done);
+            f()
+        };
         (out, sampler.join().unwrap())
     });
     let after = usage(cg);

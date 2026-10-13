@@ -7,8 +7,8 @@ options (`cache.direct=off`, `cache.no-flush=off`, `aio=threads`). After
 each job the daemon calls `posix_fadvise(DONTNEED)` on the file. This study
 compares that with O_DIRECT (`cache.direct=on`) and decides which to use.
 
-**Result: keep the page cache.** O_DIRECT is 3 to 5 times slower on both
-save and restore. Its only gain is that the VM cgroup holds no page cache
+**Result: keep the page cache.** O_DIRECT is 2.7 to 4.9 times slower on
+both save and restore. Its only gain is that the VM cgroup holds no page cache
 during the job. The security difference is small, because the same bytes
 are on disk in a 0700 directory either way.
 
@@ -47,7 +47,7 @@ These details come from QEMU 10.2 source.
 | Item | Value |
 |---|---|
 | Kernel / QEMU | 7.0.0-34-generic / 10.2.1 |
-| `/` | ext4 on LVM on NVMe; 512 B logical / 4 KiB physical sectors; volatile write cache; **not encrypted** |
+| `/` | ext4 on LVM on NVMe; 512 B logical and physical sectors, 4 KiB minimum/optimal I/O; volatile write cache; **not encrypted** |
 | Swap | 8 GiB `/swap.img` (6.1 GiB used at the time); zswap off; swappiness 60 |
 | Memory init | `init_on_alloc=1`, `init_on_free` off |
 | Lockdown | `integrity`, so hibernation is disabled |
@@ -59,8 +59,10 @@ These details come from QEMU 10.2 source.
 - **Harness:** `STALLO_IT=1 cargo test --test kvm_snapshot pause_times
   -- --ignored`. Each run uses one VM: 2 vCPU, offline, with 2 GiB and then
   4 GiB of RAM.
-- **Headroom:** `MemAvailable` was at least 22 GiB before each run, which
-  leaves at least 12 GiB beside the 4 GiB guest.
+- **Headroom:** the run script refused to start below 4096 + 512 + 12288
+  MiB `MemAvailable` (4 GiB guest, QEMU overhead, 12 GiB headroom).
+  Before the runs it read 22.3–24.5 GiB (printed by the script, not in the
+  test logs).
 - **Jobs per run:**
   1. save while idle;
   2. save with ½ of RAM filled from `/dev/urandom`;
@@ -70,6 +72,8 @@ These details come from QEMU 10.2 source.
 - **Memory sampling:** the test samples the VM cgroup's `memory.stat`
   (`file`, `anon`) and the host's `Cached` every 50 ms during each job, and
   once after it.
+- **Restore → first exec** is timed around the API call, the sampler's
+  stop (up to 50 ms) and one `exec`.
 - **Runs:**
   - page cache (current code): 3 runs;
   - O_DIRECT (`"cache": {"direct": true}` on the state node): 3 runs;
@@ -110,21 +114,25 @@ Values are median (min–max), n = 3.
 | 4 GiB | save, idle | 1040 (1039–1056) | 0–1 | 0 / 0 |
 | 4 GiB | save, ½ RAM filled | 1181 (1172–1312) | −125 (−131–0) | 0 / 0 |
 | 4 GiB | restore | 1356 (1344–1358) | 0–1 | 0 / 0 |
-| 4 GiB | save after restore | 1318 (1305–1320) | 0 | 0–1 / 0–1 |
+| 4 GiB | save after restore | 1318 (1305–1320) | 0 (−1–0) | 0–1 / 0–1 |
 | 4 GiB | save, ¾ RAM filled | 307 (299–307) | 0 | 0–1 / 0–1 |
 
-- **Host `Cached`** follows the cgroup's `file` within a few MiB. Other
-  services make it noisy, but no job left host page cache behind.
+- **Host `Cached`** follows the cgroup's `file` within a few MiB, except
+  the filled 4 GiB saves (up to about 340 MiB lower: other services freed
+  cache meanwhile). No job left host page cache behind.
 - **cgroup `memory.peak`:**
   - Page cache: it reached `memory.max` in every run (2304 of 2304 MiB, and
     4352 of 4352 MiB), so the kernel reclaimed inside the VM cgroup during
     the job.
   - O_DIRECT: it stayed 100–300 MiB below `memory.max`.
-  - `oom_kill` was 0 in every run.
-- **Negative "after" values:** the ½-filled saves pushed some of the VM's
-  other page cache out, most likely its own disk image's cache, and the
-  disk then refills it on demand. This is the main side effect of the page
-  cache, and it stays inside the VM's own cgroup.
+  - `oom_kill` was 0 in every run. The fullest guest measured had ¾ of
+    its RAM faulted in; a guest with all RAM resident leaves the image's
+    page cache less room and was not measured.
+- **Negative "after" values:** the ½-filled saves pushed 120–140 MiB of
+  the VM's other page cache out. The overlay disk uses `cache.direct=on`, so
+  this is most likely the cached read-only base image, seed ISO or
+  firmware (not verified); it is read back on demand. This is the main
+  side effect of the page cache, and it stays inside the VM's own cgroup.
 
 **Hybrids** need no separate run. A fresh `blockdev-add` per job can choose
 its cache mode, so a hybrid is either O_DIRECT for save and page cache for
@@ -160,20 +168,24 @@ nothing on security.
   puts guest RAM into `/swap.img`.
 - **Other cgroups:**
   - The page cache is charged to the VM's own cgroup, which is capped at
-    guest RAM + 256 MiB.
-  - The job cannot grow the host's memory use beyond that cap, and it cannot
-    push Jarvis, Rivetlink or other services into reclaim or swap. Global
-    reclaim only starts when the host as a whole runs short.
+    `guest RAM + max(qemu_overhead_mib, guest RAM / 16)` (256 MiB by
+    default up to 4 GiB guests).
+  - The job cannot grow the VM's memory use beyond that cap, which
+    admission already reserves. Up to that cap (here up to 1.3 GiB, partly
+    dirty until the flush) it is still real host memory and adds to global
+    pressure; this host is sometimes in global reclaim (swap 6 of 8 GiB in
+    use), where Jarvis and Rivetlink would share it.
   - Reclaim at the cap touches only file pages (no swap), and every run
     finished without an OOM kill.
-- **Disk I/O:** both modes write the same bytes. The page cache writes them
-  in about 1 s; O_DIRECT spreads them over 4–10 s of queue-depth-1 requests.
-  Neither mode changes how much other services must share the NVMe.
+- **Disk I/O:** both modes write the same bytes, with a different profile:
+  the page cache sends a 0.6–2.1 s full-bandwidth burst and one large
+  fdatasync; O_DIRECT a 2–10 s queue-depth-1 trickle. The latency effect on
+  other services' I/O was not measured.
 
 ## Recommendation
 
-- **Keep the page cache, unchanged.** It pauses the guest 3–5× less on save
-  and restore. Its page cache is bounded by the VM's own cgroup and dropped
+- **Keep the page cache, unchanged.** It pauses the guest 2.7–4.9× less on
+  save and restore. Its page cache is bounded by the VM's own cgroup and dropped
   after each job, and it carries the same data-at-rest exposure as O_DIRECT.
 - **Nothing is missing:**
   - QEMU already flushes in the right order, so no explicit fsync is needed.
