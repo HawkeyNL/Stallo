@@ -225,7 +225,7 @@ pub async fn save(
     qmp: &Qmp,
     tag: &str,
     file: &Path,
-    hold: &[&AtomicBool],
+    hold: &AtomicBool,
 ) -> Result<Option<Duration>> {
     let was_running = status(qmp).await? == "running";
     let args =
@@ -258,7 +258,7 @@ pub async fn load(
     tag: &str,
     file: &Path,
     run: bool,
-    hold: &[&AtomicBool],
+    hold: &AtomicBool,
 ) -> Result<Loaded> {
     let args =
         json!({"tag": tag, "vmstate": VMSTATE, "devices": [DEVICES[0], DEVICES[1], VMSTATE]});
@@ -283,20 +283,19 @@ async fn status(qmp: &Qmp) -> Result<String> {
     Ok(v["status"].as_str().unwrap_or("unknown").to_owned())
 }
 
-/// Resumes the guest unless it runs or a `hold` flag (a watchdog paused
-/// it) is set. Returns whether `cont` was sent.
+/// Resumes the guest unless it runs or `hold` (the disk watchdog paused it)
+/// is set. Returns whether `cont` was sent.
 ///
 /// Known gap: a watchdog `stop` sent during a long job times out and clears
 /// `hold`, but QEMU still runs it after the job; the guest is then resumed
 /// below the floor until the next watchdog tick (10 s) pauses it again.
-async fn cont_unless_held(qmp: &Qmp, hold: &[&AtomicBool]) -> Result<bool> {
-    let held = || hold.iter().any(|h| h.load(Ordering::Relaxed));
-    if held() || status(qmp).await? == "running" {
+async fn cont_unless_held(qmp: &Qmp, hold: &AtomicBool) -> Result<bool> {
+    if hold.load(Ordering::Relaxed) || status(qmp).await? == "running" {
         return Ok(false);
     }
     qmp.execute("cont", None).await?;
-    // A watchdog may have paused it between the check and `cont`.
-    if held() {
+    // The watchdog may have paused it between the check and `cont`.
+    if hold.load(Ordering::Relaxed) {
         qmp.execute("stop", None).await?;
     }
     Ok(true)
@@ -544,7 +543,7 @@ impl Manager {
             Some(vm) => {
                 let file = state_file(&vm_dir, &tag);
                 create_state_file(&vm_dir, &file).await?;
-                let saved = save(&vm.qmp, &tag, &file, &vm.holds()).await;
+                let saved = save(&vm.qmp, &tag, &file, &vm.disk_full).await;
                 if saved.is_err() {
                     // The tag may be on the disk already: without its RAM it
                     // would look like a disk-only snapshot.
@@ -681,7 +680,7 @@ impl Manager {
             .map_err(|_| {
                 anyhow::anyhow!("{} is busy with a guest command; try again", vm.config.name)
             })?;
-        let loaded = load(&vm.qmp, tag, file, run, &vm.holds()).await;
+        let loaded = load(&vm.qmp, tag, file, run, &vm.disk_full).await;
         *agent = None;
         let loaded =
             loaded.with_context(|| format!("cannot restore {tag}; the VM may be left paused"))?;
@@ -971,7 +970,7 @@ mod tests {
             ..Script::default()
         })
         .await;
-        let pause = save(&qmp, "s1", Path::new(F_PATH), &[&hold]).await.unwrap();
+        let pause = save(&qmp, "s1", Path::new(F_PATH), &hold).await.unwrap();
         assert_eq!(
             pause,
             Some(Duration::from_millis(1002)),
@@ -999,7 +998,7 @@ mod tests {
             ..Script::default()
         })
         .await;
-        let loaded = load(&qmp, "s1", Path::new(F_PATH), true, &[&hold])
+        let loaded = load(&qmp, "s1", Path::new(F_PATH), true, &hold)
             .await
             .unwrap();
         assert!(loaded.continued && loaded.pause.is_none());
@@ -1012,7 +1011,7 @@ mod tests {
         })
         .await;
         assert!(
-            load(&qmp, "s1", Path::new(F_PATH), true, &[&hold])
+            load(&qmp, "s1", Path::new(F_PATH), true, &hold)
                 .await
                 .unwrap()
                 .continued
@@ -1027,12 +1026,12 @@ mod tests {
         })
         .await;
         assert!(
-            !load(&qmp, "s1", Path::new(F_PATH), true, &[&hold])
+            !load(&qmp, "s1", Path::new(F_PATH), true, &hold)
                 .await
                 .unwrap()
                 .continued
         );
-        assert!(save(&qmp, "s2", Path::new(F_PATH), &[&hold]).await.is_ok());
+        assert!(save(&qmp, "s2", Path::new(F_PATH), &hold).await.is_ok());
         assert!(!cmds(&log).contains(&"cont".to_owned()));
     }
 
@@ -1046,7 +1045,7 @@ mod tests {
             ..Script::default()
         })
         .await;
-        let err = save(&qmp, "s1", Path::new(F_PATH), &[&hold])
+        let err = save(&qmp, "s1", Path::new(F_PATH), &hold)
             .await
             .unwrap_err()
             .to_string();
@@ -1067,7 +1066,7 @@ mod tests {
             ..Script::default()
         })
         .await;
-        assert!(save(&qmp, "s1", Path::new(F_PATH), &[&hold]).await.is_err());
+        assert!(save(&qmp, "s1", Path::new(F_PATH), &hold).await.is_err());
         assert!(!cmds(&log).iter().any(|c| c.starts_with("snapshot-")));
     }
 

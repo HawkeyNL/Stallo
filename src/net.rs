@@ -14,7 +14,7 @@
 
 use std::fs::File;
 use std::io;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
-use crate::config::{NetProfile, PortForward, VmConfig};
+use crate::config::{PortForward, VmConfig};
 use crate::vm::Manager;
 
 pub const PASST: &str = "/usr/bin/passt";
@@ -43,17 +43,27 @@ pub const PASST_MAX_FILES: libc::rlim_t = 4096;
 /// passt's share of the VM cgroup's memory (it used 18-21 MiB in the lab).
 pub const PASST_MEMORY_MIB: u64 = 64;
 
-/// How often the isolation probe repeats while `internet` VMs run.
-pub const RECHECK: Duration = Duration::from_secs(2);
+/// How often the isolation probe repeats while `internet` VMs have
+/// network. A probe costs microseconds.
+pub const RECHECK: Duration = Duration::from_millis(500);
+
+/// The table's last rule drops UDP to this address and port. The port is
+/// the table's version: an older or half-loaded table fails the probe.
+pub const CANARY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1);
 
 /// Fails unless the host isolates this user's traffic: passt is installed
 /// and the `inet stallo` nftables table drops what it must.
 ///
-/// The probe sends one UDP datagram each to its own `127.0.0.1` and `::1`
-/// sockets, to `10.255.255.1:9` and to `127.0.0.53:54`. The table drops
-/// each in the output hook, which fails `sendto` with `EPERM` at once
-/// (a dropped TCP SYN would only time out). Anything else, including a
-/// datagram that was sent, fails the check. It takes microseconds.
+/// The probe sends UDP datagrams to its own `127.0.0.1` and `::1` sockets,
+/// to the table's version canary, to one address of each private range the
+/// table denies, and to `127.0.0.53:54`. The table drops each in the
+/// output hook, which fails `sendto` with `EPERM` at once (a dropped TCP
+/// SYN would only time out). Anything else, including a datagram that was
+/// sent, fails the check. It takes microseconds.
+///
+/// `EPERM` does not say which filter dropped a datagram; the canary is
+/// what ties the result to this table. Root can still edit the table's
+/// other rules unnoticed.
 pub fn check_isolation() -> Result<()> {
     probe().context("isolation unavailable")
 }
@@ -65,12 +75,23 @@ fn probe() -> Result<()> {
     // Receivers for the loopback probes; whatever reaches them is dropped
     // with them.
     let own4 = UdpSocket::bind("127.0.0.1:0").context("cannot bind a 127.0.0.1 probe socket")?;
-    let own6 = UdpSocket::bind("[::1]:0").context("cannot bind a ::1 probe socket")?;
+    let own6 = UdpSocket::bind("[::1]:0")
+        .context("cannot bind a ::1 probe socket (is IPv6 disabled? the internet profile needs it on loopback)")?;
+    let v6 = |s: &str, port| SocketAddr::new(IpAddr::V6(s.parse().unwrap()), port);
     let targets = [
         own4.local_addr()?,
         own6.local_addr()?,
-        // A private range, never local.
+        // Before any off-host target: an older table stops here, and a
+        // canary that gets out goes to TEST-NET-1.
+        CANARY,
+        // One per private range (port 9: discard).
         SocketAddr::from(([10, 255, 255, 1], 9)),
+        SocketAddr::from(([172, 31, 255, 1], 9)),
+        SocketAddr::from(([192, 168, 255, 1], 9)),
+        SocketAddr::from(([100, 127, 255, 1], 9)),
+        SocketAddr::from(([169, 254, 255, 1], 9)),
+        v6("fd7a:115c:a1e0::1", 9),
+        v6("64:ff9b::a00:1", 9),
         // The DNS exception is for port 53 only.
         SocketAddr::from(([127, 0, 0, 53], 54)),
     ];
@@ -107,9 +128,12 @@ fn verdict(results: &[(SocketAddr, io::Result<()>)]) -> Result<()> {
     Ok(())
 }
 
-/// Repeats the probe every [`RECHECK`] while `internet` VMs run, and pauses
-/// them all when it fails: the table can be flushed at runtime (`nft flush
-/// ruleset`). `stallo resume` probes again before it continues a VM.
+/// Repeats the probe every [`RECHECK`] while `internet` VMs have network,
+/// and cuts it for all of them when the probe fails: the table can be
+/// flushed at runtime (`nft flush ruleset`). Cutting kills passt, which
+/// needs no QMP; the guests keep running offline until they restart, and a
+/// start probes again. Between the flush and the next probe (at most
+/// [`RECHECK`]) guests are not isolated.
 pub async fn watchdog(manager: Arc<Manager>) {
     let mut tick = tokio::time::interval(RECHECK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -118,7 +142,7 @@ pub async fn watchdog(manager: Arc<Manager>) {
         let vms: Vec<_> = manager
             .all_running()
             .into_iter()
-            .filter(|vm| vm.config.net == NetProfile::Internet)
+            .filter(|vm| vm.has_network())
             .collect();
         if vms.is_empty() {
             continue;
@@ -127,10 +151,8 @@ pub async fn watchdog(manager: Arc<Manager>) {
             continue;
         };
         for vm in vms {
-            match vm.pause_isolation_lost().await {
-                Ok(true) => tracing::error!("{}: paused: {e:#}", vm.config.name),
-                Ok(false) => {}
-                Err(err) => tracing::error!("{}: pause failed: {err:#}", vm.config.name),
+            if vm.cut_network() {
+                tracing::error!("{}: network cut: {e:#}", vm.config.name);
             }
         }
     }

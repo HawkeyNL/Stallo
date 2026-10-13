@@ -128,8 +128,12 @@ pub struct Running {
     pub(crate) qga: tokio::sync::Mutex<Option<Qga>>,
     /// Paused by the disk watchdog.
     pub(crate) disk_full: AtomicBool,
-    /// Paused because the host's network isolation went away.
-    pub(crate) isolation_lost: AtomicBool,
+    /// Set when passt is gone: cut because the host's isolation went
+    /// away, or exited by itself. The guest stays up without network until
+    /// it restarts.
+    pub(crate) net_down: Arc<AtomicBool>,
+    /// Wakes passt's reaper to kill it (`internet` VMs only).
+    cut_net: Option<Arc<tokio::sync::Notify>>,
     /// Becomes `true` once QEMU has exited and everything is cleaned up.
     exited: watch::Receiver<bool>,
 }
@@ -529,27 +533,47 @@ impl Manager {
             }
         };
         // passt checks its arguments at once; by the time QMP answers, a
-        // passt that refused them has exited.
-        if let Some(p) = passt.as_mut()
-            && let Some(status) = p.try_wait()?
-        {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            bail!(
-                "passt exited ({status}); see {}",
-                vm_dir.join(PASST_LOG).display()
-            );
+        // passt that refused them has exited. The isolation is checked
+        // again too: the table may have gone since `check_net`, and the
+        // watchdog only sees the VM from here on.
+        if let Some(p) = passt.as_mut() {
+            let gone = match p.try_wait()? {
+                Some(status) => Some(anyhow::anyhow!(
+                    "passt exited ({status}); see {}",
+                    vm_dir.join(PASST_LOG).display()
+                )),
+                None => net::check_isolation().err(),
+            };
+            if let Some(e) = gone {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(e);
+            }
         }
-        if let Some(mut p) = passt {
+        let net_down = Arc::new(AtomicBool::new(false));
+        let cut_net = passt.map(|mut p| {
+            let cut = Arc::new(tokio::sync::Notify::new());
+            let wake = cut.clone();
+            let down = net_down.clone();
             let name = name.clone();
-            // Reaps passt. It exits when QEMU does, or with the cgroup.
+            // Reaps passt. It exits when QEMU does, with the cgroup, or
+            // when the isolation watchdog cuts the guest's network.
             tokio::spawn(async move {
-                match p.wait().await {
+                let r = tokio::select! {
+                    r = p.wait() => r,
+                    () = wake.notified() => {
+                        let _ = p.start_kill();
+                        p.wait().await
+                    }
+                };
+                down.store(true, Ordering::Relaxed);
+                match r {
                     Ok(s) if s.success() => tracing::debug!("{name}: passt exited"),
                     r => tracing::warn!("{name}: passt exited: {r:?}"),
                 }
             });
-        }
+            cut
+        });
 
         let (tx, rx) = watch::channel(false);
         let running = Arc::new(Running {
@@ -563,7 +587,8 @@ impl Manager {
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
-            isolation_lost: AtomicBool::new(false),
+            net_down,
+            cut_net,
             exited: rx,
         });
         self.running
@@ -653,10 +678,8 @@ impl Manager {
             !host::below_floor(host::disk_free(&self.paths.data)?, floor),
             "the data disk is still below the {floor} GiB floor; free space first"
         );
-        self.check_net(&vm.config)?;
         // Cleared first, so a watchdog tick after `cont` can pause it again.
         vm.disk_full.store(false, Ordering::Relaxed);
-        vm.isolation_lost.store(false, Ordering::Relaxed);
         vm.qmp.execute("cont", None).await?;
         Ok(())
     }
@@ -1190,30 +1213,36 @@ impl Running {
     /// Marks the VM as paused by the disk watchdog and pauses it. Returns
     /// false if it already was.
     pub async fn pause_disk_full(&self) -> Result<bool> {
-        self.hold(&self.disk_full).await
-    }
-
-    /// Marks the VM as paused because the host's network isolation is gone
-    /// and pauses it. Returns false if it already was.
-    pub async fn pause_isolation_lost(&self) -> Result<bool> {
-        self.hold(&self.isolation_lost).await
-    }
-
-    async fn hold(&self, flag: &AtomicBool) -> Result<bool> {
-        if flag.swap(true, Ordering::Relaxed) {
+        if self.disk_full.swap(true, Ordering::Relaxed) {
             return Ok(false);
         }
         if let Err(e) = self.qmp.execute("stop", None).await {
             // Not paused: let the next tick try again.
-            flag.store(false, Ordering::Relaxed);
+            self.disk_full.store(false, Ordering::Relaxed);
             return Err(e);
         }
         Ok(true)
     }
 
-    /// The flags that keep the guest paused until `stallo resume`.
-    pub(crate) fn holds(&self) -> [&AtomicBool; 2] {
-        [&self.disk_full, &self.isolation_lost]
+    /// Whether the guest still has its network (an `internet` VM whose
+    /// passt was not cut).
+    pub fn has_network(&self) -> bool {
+        self.cut_net.is_some() && !self.net_down.load(Ordering::Relaxed)
+    }
+
+    /// Kills passt: the guest loses its network at once and until it
+    /// restarts. Needs no QMP, so a hung or hostile QEMU cannot delay it.
+    /// Returns false if it was already cut or the VM has no network.
+    pub fn cut_network(&self) -> bool {
+        let Some(cut) = &self.cut_net else {
+            return false;
+        };
+        if self.net_down.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        // Stores a permit if the reaper is not waiting yet.
+        cut.notify_one();
+        true
     }
 
     /// What `ls` shows: QEMU's run state, e.g. `running`, `paused` or
@@ -1223,9 +1252,7 @@ impl Running {
             Ok(s) if s == "paused" && self.disk_full.load(Ordering::Relaxed) => {
                 "paused (disk full)".to_owned()
             }
-            Ok(s) if s == "paused" && self.isolation_lost.load(Ordering::Relaxed) => {
-                "paused (isolation lost)".to_owned()
-            }
+            Ok(s) if self.net_down.load(Ordering::Relaxed) => format!("{s} (no network)"),
             Ok(s) => s,
             Err(_) => "unknown".to_owned(),
         }
@@ -1636,7 +1663,8 @@ mod tests {
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
-            isolation_lost: AtomicBool::new(false),
+            net_down: Arc::default(),
+            cut_net: None,
             exited,
         };
         (dir, vm, log)
@@ -1667,6 +1695,27 @@ mod tests {
                     .join(" ")
             })
             .collect()
+    }
+
+    /// The isolation watchdog cuts the network once; offline VMs have
+    /// none to cut.
+    #[tokio::test]
+    async fn cutting_the_network() {
+        let (_d, mut vm, log) = fake_vm("running", None).await;
+        assert!(!vm.has_network() && !vm.cut_network());
+        let cut = Arc::new(tokio::sync::Notify::new());
+        vm.cut_net = Some(cut.clone());
+        assert!(vm.has_network());
+        assert!(vm.cut_network());
+        assert!(!vm.cut_network(), "only once");
+        assert!(!vm.has_network());
+        // passt's reaper is woken even though it was not waiting yet.
+        tokio::time::timeout(Duration::from_secs(1), cut.notified())
+            .await
+            .unwrap();
+        assert_eq!(vm.state().await, "running (no network)");
+        // No QMP command was needed.
+        assert!(!log.lock().unwrap().iter().any(|c| c["execute"] == "stop"));
     }
 
     #[tokio::test]
