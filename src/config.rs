@@ -60,6 +60,15 @@ pub fn validate_image_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How the daemon runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// As the developer's own user, data under `$HOME`; offline VMs only.
+    Dev,
+    /// As the dedicated `stallo` user, data under `/var/lib/stallo`.
+    Production,
+}
+
 /// Guest network profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

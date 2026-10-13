@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -21,7 +21,7 @@ use stallo::api::Via;
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Response, VmInfo};
 use stallo::audit;
 use stallo::cgroup::Cgroups;
-use stallo::config::{DaemonConfig, VmConfig, validate_name};
+use stallo::config::{DaemonConfig, Mode, VmConfig, validate_name};
 use stallo::images;
 use stallo::paths::{Paths, safe_remove};
 use stallo::read_line;
@@ -37,7 +37,9 @@ const MAX_CONNECTIONS: usize = 64;
 #[derive(Parser)]
 #[command(version, about = "Stallo daemon: owns VMs, serves the stallo API")]
 struct Args {
-    /// Dev mode: run as the current user with data under $HOME.
+    /// Dev mode: run as the current user with data under $HOME, offline VMs
+    /// only. Without it: production mode, as the `stallo` user with data in
+    /// /var/lib/stallo and runtime files in /run/stallo.
     #[arg(long)]
     dev: bool,
     /// Override the data directory (dev mode only).
@@ -59,17 +61,32 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    if !args.dev {
-        bail!("production mode is not available yet; run `stallod --dev`");
+    let mode = if args.dev {
+        Mode::Dev
+    } else {
+        Mode::Production
+    };
+    if mode == Mode::Production {
+        // The host's network table and every file permission assume the
+        // dedicated `stallo` user.
+        ensure!(
+            !rustix::process::getuid().is_root(),
+            "stallod must not run as root; run it as the stallo user"
+        );
     }
     // New files are private to the daemon user (and its group in production).
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o027));
 
-    let defaults = Paths::dev()?;
-    let paths = Paths::new(
-        args.data_dir.unwrap_or(defaults.data),
-        args.runtime_dir.unwrap_or(defaults.runtime),
-    )?
+    let paths = match mode {
+        Mode::Dev => {
+            let defaults = Paths::dev()?;
+            Paths::new(
+                args.data_dir.unwrap_or(defaults.data),
+                args.runtime_dir.unwrap_or(defaults.runtime),
+            )?
+        }
+        Mode::Production => Paths::production()?,
+    }
     .prepare()?;
     // One daemon per runtime dir: a second one would wipe the first one's
     // sockets. Held (open) for the daemon's lifetime.
@@ -85,13 +102,13 @@ fn main() -> Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(serve(paths, config, cgroups))?;
+        .block_on(serve(paths, config, cgroups, mode))?;
     drop(lock);
     Ok(())
 }
 
-async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups) -> Result<()> {
-    let manager = Manager::new(paths.clone(), config, cgroups);
+async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode) -> Result<()> {
+    let manager = Manager::new(paths.clone(), config, cgroups, mode);
     manager.cleanup_leftovers().await?;
 
     let sock = paths.api_socket();
@@ -100,6 +117,9 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups) -> Result<(
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!("listening on {}", sock.display());
     tokio::spawn(stallo::host::watchdog(manager.clone()));
+    if mode == Mode::Production {
+        tokio::spawn(stallo::net::watchdog(manager.clone()));
+    }
 
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;

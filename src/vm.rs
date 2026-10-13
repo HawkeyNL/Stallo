@@ -24,7 +24,9 @@ use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::cgroup::{Cgroups, Limits};
-use crate::config::{DaemonConfig, NetProfile, PortForward, VmConfig, new_uuid, validate_name};
+use crate::config::{
+    DaemonConfig, Mode, NetProfile, PortForward, VmConfig, new_uuid, validate_name,
+};
 use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
@@ -126,6 +128,8 @@ pub struct Running {
     pub(crate) qga: tokio::sync::Mutex<Option<Qga>>,
     /// Paused by the disk watchdog.
     pub(crate) disk_full: AtomicBool,
+    /// Paused because the host's network isolation went away.
+    pub(crate) isolation_lost: AtomicBool,
     /// Becomes `true` once QEMU has exited and everything is cleaned up.
     exited: watch::Receiver<bool>,
 }
@@ -142,6 +146,7 @@ impl Running {
 pub struct Manager {
     pub paths: Paths,
     pub config: DaemonConfig,
+    pub mode: Mode,
     cgroups: Cgroups,
     running: Mutex<HashMap<String, Arc<Running>>>,
     /// Per-name lifecycle locks.
@@ -156,10 +161,11 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn new(paths: Paths, config: DaemonConfig, cgroups: Cgroups) -> Arc<Self> {
+    pub fn new(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             paths,
             config,
+            mode,
             cgroups,
             running: Mutex::default(),
             ops: Mutex::default(),
@@ -438,14 +444,18 @@ impl Manager {
         }
     }
 
-    /// Whether `cfg`'s network profile may start here. The internet profile
-    /// is refused until the host's isolation can be checked.
+    /// Whether `cfg`'s network profile may start here. Fail closed: the
+    /// internet profile needs production mode and a passing isolation
+    /// probe (`net::check_isolation`).
     fn check_net(&self, cfg: &VmConfig) -> Result<()> {
-        match cfg.net {
-            NetProfile::Offline => Ok(()),
-            NetProfile::Internet => {
-                bail!("isolation unavailable: the internet profile cannot be checked yet")
-            }
+        match (cfg.net, self.mode) {
+            (NetProfile::Offline, _) => Ok(()),
+            // The host's table matches the daemon's user; in dev mode that
+            // is the developer, whose traffic it must not touch.
+            (NetProfile::Internet, Mode::Dev) => bail!(
+                "isolation unavailable: dev mode runs as your own user, so the internet profile needs production mode"
+            ),
+            (NetProfile::Internet, Mode::Production) => net::check_isolation(),
         }
     }
 
@@ -553,6 +563,7 @@ impl Manager {
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
+            isolation_lost: AtomicBool::new(false),
             exited: rx,
         });
         self.running
@@ -642,8 +653,10 @@ impl Manager {
             !host::below_floor(host::disk_free(&self.paths.data)?, floor),
             "the data disk is still below the {floor} GiB floor; free space first"
         );
+        self.check_net(&vm.config)?;
         // Cleared first, so a watchdog tick after `cont` can pause it again.
         vm.disk_full.store(false, Ordering::Relaxed);
+        vm.isolation_lost.store(false, Ordering::Relaxed);
         vm.qmp.execute("cont", None).await?;
         Ok(())
     }
@@ -1177,15 +1190,30 @@ impl Running {
     /// Marks the VM as paused by the disk watchdog and pauses it. Returns
     /// false if it already was.
     pub async fn pause_disk_full(&self) -> Result<bool> {
-        if self.disk_full.swap(true, Ordering::Relaxed) {
+        self.hold(&self.disk_full).await
+    }
+
+    /// Marks the VM as paused because the host's network isolation is gone
+    /// and pauses it. Returns false if it already was.
+    pub async fn pause_isolation_lost(&self) -> Result<bool> {
+        self.hold(&self.isolation_lost).await
+    }
+
+    async fn hold(&self, flag: &AtomicBool) -> Result<bool> {
+        if flag.swap(true, Ordering::Relaxed) {
             return Ok(false);
         }
         if let Err(e) = self.qmp.execute("stop", None).await {
             // Not paused: let the next tick try again.
-            self.disk_full.store(false, Ordering::Relaxed);
+            flag.store(false, Ordering::Relaxed);
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// The flags that keep the guest paused until `stallo resume`.
+    pub(crate) fn holds(&self) -> [&AtomicBool; 2] {
+        [&self.disk_full, &self.isolation_lost]
     }
 
     /// What `ls` shows: QEMU's run state, e.g. `running`, `paused` or
@@ -1194,6 +1222,9 @@ impl Running {
         match self.status().await {
             Ok(s) if s == "paused" && self.disk_full.load(Ordering::Relaxed) => {
                 "paused (disk full)".to_owned()
+            }
+            Ok(s) if s == "paused" && self.isolation_lost.load(Ordering::Relaxed) => {
+                "paused (isolation lost)".to_owned()
             }
             Ok(s) => s,
             Err(_) => "unknown".to_owned(),
@@ -1605,6 +1636,7 @@ mod tests {
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
+            isolation_lost: AtomicBool::new(false),
             exited,
         };
         (dir, vm, log)

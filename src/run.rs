@@ -140,10 +140,14 @@ impl Manager {
 mod tests {
     use super::*;
     use crate::cgroup::Cgroups;
-    use crate::config::{DaemonConfig, NetProfile};
+    use crate::config::{DaemonConfig, Mode, NetProfile};
     use crate::paths::Paths;
 
     fn manager(root: &std::path::Path) -> Arc<Manager> {
+        manager_in(root, Mode::Dev)
+    }
+
+    fn manager_in(root: &std::path::Path, mode: Mode) -> Arc<Manager> {
         for d in ["data", "run", "cg"] {
             fs::create_dir(root.join(d)).unwrap();
         }
@@ -151,7 +155,12 @@ mod tests {
             .unwrap()
             .prepare()
             .unwrap();
-        Manager::new(paths, DaemonConfig::default(), Cgroups::at(root.join("cg")))
+        Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            mode,
+        )
     }
 
     fn vm(name: &str, throwaway_of: Option<&str>) -> VmConfig {
@@ -239,12 +248,22 @@ mod tests {
         assert!(err.to_string().contains("kept for `stallo run`"), "{err}");
     }
 
-    /// Fail closed: without an isolation check, internet VMs neither get
-    /// created nor start (also from a hand-written vm.toml).
+    /// S15, fail closed: dev mode always refuses the internet profile, and
+    /// production mode refuses it without the host's table (as here). It
+    /// is neither created nor started, also from a hand-written vm.toml.
     #[tokio::test]
     async fn internet_is_refused() {
+        for (mode, why) in [
+            (Mode::Dev, "dev mode"),
+            (Mode::Production, "isolation unavailable"),
+        ] {
+            internet_is_refused_in(mode, why).await;
+        }
+    }
+
+    async fn internet_is_refused_in(mode: Mode, why: &str) {
         let tmp = tempfile::tempdir().unwrap();
-        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
         let new = crate::vm::NewVm {
             name: "web".into(),
             image: "ubuntu-26.04".into(),
@@ -256,7 +275,7 @@ mod tests {
             agent_control: false,
         };
         let err = m.create(&new).await.unwrap_err();
-        assert!(err.to_string().contains("isolation unavailable"), "{err}");
+        assert!(err.to_string().contains(why), "{err}");
         assert!(!m.paths.vm_dir("web").exists());
 
         let dir = m.paths.vm_dir("web");
@@ -267,6 +286,6 @@ mod tests {
         };
         cfg.save(&dir).unwrap();
         let err = m.start("web").await.err().unwrap();
-        assert!(err.to_string().contains("isolation unavailable"), "{err}");
+        assert!(err.to_string().contains(why), "{err}");
     }
 }

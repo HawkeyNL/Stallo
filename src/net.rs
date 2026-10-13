@@ -13,16 +13,20 @@
 //! multicast addresses. See `docs/network-verification.md`.
 
 use std::fs::File;
-use std::net::IpAddr;
+use std::io;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
-use crate::config::{PortForward, VmConfig};
+use crate::config::{NetProfile, PortForward, VmConfig};
+use crate::vm::Manager;
 
 pub const PASST: &str = "/usr/bin/passt";
 
@@ -38,6 +42,99 @@ pub const PASST_MAX_FILES: libc::rlim_t = 4096;
 
 /// passt's share of the VM cgroup's memory (it used 18-21 MiB in the lab).
 pub const PASST_MEMORY_MIB: u64 = 64;
+
+/// How often the isolation probe repeats while `internet` VMs run.
+pub const RECHECK: Duration = Duration::from_secs(2);
+
+/// Fails unless the host isolates this user's traffic: passt is installed
+/// and the `inet stallo` nftables table drops what it must.
+///
+/// The probe sends one UDP datagram each to its own `127.0.0.1` and `::1`
+/// sockets, to `10.255.255.1:9` and to `127.0.0.53:54`. The table drops
+/// each in the output hook, which fails `sendto` with `EPERM` at once
+/// (a dropped TCP SYN would only time out). Anything else, including a
+/// datagram that was sent, fails the check. It takes microseconds.
+pub fn check_isolation() -> Result<()> {
+    probe().context("isolation unavailable")
+}
+
+fn probe() -> Result<()> {
+    if !Path::new(PASST).exists() {
+        bail!("{PASST} is missing; install the passt package");
+    }
+    // Receivers for the loopback probes; whatever reaches them is dropped
+    // with them.
+    let own4 = UdpSocket::bind("127.0.0.1:0").context("cannot bind a 127.0.0.1 probe socket")?;
+    let own6 = UdpSocket::bind("[::1]:0").context("cannot bind a ::1 probe socket")?;
+    let targets = [
+        own4.local_addr()?,
+        own6.local_addr()?,
+        // A private range, never local.
+        SocketAddr::from(([10, 255, 255, 1], 9)),
+        // The DNS exception is for port 53 only.
+        SocketAddr::from(([127, 0, 0, 53], 54)),
+    ];
+    // One at a time, loopback first: without the table the probe stops
+    // at the first datagram, before anything could leave the host.
+    for to in targets {
+        verdict(&[(to, send_one(to))])?;
+    }
+    Ok(())
+}
+
+fn send_one(to: SocketAddr) -> io::Result<()> {
+    let any: SocketAddr = if to.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    UdpSocket::bind(any)?
+        .send_to(b"stallo isolation probe", to)
+        .map(drop)
+}
+
+/// Every probe must have failed with `EPERM`.
+fn verdict(results: &[(SocketAddr, io::Result<()>)]) -> Result<()> {
+    for (to, r) in results {
+        match r {
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+            Ok(()) => {
+                bail!("a probe datagram to {to} was sent; the stallo nftables table is not loaded")
+            }
+            Err(e) => bail!("the probe to {to} failed with \"{e}\" instead of EPERM"),
+        }
+    }
+    Ok(())
+}
+
+/// Repeats the probe every [`RECHECK`] while `internet` VMs run, and pauses
+/// them all when it fails: the table can be flushed at runtime (`nft flush
+/// ruleset`). `stallo resume` probes again before it continues a VM.
+pub async fn watchdog(manager: Arc<Manager>) {
+    let mut tick = tokio::time::interval(RECHECK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let vms: Vec<_> = manager
+            .all_running()
+            .into_iter()
+            .filter(|vm| vm.config.net == NetProfile::Internet)
+            .collect();
+        if vms.is_empty() {
+            continue;
+        }
+        let Err(e) = check_isolation() else {
+            continue;
+        };
+        for vm in vms {
+            match vm.pause_isolation_lost().await {
+                Ok(true) => tracing::error!("{}: paused: {e:#}", vm.config.name),
+                Ok(false) => {}
+                Err(err) => tracing::error!("{}: pause failed: {err:#}", vm.config.name),
+            }
+        }
+    }
+}
 
 /// passt's arguments. `fd` is passt's end of the socketpair; guest DNS
 /// goes to `dns`.
@@ -232,6 +329,35 @@ mod tests {
     #[test]
     fn mac_is_stable_per_vm() {
         assert_eq!(mac(&vm()), "52:54:00:4f:1c:2b");
+    }
+
+    #[test]
+    fn verdict_needs_eperm_everywhere() {
+        let to: SocketAddr = ([10, 255, 255, 1], 9).into();
+        let eperm = || Err(io::Error::from_raw_os_error(libc::EPERM));
+        verdict(&[(to, eperm()), (to, eperm())]).unwrap();
+        let sent = verdict(&[(to, eperm()), (to, Ok(()))]).unwrap_err();
+        assert!(sent.to_string().contains("not loaded"), "{sent}");
+        // A timeout or "unreachable" proves nothing about the table.
+        for errno in [
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+            libc::EACCES,
+            libc::EAGAIN,
+        ] {
+            let r = verdict(&[(to, Err(io::Error::from_raw_os_error(errno)))]);
+            assert!(r.is_err(), "{errno}");
+        }
+        assert!(verdict(&[]).is_ok());
+    }
+
+    /// Without the table (as on a dev host or in CI), the probe fails.
+    /// Only loopback targets: nothing leaves the machine.
+    #[test]
+    fn unfiltered_loopback_fails_the_probe() {
+        let own = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = own.local_addr().unwrap();
+        assert!(verdict(&[(to, send_one(to))]).is_err());
     }
 
     /// The child sees the socket under the parent's number; nothing else
