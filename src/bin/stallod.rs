@@ -114,7 +114,15 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode)
     let sock = paths.api_socket();
     safe_remove(&paths.runtime, &sock)?;
     let listener = UnixListener::bind(&sock).context("cannot bind the API socket")?;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+    // Dev: the owner only. Production: the daemon's group too (S2); its
+    // members also need to traverse the runtime dir, but not the per-VM
+    // dirs below it (0700).
+    let (sock_mode, dir_mode) = match mode {
+        Mode::Dev => (0o600, 0o700),
+        Mode::Production => (0o660, 0o750),
+    };
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(sock_mode))?;
+    std::fs::set_permissions(&paths.runtime, std::fs::Permissions::from_mode(dir_mode))?;
     tracing::info!("listening on {}", sock.display());
     tokio::spawn(stallo::host::watchdog(manager.clone()));
     if mode == Mode::Production {
@@ -125,6 +133,9 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode)
     let mut int = signal(SignalKind::interrupt())?;
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let own_uid = rustix::process::getuid().as_raw();
+    // Production: members of the daemon's group may use the API too; the
+    // socket and the runtime dir are group-accessible (S2).
+    let group = (mode == Mode::Production).then(|| rustix::process::getgid().as_raw());
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -144,7 +155,7 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode)
                 };
                 let manager = manager.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = connection(&manager, stream, own_uid).await {
+                    if let Err(e) = connection(&manager, stream, own_uid, group).await {
                         tracing::debug!("connection: {e:#}");
                     }
                     drop(permit);
@@ -172,9 +183,18 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode)
     Ok(())
 }
 
-async fn connection(manager: &Arc<Manager>, stream: UnixStream, own_uid: u32) -> Result<()> {
+async fn connection(
+    manager: &Arc<Manager>,
+    stream: UnixStream,
+    own_uid: u32,
+    group: Option<u32>,
+) -> Result<()> {
     let cred = stream.peer_cred()?;
-    if !api::authorize(cred.uid(), cred.gid(), own_uid, None) {
+    let mut gids = vec![cred.gid()];
+    if group.is_some() {
+        gids.extend(api::peer_groups(&stream)?);
+    }
+    if !api::authorize(cred.uid(), &gids, own_uid, group) {
         tracing::warn!("refused API peer uid {} pid {:?}", cred.uid(), cred.pid());
         return Ok(());
     }

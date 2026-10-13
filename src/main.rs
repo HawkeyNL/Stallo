@@ -19,7 +19,8 @@ struct Cli {
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
-    /// API socket (default: $STALLO_SOCKET, else the dev-mode socket).
+    /// API socket (default: $STALLO_SOCKET, else the production socket
+    /// /run/stallo/api.sock if it is there, else the dev-mode socket).
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     #[command(subcommand)]
@@ -216,7 +217,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         .or_else(|| std::env::var_os("STALLO_SOCKET").map(PathBuf::from));
     let socket = match explicit_socket.clone() {
         Some(s) => s,
-        None => stallo::paths::Paths::dev()?.api_socket(),
+        None => default_socket()?,
     };
     let call = |request: Request| {
         let socket = socket.clone();
@@ -484,6 +485,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The production daemon's socket when it is there (and this user may
+/// reach it), else the dev-mode socket.
+fn default_socket() -> Result<PathBuf> {
+    let production = stallo::paths::Paths::production()?.api_socket();
+    if production.exists() {
+        return Ok(production);
+    }
+    Ok(stallo::paths::Paths::dev()?.api_socket())
 }
 
 /// The arguments `stallo mcp` needs: `[--socket <path>] mcp`.

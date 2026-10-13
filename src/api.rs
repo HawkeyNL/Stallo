@@ -368,9 +368,44 @@ pub fn check_agent(
 }
 
 /// Whether a peer may use the API: the daemon's own UID, root, or (in
-/// production) a member of the daemon's group via the primary GID.
-pub fn authorize(peer_uid: u32, peer_gid: u32, own_uid: u32, group: Option<u32>) -> bool {
-    peer_uid == own_uid || peer_uid == 0 || group.is_some_and(|g| g == peer_gid)
+/// production) a member of the daemon's group. `peer_gids` are the peer's
+/// primary and supplementary groups at `connect()` time.
+pub fn authorize(peer_uid: u32, peer_gids: &[u32], own_uid: u32, group: Option<u32>) -> bool {
+    peer_uid == own_uid || peer_uid == 0 || group.is_some_and(|g| peer_gids.contains(&g))
+}
+
+/// The supplementary groups of a Unix socket's peer, as they were at
+/// `connect()` (`SO_PEERGROUPS`).
+pub fn peer_groups(fd: impl std::os::fd::AsFd) -> std::io::Result<Vec<u32>> {
+    use std::os::fd::AsRawFd;
+    // Most users are in a few groups; the kernel reports the size it needs
+    // (ERANGE) when there are more. NGROUPS_MAX bounds it.
+    let mut groups = vec![0 as libc::gid_t; 32];
+    loop {
+        let mut len = (groups.len() * size_of::<libc::gid_t>()) as libc::socklen_t;
+        // SAFETY: `groups` is a writable buffer of `len` bytes, and the
+        // kernel writes at most `len` bytes into it.
+        #[allow(unsafe_code)]
+        let r = unsafe {
+            libc::getsockopt(
+                fd.as_fd().as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERGROUPS,
+                groups.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        let need = len as usize / size_of::<libc::gid_t>();
+        if r == 0 {
+            groups.truncate(need);
+            return Ok(groups);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ERANGE) || need <= groups.len() || need > 65536 {
+            return Err(e);
+        }
+        groups.resize(need, 0);
+    }
 }
 
 /// Sends one request and reads the response (client side).
@@ -511,11 +546,30 @@ mod tests {
     /// S2.
     #[test]
     fn authorization() {
-        assert!(authorize(1000, 1000, 1000, None));
-        assert!(authorize(0, 0, 1000, None));
-        assert!(!authorize(1001, 1001, 1000, None));
-        assert!(!authorize(1001, 1000, 1000, None));
-        assert!(authorize(1001, 990, 991, Some(990)));
-        assert!(!authorize(1001, 1001, 991, Some(990)));
+        assert!(authorize(1000, &[1000], 1000, None));
+        assert!(authorize(0, &[0], 1000, None));
+        assert!(!authorize(1001, &[1001], 1000, None));
+        // Sharing the daemon user's group means nothing in dev mode.
+        assert!(!authorize(1001, &[1000, 990], 1000, None));
+        assert!(authorize(1001, &[990], 991, Some(990)));
+        // Group membership via a supplementary group.
+        assert!(authorize(1001, &[1001, 27, 990], 991, Some(990)));
+        assert!(!authorize(1001, &[1001, 27], 991, Some(990)));
+        assert!(!authorize(1001, &[], 991, Some(990)));
+    }
+
+    /// S2: the peer's supplementary groups come from the kernel.
+    #[test]
+    fn peer_groups_of_own_socket() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut got = peer_groups(&a).unwrap();
+        let mut want: Vec<u32> = rustix::process::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want);
     }
 }

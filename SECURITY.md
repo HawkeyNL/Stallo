@@ -47,6 +47,11 @@ every process of the developer's user) can send CLI requests or run
 `stallo agent <vm> on` itself. The boundaries are the socket permissions
 and, in production, the separate `stallo` user.
 
+In production the API socket is `/run/stallo/api.sock`, mode `0660`, group
+`stallo`, and the daemon also checks the peer's groups (`SO_PEERGROUPS`).
+Every member of group `stallo` has the full API, the same as the owner:
+add only trusted users, and agents only through `stallo mcp`.
+
 Every API call is logged, one JSON line each, in
 `<data>/audit/<vm>.jsonl` (or `_daemon.jsonl` for calls that name no
 existing VM): time, peer UID and PID, `via`, operation, argument sizes,
