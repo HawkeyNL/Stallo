@@ -31,6 +31,14 @@ pub const PASST: &str = "/usr/bin/passt";
 /// own resolver. Link-local, so it can never be a real internet server.
 pub const GUEST_DNS: &str = "169.254.1.53";
 
+/// Most open files for passt. Each guest flow is a host socket and a
+/// conntrack entry shared with the whole host; passt would otherwise raise
+/// its limit to the hard limit.
+pub const PASST_MAX_FILES: libc::rlim_t = 4096;
+
+/// passt's share of the VM cgroup's memory (it used 18-21 MiB in the lab).
+pub const PASST_MEMORY_MIB: u64 = 64;
+
 /// passt's arguments. `fd` is passt's end of the socketpair; guest DNS
 /// goes to `dns`.
 pub fn passt_args(forwards: &[PortForward], fd: RawFd, dns: IpAddr) -> Vec<String> {
@@ -50,6 +58,9 @@ pub fn passt_args(forwards: &[PortForward], fd: RawFd, dns: IpAddr) -> Vec<Strin
         GUEST_DNS,
         "--dns-host",
         &dns.to_string(),
+        // The host's search domains (tailnet, LAN) stay on the host.
+        "--search",
+        "none",
         "-u",
         "none",
     ]
@@ -135,6 +146,21 @@ pub fn spawn_passt(
         .process_group(0);
     crate::cgroup::move_on_exec(&mut cmd, cgroup)?;
     inherit_on_exec(&mut cmd, fd);
+    // SAFETY: runs in the forked child before exec; one setrlimit syscall
+    // on a stack value, nothing else.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: PASST_MAX_FILES,
+                rlim_max: PASST_MAX_FILES,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     cmd.spawn().context("cannot start passt")
 }
 
@@ -162,7 +188,7 @@ mod tests {
     fn golden_passt_args() {
         let base = "--foreground --quiet --fd 7 --map-host-loopback none \
                     --map-guest-addr none --dns-forward 169.254.1.53 \
-                    --dns-host 9.9.9.9 -u none";
+                    --dns-host 9.9.9.9 --search none -u none";
         let dns = IpAddr::from([9, 9, 9, 9]);
         assert_eq!(passt_args(&[], 7, dns).join(" "), format!("{base} -t none"));
         let lo = "127.0.0.1".parse().unwrap();

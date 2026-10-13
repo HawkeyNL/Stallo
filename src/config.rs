@@ -108,7 +108,7 @@ pub struct PortForward {
 
 /// Most port forwards per VM.
 pub const MAX_FORWARDS: usize = 16;
-/// Host ports below this need privileges and belong to system services.
+/// Forwarded host ports must be above 1024, away from system services.
 pub const MIN_HOST_PORT: u16 = 1025;
 
 impl PortForward {
@@ -119,12 +119,18 @@ impl PortForward {
             self.host
         );
         ensure!(self.guest != 0, "guest port 0 is not a port");
+        let b = self.bind;
         // A wildcard would publish the guest on every host address; name
-        // the address instead.
+        // the address instead. IPv4-mapped IPv6 (`::ffff:0.0.0.0`) would
+        // slip past the checks, and passt cannot bind an unscoped
+        // link-local address.
+        let odd = match b {
+            IpAddr::V4(a) => a.is_broadcast(),
+            IpAddr::V6(a) => a.to_ipv4_mapped().is_some() || a.is_unicast_link_local(),
+        };
         ensure!(
-            !self.bind.is_unspecified() && !self.bind.is_multicast(),
-            "cannot bind a port forward to {}: give one host address",
-            self.bind
+            !b.is_unspecified() && !b.is_multicast() && !odd,
+            "cannot bind a port forward to {b}: give one host address (IPv4 in its own form)"
         );
         Ok(())
     }
@@ -163,10 +169,9 @@ impl VmConfig {
         );
         for (i, f) in self.forwards.iter().enumerate() {
             f.validate()?;
+            // passt keeps one target per host port, whatever the address.
             ensure!(
-                !self.forwards[..i]
-                    .iter()
-                    .any(|o| o.host == f.host && o.bind == f.bind),
+                !self.forwards[..i].iter().any(|o| o.host == f.host),
                 "host port {} is forwarded twice",
                 f.host
             );
@@ -323,11 +328,27 @@ impl DaemonConfig {
             cfg.host.qemu_overhead_mib <= MAX_MEMORY_MIB,
             "host.qemu_overhead_mib is out of range"
         );
+        // IPv4 only: passt's DNS relay address is IPv4, and it pairs with a
+        // resolver of the same family (an IPv6 one would leave it relaying
+        // to the host's own resolver). A non-public address would be
+        // dropped by the host's table anyway; refuse it here instead.
         let dns = cfg.net.dns;
-        ensure!(
-            !dns.is_unspecified() && !dns.is_loopback() && !dns.is_multicast(),
-            "net.dns must be a resolver on the internet, not {dns}"
-        );
+        let public = match dns {
+            IpAddr::V4(a) => {
+                let [b0, b1, ..] = a.octets();
+                !(a.is_unspecified()
+                    || a.is_loopback()
+                    || a.is_private()
+                    || a.is_link_local()
+                    || a.is_multicast()
+                    || a.is_broadcast()
+                    || b0 == 0
+                    || b0 >= 240
+                    || (b0 == 100 && (64..128).contains(&b1)))
+            }
+            IpAddr::V6(_) => false,
+        };
+        ensure!(public, "net.dns must be a public IPv4 resolver, not {dns}");
         Ok(cfg)
     }
 }
@@ -508,14 +529,26 @@ mod tests {
             inet(vec![other("0.0.0.0")]),
             inet(vec![other("::")]),
             inet(vec![other("224.0.0.1")]),
+            inet(vec![other("::ffff:0.0.0.0")]),
+            inet(vec![other("::ffff:127.0.0.1")]),
+            inet(vec![other("fe80::1")]),
+            inet(vec![other("255.255.255.255")]),
             inet((0..17).map(|i| fwd(2000 + i, 80)).collect()),
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
-        // The same port on two addresses is fine.
-        inet(vec![fwd(8080, 80), other("192.0.2.1")])
-            .validate()
-            .unwrap();
+        // passt keeps one target per host port, whatever the address.
+        assert!(
+            inet(vec![fwd(8080, 80), other("192.0.2.1")])
+                .validate()
+                .is_err()
+        );
+        inet(vec![PortForward {
+            bind: "::1".parse().unwrap(),
+            ..fwd(8080, 80)
+        }])
+        .validate()
+        .unwrap();
     }
 
     #[test]
@@ -545,12 +578,24 @@ mod tests {
         fs::write(&path, "[host]\ntypo = 1\n").unwrap();
         assert!(DaemonConfig::load(&path).is_err());
         assert_eq!(cfg.net.dns.to_string(), "9.9.9.9");
-        fs::write(&path, "[net]\ndns = \"2620:fe::fe\"\n").unwrap();
+        fs::write(&path, "[net]\ndns = \"1.1.1.1\"\n").unwrap();
         assert_eq!(
             DaemonConfig::load(&path).unwrap().net.dns.to_string(),
-            "2620:fe::fe"
+            "1.1.1.1"
         );
-        for bad in ["127.0.0.53", "0.0.0.0", "::1", "224.0.0.1"] {
+        for bad in [
+            "127.0.0.53",
+            "0.0.0.0",
+            "::1",
+            "224.0.0.1",
+            "2620:fe::fe",
+            "::ffff:127.0.0.53",
+            "192.168.1.1",
+            "10.0.0.1",
+            "100.100.100.100",
+            "169.254.1.1",
+            "255.255.255.255",
+        ] {
             fs::write(&path, format!("[net]\ndns = \"{bad}\"\n")).unwrap();
             assert!(DaemonConfig::load(&path).is_err(), "{bad}");
         }

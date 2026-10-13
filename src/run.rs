@@ -128,6 +128,8 @@ impl Manager {
             uuid: new_uuid()?,
             agent_control: false,
             throwaway_of: Some(src.name.clone()),
+            // A run only needs the guest agent, not the source's ports.
+            forwards: vec![],
             ..src.clone()
         }
         .save(&to)

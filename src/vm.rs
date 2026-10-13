@@ -412,6 +412,21 @@ impl Manager {
         // see each other.
         let _admission = self.admission.lock().await;
         self.admit(&cfg, 0)?;
+        // passt would fail to bind a port another VM already forwards.
+        for vm in self.all_running() {
+            if let Some(f) = vm.config.forwards.iter().find(|f| {
+                cfg.forwards
+                    .iter()
+                    .any(|g| g.host == f.host && g.bind == f.bind)
+            }) {
+                bail!(
+                    "host port {}:{} is already forwarded to {}",
+                    f.bind,
+                    f.host,
+                    vm.config.name
+                );
+            }
+        }
         match self.spawn(&cfg, &argv, link).await {
             Ok(running) => Ok(running),
             Err(e) => {
@@ -443,7 +458,7 @@ impl Manager {
         let name = &cfg.name;
         let vm_dir = self.paths.vm_dir(name);
         let rt_dir = self.paths.vm_runtime_dir(name);
-        let overhead = self.overhead_mib(cfg.memory_mib);
+        let overhead = self.overhead_mib(cfg);
         let limits = Limits {
             memory_max_bytes: (cfg.memory_mib + overhead) << 20,
             vcpus: cfg.vcpus,
@@ -557,7 +572,7 @@ impl Manager {
             .iter()
             .map(|r| {
                 let m = r.config.memory_mib;
-                (r.config.vcpus, m + self.overhead_mib(m))
+                (r.config.vcpus, m + self.overhead_mib(&r.config))
             })
             .collect();
         // QEMU faults guest RAM in lazily, so MemAvailable does not yet
@@ -575,7 +590,7 @@ impl Manager {
         let ask = Ask {
             vcpus: cfg.vcpus,
             memory_mib: cfg.memory_mib,
-            overhead_mib: self.overhead_mib(cfg.memory_mib),
+            overhead_mib: self.overhead_mib(cfg),
             disk_bytes,
         };
         host::admit(&self.host()?, &ask, &self.config.host)
@@ -633,8 +648,13 @@ impl Manager {
         Ok(())
     }
 
-    fn overhead_mib(&self, memory_mib: u64) -> u64 {
-        overhead_mib(self.config.host.qemu_overhead_mib, memory_mib)
+    /// QEMU's overhead, plus passt's for `internet` VMs (one cgroup).
+    fn overhead_mib(&self, cfg: &VmConfig) -> u64 {
+        let passt = match cfg.net {
+            NetProfile::Internet => net::PASST_MEMORY_MIB,
+            NetProfile::Offline => 0,
+        };
+        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt
     }
 
     /// QEMU creates the QMP socket shortly after start.
@@ -1352,6 +1372,7 @@ fn private_log(path: &Path) -> Result<fs::File> {
         .write(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     log.set_permissions(fs::Permissions::from_mode(0o600))?;
