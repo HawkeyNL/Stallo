@@ -3,9 +3,11 @@
 
 mod common;
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use stallo::api::{Request, Via};
 
 use common::Daemon;
@@ -271,7 +273,17 @@ fn measure(mib: u64) {
     let mem = format!("{mib}M");
     d.ok(&["new", "dev", "--cpus", "2", "--mem", &mem, "--disk", "20G"]);
     d.assert_safe("dev");
-    let call = |r: Request| d.api(Via::Cli, r).unwrap();
+    let cg = d.vm_cgroup("dev");
+    // Every job with the page cache it used: see `sampled`.
+    let call = |r: Request| {
+        let (v, io) = sampled(&cg, || d.api(Via::Cli, r).unwrap());
+        eprintln!("MEASURE io {io}");
+        // The RAM image's page cache is dropped after every job
+        // (docs/ram-snapshot-io.md).
+        let file = |i: usize| io["file"][i].as_u64().unwrap();
+        assert!(file(2) <= file(0) + 32, "page cache left behind: {io}");
+        v
+    };
     let snap = |tag: &str| {
         call(Request::Snapshot {
             name: "dev".into(),
@@ -324,9 +336,8 @@ fn measure(mib: u64) {
         "MEASURE {gib} GiB RAM images on disk: {} MiB",
         ram_files >> 20
     );
-    // The RAM images go through the page cache, which counts against the
-    // VM's cgroup: it must never get QEMU killed.
-    let cg = d.vm_cgroup("dev");
+    // Page cache for the RAM images counts against the VM's cgroup: it
+    // must never get QEMU killed.
     let events = std::fs::read_to_string(cg.join("memory.events")).unwrap();
     assert!(events.contains("oom_kill 0"), "{events}");
     let peak = std::fs::read_to_string(cg.join("memory.peak")).unwrap();
@@ -343,4 +354,50 @@ fn measure(mib: u64) {
         });
     }
     assert!(busy["pause_ms"].as_u64().unwrap() < 60_000);
+}
+
+/// MiB of `key` in a `memory.stat` (bytes) or `/proc/meminfo` (kB) text.
+fn field_mib(text: &str, key: &str) -> u64 {
+    let v: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0);
+    if key.ends_with(':') { v >> 10 } else { v >> 20 }
+}
+
+/// The VM cgroup's `file` and `anon` and the host's `Cached`, in MiB.
+fn usage(cg: &Path) -> [u64; 3] {
+    let stat = std::fs::read_to_string(cg.join("memory.stat")).unwrap_or_default();
+    let info = std::fs::read_to_string("/proc/meminfo").unwrap();
+    [
+        field_mib(&stat, "file "),
+        field_mib(&stat, "anon "),
+        field_mib(&info, "Cached:"),
+    ]
+}
+
+/// Runs `f` and samples [`usage`] every 50 ms meanwhile: returns its result
+/// and `[before, peak, after]` per value (host `Cached` also counts other
+/// services, so it is noisy).
+fn sampled<T>(cg: &Path, f: impl FnOnce() -> T) -> (T, Value) {
+    let before = usage(cg);
+    let done = AtomicBool::new(false);
+    let (out, peak) = std::thread::scope(|s| {
+        let sampler = s.spawn(|| {
+            let mut peak = before;
+            while !done.load(Ordering::Relaxed) {
+                for (p, v) in peak.iter_mut().zip(usage(cg)) {
+                    *p = (*p).max(v);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            peak
+        });
+        let out = f();
+        done.store(true, Ordering::Relaxed);
+        (out, sampler.join().unwrap())
+    });
+    let after = usage(cg);
+    let at = |i: usize| [before[i], peak[i], after[i]];
+    (out, json!({"file": at(0), "anon": at(1), "cached": at(2)}))
 }

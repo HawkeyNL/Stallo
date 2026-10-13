@@ -177,9 +177,10 @@ async fn create_state_file(vm_dir: &Path, file: &Path) -> Result<()> {
 }
 
 /// Runs a snapshot job with `file` attached as node [`VMSTATE`]. The page
-/// cache is used for it (no `cache.direct`): RAM is written and read in
-/// one sequential stream, about twice as fast, and the pages count against
-/// the VM's own cgroup. QEMU flushes the image before the snapshot counts.
+/// cache is used for it (no `cache.direct`): QEMU's unaligned, queue-depth-1
+/// stream makes O_DIRECT 3-5x slower (docs/ram-snapshot-io.md), and the
+/// pages count against the VM's own cgroup. QEMU flushes the image before
+/// the snapshot counts; never set `cache.no-flush`.
 async fn with_state<T>(qmp: &Qmp, file: &Path, job: impl AsyncFnOnce() -> Result<T>) -> Result<T> {
     // A node left by an interrupted job would block the name.
     let _ = qmp
@@ -895,6 +896,9 @@ mod tests {
                         assert_eq!(req["arguments"]["node-name"], VMSTATE);
                         assert!(req["arguments"]["backing"].is_null());
                         assert!(req["arguments"].get("backing").is_some());
+                        // QEMU's default cache: page cache with flushes
+                        // (docs/ram-snapshot-io.md).
+                        assert!(req["arguments"].get("cache").is_none());
                         assert_eq!(req["arguments"]["file"]["filename"], "/x/s1.qcow2");
                         json!({})
                     }
