@@ -297,6 +297,9 @@ pub struct HostConfig {
     pub reserve_mib: u64,
     /// Free space on the data filesystem that VMs may never eat into, in GiB.
     pub disk_floor_gib: u64,
+    /// Cores a single VM may never use: a VM gets at most `nproc - this`
+    /// vCPUs. Lower it only on small machines such as a lab VM.
+    pub reserved_cores: u32,
     /// Minimum QEMU overhead on top of guest RAM, in MiB. The cgroup gets
     /// `memory.max = memory + max(this, memory / 16)`. Measured on Ubuntu
     /// 26.04 / QEMU 10.2 with a 2 GiB guest: QEMU's own RSS is about 60 MiB
@@ -311,6 +314,7 @@ impl Default for HostConfig {
             memory_budget_pct: 50,
             reserve_mib: 4096,
             disk_floor_gib: 20,
+            reserved_cores: 2,
             qemu_overhead_mib: 256,
         }
     }
@@ -336,6 +340,10 @@ impl DaemonConfig {
         ensure!(
             cfg.host.qemu_overhead_mib <= MAX_MEMORY_MIB,
             "host.qemu_overhead_mib is out of range"
+        );
+        ensure!(
+            (1..=1024).contains(&cfg.host.reserved_cores),
+            "host.reserved_cores must be between 1 and 1024: one VM may never take every core"
         );
         // IPv4 only: passt's DNS relay address is IPv4, and it pairs with a
         // resolver of the same family (an IPv6 one would leave it relaying
@@ -592,6 +600,8 @@ mod tests {
             DaemonConfig::load(&path).unwrap().net.dns.to_string(),
             "1.1.1.1"
         );
+        fs::write(&path, "[host]\nreserved_cores = 0\n").unwrap();
+        assert!(DaemonConfig::load(&path).is_err());
         for bad in [
             "127.0.0.53",
             "0.0.0.0",

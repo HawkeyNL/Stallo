@@ -1,0 +1,82 @@
+#!/usr/sbin/nft -f
+# Stallo: network isolation for the `internet` profile.
+#
+# passt (and the rest of Stallo) runs as the system user `stallo`. This
+# table drops every packet that user's sockets send to the host itself, to
+# private, shared, link-local, multicast and reserved ranges, so a guest
+# reaches the internet and nothing else. It does not touch packets of other
+# users or packets without a socket.
+#
+# stallod refuses to start `internet` VMs, and pauses running ones, unless
+# its probe sees this table drop traffic (docs/network-verification.md).
+#
+# Load:   nft -f /etc/stallo/stallo.nft   (root; `stallo` must exist first,
+#         its uid is resolved now)
+# Remove: nft delete table inet stallo
+#
+# A `flush ruleset` (e.g. a reload of /etc/nftables.conf) removes this table
+# too; include this file there if nftables.service is used.
+
+table inet stallo
+delete table inet stallo
+
+table inet stallo {
+	set deny4 {
+		type ipv4_addr; flags interval
+		elements = {
+			0.0.0.0/8,		# "this network"
+			10.0.0.0/8,		# private
+			100.64.0.0/10,		# shared (CGNAT, Tailscale)
+			127.0.0.0/8,		# loopback
+			169.254.0.0/16,		# link-local
+			172.16.0.0/12,		# private (Docker's default bridges)
+			192.0.0.0/24,		# IETF protocol assignments
+			192.168.0.0/16,		# private
+			198.18.0.0/15,		# benchmarking
+			224.0.0.0/4,		# multicast
+			240.0.0.0/4,		# reserved, broadcast
+		}
+	}
+
+	set deny6 {
+		type ipv6_addr; flags interval
+		elements = {
+			::/128,			# unspecified
+			::1/128,		# loopback
+			::ffff:0:0/96,		# IPv4-mapped (backstop; sent as IPv4)
+			64:ff9b::7f00:0/104,	# NAT64 of 127/8
+			64:ff9b::a00:0/104,	# NAT64 of 10/8
+			64:ff9b::a9fe:0/112,	# NAT64 of 169.254/16
+			64:ff9b::ac10:0/108,	# NAT64 of 172.16/12
+			64:ff9b::c0a8:0/112,	# NAT64 of 192.168/16
+			64:ff9b::6440:0/106,	# NAT64 of 100.64/10
+			64:ff9b:1::/48,		# local-use NAT64
+			100::/64,		# discard
+			fc00::/7,		# unique local (Tailscale's fd7a:115c:a1e0::/48)
+			fec0::/10,		# site-local
+			fe80::/10,		# link-local
+			ff00::/8,		# multicast
+		}
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+		# Only the stallo user's sockets. A positive match: packets without
+		# a socket (e.g. another table's TCP resets) never reach the drops.
+		meta skuid "stallo" jump egress
+	}
+
+	chain egress {
+		# Replies on port forwards (passt's listeners). TCP only: conntrack
+		# entries are shared by all users, and UDP or ICMP "replies" could
+		# ride an entry another process created.
+		meta l4proto tcp ct direction reply accept
+		# The host resolver, for the daemon's own image downloads. Guests
+		# cannot reach it: passt maps no guest address to the host.
+		ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+		# Any address of this host, on any interface.
+		fib daddr type { local, broadcast, multicast, anycast } drop
+		ip daddr @deny4 drop
+		ip6 daddr @deny6 drop
+	}
+}

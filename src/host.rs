@@ -71,12 +71,13 @@ pub struct Ask {
 
 /// Decides whether a VM fits. Pure, so every rule is unit-tested.
 pub fn admit(host: &HostInfo, ask: &Ask, cfg: &HostConfig) -> Result<()> {
+    let keep = cfg.reserved_cores;
     ensure!(
-        ask.vcpus + 2 <= host.cores,
-        "{} vCPUs is too many for a {}-core host (at most {})",
+        ask.vcpus + keep <= host.cores,
+        "{} vCPUs is too many for a {}-core host (at most {}; {keep} stay with the host)",
         ask.vcpus,
         host.cores,
-        host.cores.saturating_sub(2)
+        host.cores.saturating_sub(keep)
     );
     let left = host.memory_budget_mib.saturating_sub(host.memory_used_mib);
     let want = ask.memory_mib + ask.overhead_mib;
@@ -282,6 +283,13 @@ mod tests {
         let tiny = HostInfo { cores: 2, ..host() };
         let err = admit(&tiny, &Ask { vcpus: 1, ..a }, &cfg).unwrap_err();
         assert!(err.to_string().contains("vCPUs"), "{err}");
+        // A lab VM with 2 cores can run a 1-vCPU guest if told to.
+        let lab = HostConfig {
+            reserved_cores: 1,
+            ..cfg.clone()
+        };
+        admit(&tiny, &Ask { vcpus: 1, ..a }, &lab).unwrap();
+        assert!(admit(&tiny, &Ask { vcpus: 2, ..a }, &lab).is_err());
     }
 
     #[test]

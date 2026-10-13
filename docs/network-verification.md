@@ -325,6 +325,111 @@ table inet stallo {
     `192.168.0.0/16`.
   - A stricter host can add `meta oifname != "<uplink>" drop` to the
     `egress` chain, which also catches custom address pools.
-- **The daemon-driven gate** (production-mode daemon as `stallo`, the
-  probe, `stallo new --net internet`, port forwards, S15) is checked in M3-4
-  and recorded below when it has run.
+
+## M3 gate: the daemon in the lab
+
+`tests/lab/m3-network.sh` runs the gate inside the lab VM. It refuses to
+run unless `/etc/stallo-lab` exists, so it cannot run on a real host by
+accident. It does the following:
+
+- builds the simulated networks above;
+- loads `packaging/stallo.nft`;
+- starts `stallod` in production mode as user `stallo` (`systemd-run
+  --uid=stallo -p Delegate=yes`);
+- drives everything through the `stallo` CLI.
+
+The run used release binaries built from the M3-4 branch, a fresh boot of
+the lab VM, and `[net] dns = "198.51.100.1"` (the lab's internet resolver).
+
+| Check | Result |
+|---|---|
+| S15: `stallo new --net internet` with no table loaded | refused: `isolation unavailable` |
+| Create an `internet` VM with `--forward 8080:80` | ready in 22–25 s (DHCP and wait-online included) |
+| S14: internet over IPv4, IPv6, DNS name, UDP and ping | reached |
+| S14: LAN host (TCP, UDP, ping), 10/8, 172.16/12, 100.64/10, link-local, IPv6 ULA (TCP, UDP), host LAN and link-local addresses, host-only IPv4 and IPv6, gateway on another port | blocked |
+| Port forward `127.0.0.1:8080 → 80` | works; nothing listens on `198.51.100.2:8080` |
+| RAM snapshot and restore with passt attached | works; internet and forward work after the restore |
+| S15: table deleted while the VM runs | VM shows `paused (isolation lost)` within 5 s |
+| `stallo resume` without the table | refused: `isolation unavailable` |
+| `stallo resume` after reloading the table | resumes; internet works |
+
+All 30 checks passed. Dev mode refuses `internet` at create and start
+(unit test, `run::tests::internet_is_refused`).
+
+**Measured through the product** (1 vCPU, 1 GiB guest; 3 runs each):
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Upload to the target (iperf3, 10 s) | 6.39 Gbit/s | 6.35 Gbit/s | 6.18 Gbit/s |
+| Download from the target | 5.11 Gbit/s | 4.50 Gbit/s | 4.80 Gbit/s |
+| RTT p50 / mean / p99 | 128 / 232 / 261 µs | 138 / 232 / 260 µs | 136 / 231 / 253 µs |
+
+- **Slower than the hand-started passt above** (14.1 / 10.2 Gbit/s,
+  98 µs) because passt runs in the VM's cgroup. It shares the VM's CPU
+  quota (`cpu.max` = vCPUs × 100%) with the guest.
+  - During a 10 s upload the cgroup used 0.94 CPU and was throttled in 91
+    of 100 periods.
+  - That is on purpose: the network work of a VM counts against that VM,
+    not the host. A guest with more vCPUs gets more.
+- **Memory:** passt's RSS was 18–21 MiB, inside the VM's
+  `guest RAM + overhead` limit. The cgroup peaked at 922–1074 MiB of
+  1280 MiB, with no OOM.
+- **Confinement:** passt ran as uid 999 under its AppArmor profile
+  (`passt (enforce)`).
+- **Boot without an IPv6 default route:** the VM was ready in 12 s.
+
+## Installing on a host
+
+This is an owner task: it needs root, and it changes the host's firewall.
+Do it only after the lab gate.
+
+**What it changes:** packets from sockets of user `stallo` only. Other
+users, other services and packets without a socket are not matched (lab:
+root's traffic and another table's TCP resets were unaffected). Until a
+`stallo` daemon runs `internet` VMs, nothing sends as that user.
+
+1. **Install passt:**
+   - `sudo apt install passt`
+   - Rollback: `sudo apt remove passt`
+2. **Create the user** (the table resolves its uid when loaded):
+   - `sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups kvm stallo`
+   - Rollback: `sudo userdel stallo`
+3. **Load the table:**
+   - `sudo install -D -m 644 packaging/stallo.nft /etc/stallo/stallo.nft`
+   - `sudo nft -f /etc/stallo/stallo.nft`
+   - Check: `sudo nft list table inet stallo`
+   - Rollback: `sudo nft delete table inet stallo && sudo rm -r /etc/stallo`
+4. **Optional: keep the table across reboots.** Without this, the table is
+   gone after a reboot and `internet` VMs are refused (fail closed) until
+   it is loaded again. The unit is
+   `/etc/systemd/system/stallo-nft.service`:
+
+   ```
+   [Unit]
+   Description=Stallo network isolation table
+   Before=network-pre.target
+   Wants=network-pre.target
+
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/sbin/nft -f /etc/stallo/stallo.nft
+   ExecStop=/usr/sbin/nft delete table inet stallo
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   - Enable it: `sudo systemctl daemon-reload && sudo systemctl enable --now stallo-nft`
+   - Rollback: `sudo systemctl disable --now stallo-nft && sudo rm /etc/systemd/system/stallo-nft.service && sudo systemctl daemon-reload`
+5. **If `nftables.service` is enabled**, a reload of `/etc/nftables.conf`
+   runs `flush ruleset` and removes the table. Running `internet` VMs then
+   pause within a few seconds (the probe repeats every 2 s). Add `include "/etc/stallo/stallo.nft"` at the end of
+   that file to keep the table.
+
+**After the install:**
+- `internet` VMs still need `stallod` in production mode as user
+  `stallo`. That service is packaged in M5. Dev mode keeps refusing
+  `internet`.
+- `[net] dns` in `/var/lib/stallo/stallod.toml` picks the public resolver
+  for guests (default `9.9.9.9`, Quad9).

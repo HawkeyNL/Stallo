@@ -68,6 +68,31 @@ systemd-run --user --unit=stallod-dev -p Delegate=yes -p CPUWeight=50 \
 Dev mode is not a security boundary against other processes of your own
 user: they can reach the daemon socket just like `stallo` can.
 
+## Network profiles
+
+- `offline` (the default): no network device at all.
+- `internet`: the guest reaches the internet and nothing else. It cannot
+  reach the host's own addresses, the LAN, Tailscale, link-local or
+  multicast.
+  - passt gives the guest its network; an nftables table on the host
+    (`packaging/stallo.nft`) drops every connection the `stallo` user
+    opens to those ranges.
+  - Guest DNS goes to a public resolver (`[net] dns` in `stallod.toml`,
+    default `9.9.9.9`).
+  - Optional TCP port forwards: host ports above 1024, on `127.0.0.1`
+    unless `--bind` names one host address:
+
+    ```sh
+    stallo new web --net internet --forward 8080:80
+    ```
+
+The `internet` profile needs production mode (`stallod` without `--dev`,
+as user `stallo`), passt and the table. Without them the daemon refuses it
+(`isolation unavailable`), and dev mode always refuses it. The daemon
+checks the table before every start and every 2 s while such VMs run, and
+pauses them if it is gone. The lab results and the host install steps are
+in [docs/network-verification.md](docs/network-verification.md).
+
 ## Agents (MCP)
 
 `stallo mcp` is an MCP server on stdin/stdout. Register it with Claude Code
