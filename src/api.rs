@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::config::NetProfile;
+use crate::config::{NetProfile, PortForward};
 use crate::read_line;
 pub use crate::vm::Button;
 
@@ -48,6 +48,9 @@ pub enum Request {
         memory_mib: u64,
         disk_gib: u64,
         net: NetProfile,
+        /// Host ports forwarded into the guest (`internet` only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        forwards: Vec<PortForward>,
         wait: bool,
     },
     List,
@@ -224,6 +227,8 @@ pub struct VmInfo {
     pub memory_mib: u64,
     pub disk_gib: u64,
     pub net: NetProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<PortForward>,
     pub agent_control: bool,
 }
 
@@ -480,6 +485,7 @@ mod tests {
             memory_mib: 512,
             disk_gib: 10,
             net: NetProfile::Offline,
+            forwards: vec![],
             wait: true,
         };
         let on = |_: &str| Ok(true);

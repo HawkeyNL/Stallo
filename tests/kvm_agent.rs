@@ -120,6 +120,7 @@ fn agent_drives_the_console() {
             memory_mib: 512,
             disk_gib: 10,
             net: stallo::config::NetProfile::Offline,
+            forwards: vec![],
             wait: false,
         },
     ] {

@@ -44,6 +44,13 @@ enum Cmd {
         disk: u64,
         #[arg(long, value_enum, default_value = "offline")]
         net: Net,
+        /// Forward a host TCP port into the guest (`--net internet` only),
+        /// e.g. 8080:80. Host ports must be above 1024. Repeatable.
+        #[arg(long = "forward", value_name = "HOST:GUEST")]
+        forwards: Vec<String>,
+        /// Host address the forwarded ports listen on.
+        #[arg(long, default_value = "127.0.0.1", requires = "forwards")]
+        bind: std::net::IpAddr,
         /// Return once QEMU runs, without waiting for the guest agent.
         #[arg(long)]
         no_wait: bool,
@@ -236,12 +243,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             mem,
             disk,
             net,
+            forwards,
+            bind,
             no_wait,
         } => {
             let net = match net {
                 Net::Offline => NetProfile::Offline,
                 Net::Internet => NetProfile::Internet,
             };
+            let forwards = forwards
+                .iter()
+                .map(|f| stallo::net::parse_forward(f, bind))
+                .collect::<Result<_>>()?;
             let v = call(Request::New {
                 name,
                 image,
@@ -249,6 +262,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 memory_mib: mem,
                 disk_gib: disk,
                 net,
+                forwards,
                 wait: !no_wait,
             })
             .await?;
@@ -654,9 +668,10 @@ where
     }
 }
 
-/// `2 vCPU · 2 GiB · offline`
+/// `2 vCPU · 2 GiB · offline`, plus port forwards such as
+/// ` · 127.0.0.1:8080→80`.
 fn summary(vm: &VmInfo) -> String {
-    format!(
+    let mut s = format!(
         "{} vCPU · {} · {}",
         vm.vcpus,
         mib(vm.memory_mib),
@@ -664,7 +679,12 @@ fn summary(vm: &VmInfo) -> String {
             .unwrap()
             .as_str()
             .unwrap_or("?")
-    )
+    );
+    for f in &vm.forwards {
+        let host = std::net::SocketAddr::new(f.bind, f.host);
+        s.push_str(&format!(" · {host}→{}", f.guest));
+    }
+    s
 }
 
 fn mib(m: u64) -> String {

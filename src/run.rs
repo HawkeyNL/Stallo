@@ -163,6 +163,7 @@ mod tests {
             net: NetProfile::Offline,
             agent_control: false,
             throwaway_of: throwaway_of.map(Into::into),
+            forwards: vec![],
         }
     }
 
@@ -229,9 +230,41 @@ mod tests {
             memory_mib: 512,
             disk_gib: 10,
             net: NetProfile::Offline,
+            forwards: vec![],
             agent_control: false,
         };
         let err = m.create(&new).await.unwrap_err();
         assert!(err.to_string().contains("kept for `stallo run`"), "{err}");
+    }
+
+    /// Fail closed: without an isolation check, internet VMs neither get
+    /// created nor start (also from a hand-written vm.toml).
+    #[tokio::test]
+    async fn internet_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        let new = crate::vm::NewVm {
+            name: "web".into(),
+            image: "ubuntu-26.04".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_gib: 10,
+            net: NetProfile::Internet,
+            forwards: vec![],
+            agent_control: false,
+        };
+        let err = m.create(&new).await.unwrap_err();
+        assert!(err.to_string().contains("isolation unavailable"), "{err}");
+        assert!(!m.paths.vm_dir("web").exists());
+
+        let dir = m.paths.vm_dir("web");
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = VmConfig {
+            net: NetProfile::Internet,
+            ..vm("web", None)
+        };
+        cfg.save(&dir).unwrap();
+        let err = m.start("web").await.err().unwrap();
+        assert!(err.to_string().contains("isolation unavailable"), "{err}");
     }
 }

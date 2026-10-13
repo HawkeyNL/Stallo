@@ -4,6 +4,7 @@
 //! test: one machine type, a fixed device set, no defaults, seccomp sandbox,
 //! and no network device unless a profile adds one.
 
+use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
 
@@ -40,21 +41,37 @@ const WAIT_ONLINE: &str = "systemd-networkd-wait-online.service";
 /// state. Ubuntu 26.04 ships QEMU 10.2.
 pub const MACHINE: &str = "pc-q35-10.2";
 
-/// Builds the QEMU argv (without the program) for `vm`.
-pub fn argv(vm: &VmConfig, vm_dir: &Path, rt_dir: &Path) -> Result<Vec<String>> {
+/// Builds the QEMU argv (without the program) for `vm`. `net_fd` is QEMU's
+/// end of the passt socketpair: required for the `internet` profile, and
+/// refused for `offline`.
+pub fn argv(
+    vm: &VmConfig,
+    vm_dir: &Path,
+    rt_dir: &Path,
+    net_fd: Option<RawFd>,
+) -> Result<Vec<String>> {
     // Names and uuids end up inside option strings; never trust the caller.
     vm.validate()?;
-    let network = match vm.net {
+    let network = match (vm.net, net_fd) {
         // No NIC means no link ever comes online, and Ubuntu's boot then
         // waits 2 minutes for systemd-networkd-wait-online. An empty
         // `systemd.extra-unit.*` credential masks it (systemd >= 256).
-        NetProfile::Offline => [
+        (NetProfile::Offline, None) => [
             "-nic none".to_owned(),
             format!(
                 "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{WAIT_ONLINE}="
             ),
         ],
-        NetProfile::Internet => bail!("only the offline network profile is available"),
+        // An already connected socket (see net.rs). `romfile=`: no iPXE
+        // option ROM, so no network boot code in the firmware.
+        (NetProfile::Internet, Some(fd)) => [
+            format!("-netdev stream,id=net0,server=off,addr.type=fd,addr.str={fd}"),
+            format!(
+                "-device virtio-net-pci,netdev=net0,mac={},romfile=",
+                crate::net::mac(vm)
+            ),
+        ],
+        (net, fd) => bail!("network profile {net:?} with passt socket {fd:?}"),
     };
     let file = |dir: &Path, name: &str| opt_path(&dir.join(name));
     let (disk, vars, seed) = (
@@ -170,13 +187,20 @@ mod tests {
             net: NetProfile::Offline,
             agent_control: false,
             throwaway_of: None,
+            forwards: vec![],
         }
     }
 
     /// S4: the golden command line.
     #[test]
     fn golden_argv() {
-        let got = argv(&vm(), Path::new("/d/vms/dev"), Path::new("/r/vms/dev")).unwrap();
+        let got = argv(
+            &vm(),
+            Path::new("/d/vms/dev"),
+            Path::new("/r/vms/dev"),
+            None,
+        )
+        .unwrap();
         let want = "\
 -name guest=dev,debug-threads=on -uuid 4f1c2b9e-0d3a-4c5e-8f7a-1b2c3d4e5f60 \
 -nodefaults -no-user-config -display none -msg timestamp=on \
@@ -208,7 +232,7 @@ mod tests {
     /// S4: the security-relevant flags, checked one by one.
     #[test]
     fn security_flags() {
-        let a = argv(&vm(), Path::new("/d"), Path::new("/r")).unwrap();
+        let a = argv(&vm(), Path::new("/d"), Path::new("/r"), None).unwrap();
         let after = |flag: &str| {
             a.windows(2)
                 .filter(|w| w[0] == flag)
@@ -233,23 +257,37 @@ mod tests {
         assert_eq!(opt_path(Path::new("/a,b/c")).unwrap(), "/a,,b/c");
         assert!(opt_path(Path::new("/a b")).is_err());
         assert!(opt_path(Path::new("/a\nb")).is_err());
-        let a = argv(&vm(), Path::new("/x,y"), Path::new("/r")).unwrap();
+        let a = argv(&vm(), Path::new("/x,y"), Path::new("/r"), None).unwrap();
         assert!(a.iter().any(|x| x.contains("filename=/x,,y/disk.qcow2,")));
         for name in ["a,b", "a b", "a\nb"] {
             let bad = VmConfig {
                 name: name.into(),
                 ..vm()
             };
-            assert!(argv(&bad, Path::new("/d"), Path::new("/r")).is_err());
+            assert!(argv(&bad, Path::new("/d"), Path::new("/r"), None).is_err());
         }
     }
 
+    /// The internet profile: one virtio NIC on the passt socket, no
+    /// `-nic none`, and the boot waits for the network again.
     #[test]
-    fn only_offline() {
-        let vm = VmConfig {
+    fn internet_nic() {
+        let inet = VmConfig {
             net: NetProfile::Internet,
             ..vm()
         };
-        assert!(argv(&vm, Path::new("/d"), Path::new("/r")).is_err());
+        let a = argv(&inet, Path::new("/d"), Path::new("/r"), Some(9)).unwrap();
+        let offline = argv(&vm(), Path::new("/d"), Path::new("/r"), None).unwrap();
+        let tail = &a[a.len() - 4..];
+        assert_eq!(
+            tail.join(" "),
+            "-netdev stream,id=net0,server=off,addr.type=fd,addr.str=9 \
+             -device virtio-net-pci,netdev=net0,mac=52:54:00:4f:1c:2b,romfile="
+        );
+        assert_eq!(a[..a.len() - 4], offline[..offline.len() - 4]);
+        assert!(!a.iter().any(|x| x == "-nic" || x.contains(WAIT_ONLINE)));
+        // The profile and the socket go together.
+        assert!(argv(&inet, Path::new("/d"), Path::new("/r"), None).is_err());
+        assert!(argv(&vm(), Path::new("/d"), Path::new("/r"), Some(9)).is_err());
     }
 }

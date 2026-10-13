@@ -299,6 +299,7 @@ async fn dispatch(
             memory_mib,
             disk_gib,
             net,
+            forwards,
             wait,
         } => {
             let new = NewVm {
@@ -308,6 +309,7 @@ async fn dispatch(
                 memory_mib,
                 disk_gib,
                 net,
+                forwards,
                 agent_control: via == Via::Mcp,
             };
             let started = Instant::now();
@@ -543,6 +545,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         memory_mib: cfg.memory_mib,
         disk_gib: cfg.disk_gib,
         net: cfg.net,
+        forwards: cfg.forwards.clone(),
         agent_control: cfg.agent_control,
     }
 }

@@ -12,6 +12,7 @@ pub mod host;
 pub mod images;
 pub mod input;
 pub mod mcp;
+pub mod net;
 pub mod paths;
 pub mod qemu;
 pub mod qga;

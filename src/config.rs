@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -90,6 +91,43 @@ pub struct VmConfig {
     /// daemon start if a run was cut off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throwaway_of: Option<String>,
+    /// TCP ports on the host that passt forwards into the guest (`internet`
+    /// profile only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<PortForward>,
+}
+
+/// One TCP port forward: `bind:host` on the host to `guest` in the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortForward {
+    pub bind: IpAddr,
+    pub host: u16,
+    pub guest: u16,
+}
+
+/// Most port forwards per VM.
+pub const MAX_FORWARDS: usize = 16;
+/// Host ports below this need privileges and belong to system services.
+pub const MIN_HOST_PORT: u16 = 1025;
+
+impl PortForward {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.host >= MIN_HOST_PORT,
+            "host port {} is too low: use {MIN_HOST_PORT} or higher",
+            self.host
+        );
+        ensure!(self.guest != 0, "guest port 0 is not a port");
+        // A wildcard would publish the guest on every host address; name
+        // the address instead.
+        ensure!(
+            !self.bind.is_unspecified() && !self.bind.is_multicast(),
+            "cannot bind a port forward to {}: give one host address",
+            self.bind
+        );
+        Ok(())
+    }
 }
 
 impl VmConfig {
@@ -115,6 +153,24 @@ impl VmConfig {
             (1..=16384).contains(&self.disk_gib),
             "disk must be between 1 and 16384 GiB"
         );
+        ensure!(
+            self.forwards.is_empty() || self.net == NetProfile::Internet,
+            "port forwards need the internet network profile"
+        );
+        ensure!(
+            self.forwards.len() <= MAX_FORWARDS,
+            "at most {MAX_FORWARDS} port forwards"
+        );
+        for (i, f) in self.forwards.iter().enumerate() {
+            f.validate()?;
+            ensure!(
+                !self.forwards[..i]
+                    .iter()
+                    .any(|o| o.host == f.host && o.bind == f.bind),
+                "host port {} is forwarded twice",
+                f.host
+            );
+        }
         Ok(())
     }
 
@@ -192,9 +248,29 @@ fn is_uuid(s: &str) -> bool {
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     pub host: HostConfig,
+    pub net: NetConfig,
     /// Whether agents (MCP) may create VMs; such VMs start with agent
     /// control on. Agents never delete.
     pub agents_can_create: bool,
+}
+
+/// The `[net]` table: the `internet` profile.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetConfig {
+    /// The resolver passt relays guest DNS to. A public one: the host's own
+    /// resolver would answer with the LAN's and tailnet's names, and the
+    /// host's table blocks private addresses anyway.
+    pub dns: IpAddr,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        // Quad9.
+        Self {
+            dns: IpAddr::from([9, 9, 9, 9]),
+        }
+    }
 }
 
 /// The `[host]` table: admission control and host protection.
@@ -246,6 +322,11 @@ impl DaemonConfig {
         ensure!(
             cfg.host.qemu_overhead_mib <= MAX_MEMORY_MIB,
             "host.qemu_overhead_mib is out of range"
+        );
+        let dns = cfg.net.dns;
+        ensure!(
+            !dns.is_unspecified() && !dns.is_loopback() && !dns.is_multicast(),
+            "net.dns must be a resolver on the internet, not {dns}"
         );
         Ok(cfg)
     }
@@ -315,6 +396,7 @@ mod tests {
             net: NetProfile::Offline,
             agent_control: false,
             throwaway_of: None,
+            forwards: vec![],
         }
     }
 
@@ -387,6 +469,56 @@ mod tests {
     }
 
     #[test]
+    fn port_forwards() {
+        let lo = "127.0.0.1".parse().unwrap();
+        let fwd = |host, guest| PortForward {
+            bind: lo,
+            host,
+            guest,
+        };
+        let inet = |forwards| VmConfig {
+            net: NetProfile::Internet,
+            forwards,
+            ..vm()
+        };
+        let ok = inet(vec![fwd(8080, 80), fwd(1025, 22), fwd(65535, 65535)]);
+        ok.validate().unwrap();
+        // Round trip through vm.toml.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dev");
+        fs::create_dir(&dir).unwrap();
+        ok.save(&dir).unwrap();
+        assert_eq!(VmConfig::load(&dir).unwrap(), ok);
+        // Offline VMs keep their vm.toml unchanged.
+        assert!(!toml::to_string(&vm()).unwrap().contains("forwards"));
+
+        let other = |bind: &str| PortForward {
+            bind: bind.parse().unwrap(),
+            ..fwd(8080, 80)
+        };
+        for bad in [
+            VmConfig {
+                forwards: vec![fwd(8080, 80)],
+                ..vm()
+            },
+            inet(vec![fwd(1024, 80)]),
+            inet(vec![fwd(80, 80)]),
+            inet(vec![fwd(8080, 0)]),
+            inet(vec![fwd(8080, 80), fwd(8080, 81)]),
+            inet(vec![other("0.0.0.0")]),
+            inet(vec![other("::")]),
+            inet(vec![other("224.0.0.1")]),
+            inet((0..17).map(|i| fwd(2000 + i, 80)).collect()),
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        // The same port on two addresses is fine.
+        inet(vec![fwd(8080, 80), other("192.0.2.1")])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
     fn uuids_are_valid_v4_and_unique() {
         let (a, b) = (new_uuid().unwrap(), new_uuid().unwrap());
         assert!(is_uuid(&a), "{a}");
@@ -412,5 +544,15 @@ mod tests {
         assert!(DaemonConfig::load(&path).unwrap().agents_can_create);
         fs::write(&path, "[host]\ntypo = 1\n").unwrap();
         assert!(DaemonConfig::load(&path).is_err());
+        assert_eq!(cfg.net.dns.to_string(), "9.9.9.9");
+        fs::write(&path, "[net]\ndns = \"2620:fe::fe\"\n").unwrap();
+        assert_eq!(
+            DaemonConfig::load(&path).unwrap().net.dns.to_string(),
+            "2620:fe::fe"
+        );
+        for bad in ["127.0.0.53", "0.0.0.0", "::1", "224.0.0.1"] {
+            fs::write(&path, format!("[net]\ndns = \"{bad}\"\n")).unwrap();
+            assert!(DaemonConfig::load(&path).is_err(), "{bad}");
+        }
     }
 }

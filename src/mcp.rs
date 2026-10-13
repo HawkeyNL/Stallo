@@ -426,6 +426,7 @@ impl Server {
             memory_mib: a.memory_mib.unwrap_or(2048),
             disk_gib: a.disk_gib.unwrap_or(20),
             net: crate::config::NetProfile::Offline,
+            forwards: vec![],
             wait: true,
         };
         // An image download plus first boot.

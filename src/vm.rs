@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,13 +24,15 @@ use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::cgroup::{Cgroups, Limits};
-use crate::config::{DaemonConfig, NetProfile, VmConfig, new_uuid, validate_name};
+use crate::config::{DaemonConfig, NetProfile, PortForward, VmConfig, new_uuid, validate_name};
 use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
-use crate::{confine, images, input, qemu, seed};
+use crate::{confine, images, input, net, qemu, seed};
 
+/// passt's messages, in the VM directory.
+const PASST_LOG: &str = "passt.log";
 /// Graceful power-off budget before QEMU is told to quit.
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `wait_ready` waits for the guest agent.
@@ -99,6 +102,8 @@ pub struct NewVm {
     pub memory_mib: u64,
     pub disk_gib: u64,
     pub net: NetProfile,
+    /// Host ports forwarded into the guest (`internet` only).
+    pub forwards: Vec<PortForward>,
     /// Agents may control it from the start (only for VMs agents create).
     pub agent_control: bool,
 }
@@ -285,9 +290,6 @@ impl Manager {
             !new.name.starts_with(RUN_PREFIX),
             "names starting with {RUN_PREFIX} are kept for `stallo run`"
         );
-        if new.net != NetProfile::Offline {
-            bail!("only the offline network profile is available in this version");
-        }
         let cfg = VmConfig {
             name: new.name.clone(),
             uuid: new_uuid()?,
@@ -298,9 +300,11 @@ impl Manager {
             net: new.net,
             agent_control: new.agent_control,
             throwaway_of: None,
+            forwards: new.forwards.clone(),
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
+        self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
         self.pull(&cfg.image).await?;
 
@@ -377,6 +381,7 @@ impl Manager {
     ) -> Result<Arc<Running>> {
         let cfg = self.load(name)?;
         ensure!(self.running(name).is_none(), "{name} is already running");
+        self.check_net(&cfg)?;
 
         let vm_dir = self.paths.vm_dir(name);
         let rt_dir = self.paths.vm_runtime_dir(name);
@@ -392,7 +397,13 @@ impl Manager {
         }
         // VMs created before snapshots existed have no directory for them.
         ensure_private_dir(&vm_dir.join(qemu::STATES))?;
-        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
+        // (passt's end, QEMU's end) of the guest's network link.
+        let link = match cfg.net {
+            NetProfile::Internet => Some(net::socketpair()?),
+            NetProfile::Offline => None,
+        };
+        let qemu_fd = link.as_ref().map(|(_, q)| q.as_raw_fd());
+        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd)?;
         if paused {
             argv.push("-S".to_owned());
         }
@@ -401,7 +412,7 @@ impl Manager {
         // see each other.
         let _admission = self.admission.lock().await;
         self.admit(&cfg, 0)?;
-        match self.spawn(&cfg, &argv).await {
+        match self.spawn(&cfg, &argv, link).await {
             Ok(running) => Ok(running),
             Err(e) => {
                 // Best effort: the error that matters is `e`.
@@ -412,7 +423,23 @@ impl Manager {
         }
     }
 
-    async fn spawn(self: &Arc<Self>, cfg: &VmConfig, argv: &[String]) -> Result<Arc<Running>> {
+    /// Whether `cfg`'s network profile may start here. The internet profile
+    /// is refused until the host's isolation can be checked.
+    fn check_net(&self, cfg: &VmConfig) -> Result<()> {
+        match cfg.net {
+            NetProfile::Offline => Ok(()),
+            NetProfile::Internet => {
+                bail!("isolation unavailable: the internet profile cannot be checked yet")
+            }
+        }
+    }
+
+    async fn spawn(
+        self: &Arc<Self>,
+        cfg: &VmConfig,
+        argv: &[String],
+        link: Option<(OwnedFd, OwnedFd)>,
+    ) -> Result<Arc<Running>> {
         let name = &cfg.name;
         let vm_dir = self.paths.vm_dir(name);
         let rt_dir = self.paths.vm_runtime_dir(name);
@@ -422,14 +449,26 @@ impl Manager {
             vcpus: cfg.vcpus,
         };
         let log_path = vm_dir.join("qemu.log");
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&log_path)?;
-        log.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let log = private_log(&log_path)?;
         let cg = self.cgroups.create_vm(name, limits).await?;
+        // passt first, in the same cgroup. If anything below fails, the
+        // caller kills the cgroup and passt with it.
+        let (mut passt, qemu_end) = match link {
+            Some((passt_end, qemu_end)) => {
+                let log = private_log(&vm_dir.join(PASST_LOG))?;
+                (
+                    Some(net::spawn_passt(
+                        cfg,
+                        self.config.net.dns,
+                        passt_end,
+                        &cg,
+                        log,
+                    )?),
+                    Some(qemu_end),
+                )
+            }
+            None => (None, None),
+        };
         let mut cmd = Command::new(qemu::QEMU);
         cmd.args(argv)
             .stdin(Stdio::null())
@@ -440,6 +479,9 @@ impl Manager {
             .process_group(0);
         // Order matters: the cgroup hook opens files the ruleset denies.
         crate::cgroup::move_on_exec(&mut cmd, &cg)?;
+        if let Some(fd) = qemu_end {
+            net::inherit_on_exec(&mut cmd, fd);
+        }
         let mut backing = vec![images::image_path(&self.paths, &cfg.image)];
         if let Some(source) = &cfg.throwaway_of {
             backing.push(self.paths.vm_dir(source).join(qemu::DISK));
@@ -447,6 +489,8 @@ impl Manager {
         let rules = confine::qemu_rules(&vm_dir, &rt_dir, &backing);
         confine::confine_on_exec(&mut cmd, confine::build(&rules)?);
         let mut child = cmd.spawn().context("cannot start QEMU")?;
+        // Closes our copy of QEMU's socket end, so passt sees QEMU exit.
+        drop(cmd);
         let pid = child
             .id()
             .expect("a child that was not waited for has a pid");
@@ -459,6 +503,28 @@ impl Manager {
                 return Err(e.context(format!("QEMU did not start; see {}", log_path.display())));
             }
         };
+        // passt checks its arguments at once; by the time QMP answers, a
+        // passt that refused them has exited.
+        if let Some(p) = passt.as_mut()
+            && let Some(status) = p.try_wait()?
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!(
+                "passt exited ({status}); see {}",
+                vm_dir.join(PASST_LOG).display()
+            );
+        }
+        if let Some(mut p) = passt {
+            let name = name.clone();
+            // Reaps passt. It exits when QEMU does, or with the cgroup.
+            tokio::spawn(async move {
+                match p.wait().await {
+                    Ok(s) if s.success() => tracing::debug!("{name}: passt exited"),
+                    r => tracing::warn!("{name}: passt exited: {r:?}"),
+                }
+            });
+        }
 
         let (tx, rx) = watch::channel(false);
         let running = Arc::new(Running {
@@ -1278,6 +1344,20 @@ fn file_status(out: &ExecOutput, what: &str, path: &str) -> Result<()> {
     bail!("cannot {what} {}: {reason}", path.escape_debug())
 }
 
+/// A fresh log file only the daemon user can read (mode 0600 even if it
+/// existed with other permissions).
+fn private_log(path: &Path) -> Result<fs::File> {
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    log.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(log)
+}
+
 /// QEMU's own memory on top of guest RAM: `max(minimum, memory / 16)`.
 pub fn overhead_mib(minimum: u64, memory_mib: u64) -> u64 {
     minimum.max(memory_mib / 16)
@@ -1493,6 +1573,7 @@ mod tests {
                 net: NetProfile::Offline,
                 agent_control: false,
                 throwaway_of: None,
+                forwards: vec![],
             },
             pid: 0,
             qmp,

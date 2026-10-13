@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::config::VmConfig;
+use crate::config::{NetProfile, VmConfig};
 use crate::paths::safe_remove;
 use crate::run_tool;
 
@@ -65,8 +65,16 @@ runcmd:
   - [sh, -c, "mkdir -p /run/stallo-seed && mount -o ro LABEL=CIDATA /run/stallo-seed && dpkg -i /run/stallo-seed/debs/*.deb; umount /run/stallo-seed; systemctl start qemu-guest-agent"]
 "#
     );
-    // No interfaces: the offline profile has no network device.
-    let network_config = "version: 2\nethernets: {}\n".to_owned();
+    let network_config = match vm.net {
+        // No interfaces: the offline profile has no network device.
+        NetProfile::Offline => "version: 2\nethernets: {}\n",
+        // passt's DHCP. Matched by name, not MAC: a `stallo run` clone has
+        // its own MAC but this disk's netplan file.
+        NetProfile::Internet => {
+            "version: 2\nethernets:\n  nic:\n    match: {name: \"en*\"}\n    dhcp4: true\n    dhcp6: true\n"
+        }
+    }
+    .to_owned();
     Ok(Seed {
         meta_data,
         user_data,
@@ -162,7 +170,6 @@ pub async fn hash_password(password: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NetProfile;
 
     fn vm() -> VmConfig {
         VmConfig {
@@ -175,6 +182,7 @@ mod tests {
             net: NetProfile::Offline,
             agent_control: false,
             throwaway_of: None,
+            forwards: vec![],
         }
     }
 
@@ -196,6 +204,15 @@ mod tests {
                 .contains("dpkg -i /run/stallo-seed/debs/*.deb")
         );
         assert_eq!(seed.network_config, "version: 2\nethernets: {}\n");
+        let inet = VmConfig {
+            net: NetProfile::Internet,
+            ..vm()
+        };
+        let seed = render(&inet, "$6$salt$abc./XYZ").unwrap();
+        assert_eq!(
+            seed.network_config,
+            "version: 2\nethernets:\n  nic:\n    match: {name: \"en*\"}\n    dhcp4: true\n    dhcp6: true\n"
+        );
     }
 
     #[test]
