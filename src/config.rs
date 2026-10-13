@@ -85,6 +85,11 @@ pub struct VmConfig {
     /// on, or an agent created the VM (`agents_can_create`).
     #[serde(default)]
     pub agent_control: bool,
+    /// Set on the throwaway clone of `stallo run`: the VM whose disk it
+    /// overlays (read-only). Such a VM is removed when the run ends, and at
+    /// daemon start if a run was cut off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throwaway_of: Option<String>,
 }
 
 impl VmConfig {
@@ -94,6 +99,10 @@ impl VmConfig {
         validate_name(&self.name)?;
         validate_image_id(&self.image)?;
         ensure!(is_uuid(&self.uuid), "invalid uuid {:?}", self.uuid);
+        if let Some(source) = &self.throwaway_of {
+            validate_name(source)?;
+            ensure!(*source != self.name, "a VM cannot overlay itself");
+        }
         ensure!(
             (1..=255).contains(&self.vcpus),
             "vcpus must be between 1 and 255"
@@ -305,6 +314,7 @@ mod tests {
             disk_gib: 20,
             net: NetProfile::Offline,
             agent_control: false,
+            throwaway_of: None,
         }
     }
 
@@ -352,6 +362,14 @@ mod tests {
             },
             VmConfig {
                 image: "../x".into(),
+                ..vm()
+            },
+            VmConfig {
+                throwaway_of: Some("../x".into()),
+                ..vm()
+            },
+            VmConfig {
+                throwaway_of: Some("dev".into()),
                 ..vm()
             },
         ];

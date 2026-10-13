@@ -50,9 +50,10 @@ const WANTED: ABI = ABI::V9;
 /// One rule: `access` to `path` and, for a directory, everything below it.
 pub type Rule = (PathBuf, BitFlags<AccessFs>);
 
-/// The rules for one VM's QEMU. All paths must exist when the ruleset is
-/// built.
-pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> {
+/// The rules for one VM's QEMU. `backing` are the read-only images below
+/// its disk: the base image and, for a `stallo run` clone, the source VM's
+/// disk. All paths must exist when the ruleset is built.
+pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, backing: &[PathBuf]) -> Vec<Rule> {
     use AccessFs::*;
     let read = ReadFile | ReadDir;
     let rw_file = ReadFile | WriteFile;
@@ -70,7 +71,6 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> 
         ("/dev/kvm".into(), rw_file | IoctlDev),
         ("/dev/null".into(), rw_file),
         ("/dev/urandom".into(), ReadFile.into()),
-        (base_image.into(), ReadFile.into()),
         (vm_dir.join(crate::qemu::DISK), disk),
         (vm_dir.join(crate::qemu::VARS), disk),
         (vm_dir.join(crate::qemu::STATE), disk),
@@ -80,6 +80,7 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> 
         (rt_dir.into(), MakeSock | RemoveFile),
     ]
     .into_iter()
+    .chain(backing.iter().map(|b| (b.clone(), ReadFile.into())))
     // Screendumps overwrite files the daemon created (no new files).
     .chain(
         crate::qemu::SCREEN_FILES
@@ -342,7 +343,7 @@ mod tests {
         let rules = qemu_rules(
             Path::new("/d/vms/dev"),
             Path::new("/r/vms/dev"),
-            Path::new("/d/images/ubuntu-26.04.qcow2"),
+            &["/d/images/ubuntu-26.04.qcow2".into()],
         );
         let paths: Vec<&str> = rules.iter().map(|(p, _)| p.to_str().unwrap()).collect();
         for p in &paths {
@@ -420,7 +421,7 @@ mod tests {
         fs::write(&img, b"base").unwrap();
         fs::write(own.join("secret"), b"pw").unwrap();
         screen_files(&rt);
-        let rules = qemu_rules(&own, &rt, &img);
+        let rules = qemu_rules(&own, &rt, std::slice::from_ref(&img));
         let q = |p: &Path| format!("'{}'", p.display());
         let disk = |d: &Path| q(&d.join(crate::qemu::DISK));
 
@@ -458,6 +459,19 @@ mod tests {
             assert_eq!(confined(&rules, &denied), Some(false), "{denied}");
         }
         assert_eq!(fs::read(other.join(crate::qemu::DISK)).unwrap(), b"x");
+
+        // A `stallo run` clone of `other` reads its disk, nothing more.
+        let clone = qemu_rules(&own, &rt, &[img.clone(), other.join(crate::qemu::DISK)]);
+        assert_eq!(
+            confined(&clone, &format!("cat {}", disk(&other))),
+            Some(true)
+        );
+        for denied in [
+            format!("echo y >> {}", disk(&other)),
+            format!("cat {}", q(&other.join(crate::qemu::VARS))),
+        ] {
+            assert_eq!(confined(&clone, &denied), Some(false), "{denied}");
+        }
 
         // QEMU may delete its screen files but never put a link, FIFO or
         // new file in their place.
@@ -517,7 +531,7 @@ assert libc.syscall(250, 0, 0) == -1 and ctypes.get_errno() == 1, "keyctl"
             api = api.display(),
             rt = rt.display()
         );
-        let rules = qemu_rules(&vm, &rt, &root.join("img"));
+        let rules = qemu_rules(&vm, &rt, &[root.join("img")]);
         if let Some(ok) = confined(&rules, &script) {
             assert!(ok, "a socket, connect or io_uring was allowed");
         }

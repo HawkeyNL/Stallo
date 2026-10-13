@@ -170,8 +170,14 @@ async fn connection(manager: &Arc<Manager>, stream: UnixStream, own_uid: u32) ->
     if !got {
         return Ok(());
     }
+    // The client sends nothing after its request: end of stream means it
+    // went away (only `run` acts on that; everything else completes).
+    // Clients must therefore not half-close while they wait.
+    let gone = async move {
+        let _ = tokio::io::copy(&mut r, &mut tokio::io::sink()).await;
+    };
     let (response, audit) = match serde_json::from_slice::<Envelope>(&line) {
-        Ok(env) => handle(manager, env, &cred).await,
+        Ok(env) => handle(manager, env, &cred, gone).await,
         Err(e) => {
             tracing::info!(
                 "invalid request from uid {} pid {:?}",
@@ -212,6 +218,7 @@ async fn handle(
     m: &Arc<Manager>,
     env: Envelope,
     peer: &UCred,
+    client_gone: impl Future<Output = ()>,
 ) -> (Response, Option<(std::fs::File, audit::Entry)>) {
     let started = Instant::now();
     let (op, vm, args, argv0) = audit::describe(&env.request);
@@ -231,7 +238,7 @@ async fn handle(
         _ => match api::check_agent(env.via, &env.request, m.config.agents_can_create, |n| {
             Ok(m.load(n)?.agent_control)
         }) {
-            Ok(()) => dispatch(m, env.via, env.request).await,
+            Ok(()) => dispatch(m, env.via, env.request, client_gone).await,
             Err(e) => Err(e),
         },
     };
@@ -278,7 +285,12 @@ async fn handle(
     (response, audit)
 }
 
-async fn dispatch(m: &Arc<Manager>, via: Via, request: Request) -> Result<Value> {
+async fn dispatch(
+    m: &Arc<Manager>,
+    via: Via,
+    request: Request,
+    client_gone: impl Future<Output = ()>,
+) -> Result<Value> {
     Ok(match request {
         Request::New {
             name,
@@ -352,6 +364,21 @@ async fn dispatch(m: &Arc<Manager>, via: Via, request: Request) -> Result<Value>
             let limit = timeout_s.map_or(EXEC_DEFAULT_TIMEOUT, Duration::from_secs);
             let stdin = stdin.as_deref().map(str::as_bytes);
             let out = m.exec(&name, &argv, admin, limit, stdin).await?;
+            json!(ExecResult {
+                exit_code: out.exit_code,
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                truncated: out.truncated,
+            })
+        }
+        Request::Run {
+            name,
+            argv,
+            admin,
+            timeout_s,
+        } => {
+            let limit = timeout_s.map_or(EXEC_DEFAULT_TIMEOUT, Duration::from_secs);
+            let out = m.run(&name, &argv, admin, limit, client_gone).await?;
             json!(ExecResult {
                 exit_code: out.exit_code,
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

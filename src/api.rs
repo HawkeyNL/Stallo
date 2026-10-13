@@ -68,6 +68,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdin: Option<String>,
     },
+    /// Runs a command in a throwaway clone of a stopped VM (`stallo run`).
+    Run {
+        name: String,
+        argv: Vec<String>,
+        admin: bool,
+        timeout_s: Option<u64>,
+    },
     /// Reads part of a guest file: up to `max_bytes` (default 1 MiB, at
     /// most 16 MiB) from `offset`.
     FileRead {
@@ -310,6 +317,7 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         Start { name, .. }
         | Stop { name, .. }
         | Exec { name, .. }
+        | Run { name, .. }
         | FileRead { name, .. }
         | FileWrite { name, .. }
         | Screenshot { name }
@@ -452,6 +460,13 @@ mod tests {
             agent_gate(&Request::Screenshot { name: name() }),
             Gate::Vm("dev")
         );
+        let run = Request::Run {
+            name: name(),
+            argv: vec!["true".into()],
+            admin: false,
+            timeout_s: None,
+        };
+        assert_eq!(agent_gate(&run), Gate::Vm("dev"));
     }
 
     /// S8: the policy, without a VM.

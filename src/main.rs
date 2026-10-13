@@ -75,6 +75,19 @@ enum Cmd {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    /// Run a command in a throwaway clone of a stopped VM; the clone is
+    /// deleted afterwards (also on Ctrl-C). The exit code is passed through.
+    Run {
+        vm: String,
+        /// Run as root instead of the guest user.
+        #[arg(long)]
+        admin: bool,
+        /// Seconds before the command is killed (default 120, max 3600).
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
     /// Copy a file between the host and a VM, e.g. `stallo cp notes.txt
     /// dev:/home/agent/notes.txt` or `stallo cp dev:/etc/os-release .`.
     Cp {
@@ -214,6 +227,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let json = cli.json;
     let print_json = |v: &Value| println!("{}", serde_json::to_string_pretty(v).unwrap());
 
+    let is_run = matches!(cli.command, Cmd::Run { .. });
     match cli.command {
         Cmd::New {
             name,
@@ -285,15 +299,30 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             admin,
             timeout,
             argv,
+        }
+        | Cmd::Run {
+            vm,
+            admin,
+            timeout,
+            argv,
         } => {
-            let v = call(Request::Exec {
-                name: vm,
-                argv,
-                admin,
-                timeout_s: timeout,
-                stdin: None,
-            })
-            .await?;
+            let request = if is_run {
+                Request::Run {
+                    name: vm,
+                    argv,
+                    admin,
+                    timeout_s: timeout,
+                }
+            } else {
+                Request::Exec {
+                    name: vm,
+                    argv,
+                    admin,
+                    timeout_s: timeout,
+                    stdin: None,
+                }
+            };
+            let v = call(request).await?;
             let r: ExecResult = serde_json::from_value(v.clone())?;
             if json {
                 print_json(&v);

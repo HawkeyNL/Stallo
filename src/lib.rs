@@ -16,6 +16,7 @@ pub mod paths;
 pub mod qemu;
 pub mod qga;
 pub mod qmp;
+pub mod run;
 pub mod seed;
 pub mod snapshot;
 pub mod vm;

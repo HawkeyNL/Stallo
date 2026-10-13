@@ -136,6 +136,12 @@ impl Cgroups {
         kill_and_remove(&self.vm_dir(name)).await
     }
 
+    /// A tree at `root` (a temporary directory in tests).
+    #[cfg(test)]
+    pub(crate) fn at(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     /// Kills and removes every `vm-*` cgroup. Called at daemon start, before
     /// the API accepts requests: VMs never outlive the daemon that started
     /// them. systemd's default `KillMode=control-group` already does this

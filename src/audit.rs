@@ -78,6 +78,18 @@ pub fn describe(r: &Request) -> Described<'_> {
             ],
             argv.first().map(|a| cut(a, 256)),
         ),
+        Request::Run {
+            name, argv, admin, ..
+        } => (
+            "run",
+            Some(name),
+            vec![
+                ("admin", u64::from(*admin)),
+                ("argv", argv.len() as u64),
+                ("argv_bytes", argv.iter().map(|a| len(a)).sum()),
+            ],
+            argv.first().map(|a| cut(a, 256)),
+        ),
         Request::FileRead {
             name, path, admin, ..
         } => (

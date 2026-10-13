@@ -202,6 +202,7 @@ mod tests {
             disk_gib: 20,
             net: NetProfile::Offline,
             agent_control: false,
+            throwaway_of: None,
         }
     }
 

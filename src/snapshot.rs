@@ -427,7 +427,7 @@ impl Manager {
     pub async fn snapshot(&self, name: &str, tag: Option<&str>) -> Result<Taken> {
         let started = Instant::now();
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         let vm = self.running(name);
         let names = match &vm {
             Some(vm) => list_live(&vm.qmp).await?.1,
@@ -459,7 +459,7 @@ impl Manager {
     /// The VM's snapshots, oldest first.
     pub async fn snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         Ok(match self.running(name) {
             Some(vm) => list_live(&vm.qmp).await?.0,
             None => list_offline(&self.paths.vm_dir(name)).await?,
@@ -479,7 +479,7 @@ impl Manager {
     pub async fn restore(self: &Arc<Self>, name: &str, tag: Option<&str>) -> Result<Restored> {
         let started = Instant::now();
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         let vm_dir = self.paths.vm_dir(name);
         let (vm, list) = match self.running(name) {
             Some(vm) => {
@@ -569,7 +569,7 @@ impl Manager {
     pub async fn delete_snapshot(&self, name: &str, tag: &str) -> Result<()> {
         validate_tag(tag)?;
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         let vm_dir = self.paths.vm_dir(name);
         let vm = self.running(name);
         let no_such = || anyhow::anyhow!("{name} has no snapshot named {tag}");

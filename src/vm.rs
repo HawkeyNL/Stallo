@@ -44,6 +44,8 @@ pub const EXEC_MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 pub const FILE_MAX: usize = (16 << 20) - 1;
 const FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a guest command waits for the one before it to finish.
+/// Names of `stallo run` clones start with this; `new` refuses them.
+pub const RUN_PREFIX: &str = "run-";
 pub(crate) const QGA_BUSY_WAIT: Duration = Duration::from_secs(30);
 /// Largest screendump read back from QEMU. The guest picks the resolution,
 /// but bochs-display has 16 MiB of video memory: at most 4 Mi pixels at
@@ -143,6 +145,9 @@ pub struct Manager {
     pulls: tokio::sync::Mutex<()>,
     /// Serialises admission: checking what fits and starting it is atomic.
     admission: tokio::sync::Mutex<()>,
+    /// VMs whose disk a `stallo run` clone uses; their lifecycle lock is
+    /// held until the run ends.
+    pub(crate) in_run: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Manager {
@@ -155,31 +160,76 @@ impl Manager {
             ops: Mutex::default(),
             pulls: tokio::sync::Mutex::default(),
             admission: tokio::sync::Mutex::default(),
+            in_run: Mutex::default(),
         })
     }
 
-    /// Kills leftovers of an earlier daemon: VM cgroups and runtime dirs.
+    /// Kills leftovers of an earlier daemon: VM cgroups and runtime dirs,
+    /// and the throwaway clones of runs it did not finish.
     pub async fn cleanup_leftovers(&self) -> Result<()> {
         self.cgroups.remove_leftovers().await?;
         safe_remove(&self.paths.runtime, &self.paths.vms_runtime_dir())?;
         ensure_private_dir(&self.paths.vms_runtime_dir())?;
         ensure_private_dir(&self.paths.vms_dir())?;
         ensure_private_dir(&self.paths.audit_dir())?;
+        // Clones of runs that were cut off, also half-made ones.
+        for entry in fs::read_dir(self.paths.vms_dir())? {
+            let name = entry?.file_name();
+            let Some(name) = name.to_str().filter(|n| n.starts_with(RUN_PREFIX)) else {
+                continue;
+            };
+            tracing::info!("{name}: removing the clone of a cut-off run");
+            if let Err(e) = safe_remove(&self.paths.data, &self.paths.vm_dir(name)) {
+                tracing::error!("{name}: cannot remove: {e:#}");
+            }
+        }
         Ok(())
     }
 
     // ponytail: entries are never removed (removing one would let two
     // callers hold different locks for one name); the map grows by the
-    // number of distinct VM names ever used.
-    pub(crate) async fn lock(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self
-            .ops
+    // number of distinct VM names ever used (each `stallo run` adds its
+    // clone's name).
+    //
+    // A VM that a `stallo run` uses (its source or its clone) is refused at
+    // once instead: the run holds its lock for as long as its command runs.
+    // (A caller already queued for the lock before the run took it still
+    // waits for the run.)
+    pub(crate) async fn lock(&self, name: &str) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self.op_lock(name);
+        {
+            // Checked together with the run's take-and-mark (`lock_for_run`).
+            let in_run = self.in_run.lock().unwrap();
+            if let Ok(guard) = lock.clone().try_lock_owned() {
+                return Ok(guard);
+            }
+            ensure!(
+                !in_run.contains(name),
+                "{name} is in use by `stallo run`; try again when it ends"
+            );
+        }
+        Ok(lock.lock_owned().await)
+    }
+
+    /// Takes `name`'s lifecycle lock for a `stallo run` and marks it as in
+    /// use, or fails at once if someone else holds it.
+    pub(crate) fn lock_for_run(&self, name: &str) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self.op_lock(name);
+        let mut in_run = self.in_run.lock().unwrap();
+        let guard = lock
+            .try_lock_owned()
+            .map_err(|_| anyhow::anyhow!("{name} is busy; try again"))?;
+        in_run.insert(name.to_owned());
+        Ok(guard)
+    }
+
+    fn op_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.ops
             .lock()
             .unwrap()
             .entry(name.to_owned())
             .or_default()
-            .clone();
-        lock.lock_owned().await
+            .clone()
     }
 
     pub fn running(&self, name: &str) -> Option<Arc<Running>> {
@@ -231,6 +281,10 @@ impl Manager {
     /// seed. On failure nothing is left behind.
     pub async fn create(&self, new: &NewVm) -> Result<VmConfig> {
         validate_name(&new.name)?;
+        ensure!(
+            !new.name.starts_with(RUN_PREFIX),
+            "names starting with {RUN_PREFIX} are kept for `stallo run`"
+        );
         if new.net != NetProfile::Offline {
             bail!("only the offline network profile is available in this version");
         }
@@ -243,13 +297,14 @@ impl Manager {
             disk_gib: new.disk_gib,
             net: new.net,
             agent_control: new.agent_control,
+            throwaway_of: None,
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
         self.admit(&cfg, cfg.disk_gib << 30)?;
         self.pull(&cfg.image).await?;
 
-        let _op = self.lock(&new.name).await;
+        let _op = self.lock(&new.name).await?;
         let dir = self.paths.vm_dir(&new.name);
         // Claims the name atomically: fails if the directory exists.
         fs::DirBuilder::new()
@@ -309,7 +364,7 @@ impl Manager {
     /// Starts QEMU in a fresh `vm-<name>` cgroup and connects to QMP.
     pub async fn start(self: &Arc<Self>, name: &str) -> Result<Arc<Running>> {
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         self.start_locked(name, false).await
     }
 
@@ -387,11 +442,11 @@ impl Manager {
             .process_group(0);
         // Order matters: the cgroup hook opens files the ruleset denies.
         crate::cgroup::move_on_exec(&mut cmd, &cg)?;
-        let rules = confine::qemu_rules(
-            &vm_dir,
-            &rt_dir,
-            &images::image_path(&self.paths, &cfg.image),
-        );
+        let mut backing = vec![images::image_path(&self.paths, &cfg.image)];
+        if let Some(source) = &cfg.throwaway_of {
+            backing.push(self.paths.vm_dir(source).join(qemu::DISK));
+        }
+        let rules = confine::qemu_rules(&vm_dir, &rt_dir, &backing);
         confine::confine_on_exec(&mut cmd, confine::build(&rules)?);
         let mut child = cmd.spawn().context("cannot start QEMU")?;
         let pid = child
@@ -489,7 +544,7 @@ impl Manager {
     /// Turns agent control of a VM on or off (stored in `vm.toml`).
     pub async fn set_agent(&self, name: &str, on: bool) -> Result<()> {
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         let mut cfg = self.load(name)?;
         cfg.agent_control = on;
         cfg.save(&self.paths.vm_dir(name))
@@ -498,7 +553,7 @@ impl Manager {
     /// Continues a paused VM, unless the disk is still below the floor.
     pub async fn resume(&self, name: &str) -> Result<()> {
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         let vm = self
             .running(name)
             .with_context(|| format!("{name} is not running"))?;
@@ -582,7 +637,7 @@ impl Manager {
     /// [`POWERDOWN_TIMEOUT`], then `cgroup.kill`. With `force`, kills at once.
     pub async fn stop(&self, name: &str, force: bool) -> Result<()> {
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         self.stop_locked(name, force).await
     }
 
@@ -633,7 +688,7 @@ impl Manager {
     /// that a failed create left without `vm.toml`.
     pub async fn remove(&self, name: &str) -> Result<()> {
         self.check_exists(name)?;
-        let _op = self.lock(name).await;
+        let _op = self.lock(name).await?;
         ensure!(
             self.running(name).is_none(),
             "{name} is running; stop it first: stallo stop {name}"
@@ -1439,6 +1494,7 @@ mod tests {
                 disk_gib: 10,
                 net: NetProfile::Offline,
                 agent_control: false,
+                throwaway_of: None,
             },
             pid: 0,
             qmp,
