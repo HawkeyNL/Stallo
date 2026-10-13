@@ -82,15 +82,20 @@ gate.
    | UDP `sendto()` to `127.0.0.53:54` | **`EPERM`** | sent |
    | UDP `sendto()` to `127.0.0.53:53` (allowed on purpose) | sent | sent |
 
-   - **What the probe sends:** one datagram each to its own `127.0.0.1`
-     and `::1` sockets, to `10.255.255.1:9`, and to `127.0.0.53:54`. That
-     covers both address families, a private range, and the narrowness of
-     the DNS exception.
+   - **What the probe sends:** one datagram each, in this order:
+     - to its own `127.0.0.1` and `::1` sockets;
+     - to the table's version canary `192.0.2.1:1` (the table's last rule,
+       so an older or half-loaded table fails);
+     - to one address in each private range (`10/8`, `172.16/12`,
+       `192.168/16`, `100.64/10`, `169.254/16`, Tailscale's ULA, NAT64 of
+       `10/8`);
+     - to `127.0.0.53:54`, to prove the DNS exception is narrow.
+     - Loopback goes first, so without the table nothing leaves the host.
    - **Pass condition:** every send must fail with `EPERM`. Any other
      result, including success, refuses the start.
    - **Limit:** `EPERM` does not say which table dropped the packet. The
-     probe proves that egress of the daemon's user is filtered, not that
-     the filter is exactly `inet stallo`.
+     canary ties the result to this table's version, but root can still
+     edit its other rules unnoticed.
    - **`reject`:** using `reject with icmpx admin-prohibited` instead of
      `drop` changed none of these results. `reject with tcp reset` was not
      tested. The table keeps `drop`.
@@ -100,12 +105,20 @@ gate.
    Ubuntu's `/etc/nftables.conf`, which begins with `flush ruleset`, if the
    nftables service is enabled and reloaded. Running guests would then
    reach everything.
-   - The daemon therefore repeats the probe every 2 s while an `internet`
-     VM runs.
-   - On failure, it pauses every `internet` VM. `stallo resume` works only
-     once the probe passes again.
-   - The owner's install keeps the table out of `/etc/nftables.conf`'s
-     flush, or includes it there.
+   - The daemon therefore repeats the probe every 0.5 s while an
+     `internet` VM has network, and once more right after QEMU and passt
+     start.
+   - On failure, it kills passt for every `internet` VM. That needs no
+     QMP, so a hung or hostile QEMU cannot delay it. The guests keep
+     running without network (`ls` shows `running (no network)`) until
+     they restart, and a start probes again.
+   - **The remaining window:** between the flush and the next probe
+     (at most 0.5 s), guests are not isolated.
+   - The owner's install reloads the table after such a flush (see
+     "Installing on a host").
+   - *Changed after review.* The first version paused the guests over
+     QMP every 2 s. A QMP `stop` can hang or be ignored, and it does not
+     stop QEMU from sending frames to passt.
 
 3. **Port forwards need replies, and only TCP replies may pass.**
    - passt answers a forwarded connection from its own socket (uid
@@ -131,6 +144,10 @@ gate.
    - Measured with the new rule: the root process still got its answer, the
      guest's datagram from the same port was blocked, and the forward
      worked.
+   - **What is left:** a reply-direction packet from a stallo socket needs
+     the far side to have sent to that exact address and port first, as
+     in a TCP simultaneous open. A LAN host would have to cooperate. passt
+     has no raw sockets to forge one.
 
 4. **The guest does not use the host's resolver.**
    - systemd-resolved on the host applies its split DNS: Tailscale
@@ -292,9 +309,13 @@ table inet stallo {
     fib daddr type { local, broadcast, multicast, anycast } drop
     ip daddr @deny4 drop
     ip6 daddr @deny6 drop
+    ip daddr 192.0.2.1 udp dport 1 drop
   }
 }
 ```
+
+- **The last rule is the version canary** for the probe (added after
+  review). `packaging/stallo.nft` is this table with comments.
 
 - **NAT64:** the `64:ff9b::` entries are the well-known NAT64 prefix with
   a private IPv4 range embedded, because a NAT64 gateway on the LAN would
@@ -329,8 +350,9 @@ table inet stallo {
 ## M3 gate: the daemon in the lab
 
 `tests/lab/m3-network.sh` runs the gate inside the lab VM. It refuses to
-run unless `/etc/stallo-lab` exists, so it cannot run on a real host by
-accident. It does the following:
+run unless `/etc/stallo-lab` exists and `systemd-detect-virt --vm`
+succeeds, so it cannot run on a real host by accident. It does the
+following:
 
 - builds the simulated networks above;
 - loads `packaging/stallo.nft`;
@@ -338,25 +360,35 @@ accident. It does the following:
   --uid=stallo -p Delegate=yes`);
 - drives everything through the `stallo` CLI.
 
-The run used release binaries built from the M3-4 branch, a fresh boot of
-the lab VM, and `[net] dns = "198.51.100.1"` (the lab's internet resolver).
+The final run used release binaries built from the M3-4 branch after the
+review fixes, a fresh boot of the lab VM, and `[net] dns = "198.51.100.1"`
+(the lab's internet resolver).
 
 | Check | Result |
 |---|---|
+| Controls: every deny target answers user `nobody`, whom the table does not match (13 checks) | answered |
 | S15: `stallo new --net internet` with no table loaded | refused: `isolation unavailable` |
-| Create an `internet` VM with `--forward 8080:80` | ready in 22–25 s (DHCP and wait-online included) |
+| Create an `internet` VM with `--forward 8080:80` | ready in 20–25 s on first boot (cloud-init, DHCP and wait-online included) |
 | S14: internet over IPv4, IPv6, DNS name, UDP and ping | reached |
-| S14: LAN host (TCP, UDP, ping), 10/8, 172.16/12, 100.64/10, link-local, IPv6 ULA (TCP, UDP), host LAN and link-local addresses, host-only IPv4 and IPv6, gateway on another port | blocked |
+| S14: LAN host (TCP, UDP, ping), 10/8, 172.16/12, 100.64/10, link-local, IPv6 ULA (TCP, UDP), host LAN and link-local addresses, host-only IPv4 and IPv6 | blocked |
 | Port forward `127.0.0.1:8080 → 80` | works; nothing listens on `198.51.100.2:8080` |
 | RAM snapshot and restore with passt attached | works; internet and forward work after the restore |
-| S15: table deleted while the VM runs | VM shows `paused (isolation lost)` within 5 s |
-| `stallo resume` without the table | refused: `isolation unavailable` |
-| `stallo resume` after reloading the table | resumes; internet works |
+| S15: table deleted while the VM runs | `running (no network)` within 2 s; the guest cannot reach the internet target either |
+| S15: another `internet` VM while the table is gone | refused: `isolation unavailable` |
+| Stop and start after reloading the table | internet works again |
+| IPv6 port forward `[::1]:8081 → 80` | works |
 
-All 30 checks passed. Dev mode refuses `internet` at create and start
+All 47 checks passed. Dev mode refuses `internet` at create and start
 (unit test, `run::tests::internet_is_refused`).
 
-**Measured through the product** (1 vCPU, 1 GiB guest; 3 runs each):
+**An IPv6 forward reaches the guest over IPv6.** passt keeps the address
+family, so a guest service must listen on IPv6 too: Python's
+`http.server` bound only `0.0.0.0` until it was given `--bind ::`.
+
+**Measured through the product** (1 vCPU, 1 GiB guest; 3 runs each).
+This was measured with the build before the review fixes. Those fixes
+changed passt's arguments by `--search none` and a 4096 open-file limit.
+Neither is on the data path, but the numbers were not measured again.
 
 | | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
@@ -371,35 +403,69 @@ All 30 checks passed. Dev mode refuses `internet` at create and start
     of 100 periods.
   - That is on purpose: the network work of a VM counts against that VM,
     not the host. A guest with more vCPUs gets more.
-- **Memory:** passt's RSS was 18–21 MiB, inside the VM's
-  `guest RAM + overhead` limit. The cgroup peaked at 922–1074 MiB of
-  1280 MiB, with no OOM.
+- **The mean RTT is close to the p99:** under 1% of the round trips took
+  several milliseconds, when the quota ran out.
+- **Memory:** passt's RSS was 18–21 MiB. `internet` VMs get 64 MiB more
+  cgroup memory for it (after review). Before that, the cgroup peaked at
+  922–1074 MiB of 1280 MiB, with no OOM.
 - **Confinement:** passt ran as uid 999 under its AppArmor profile
   (`passt (enforce)`).
-- **Boot without an IPv6 default route:** the VM was ready in 12 s.
+- **Restart time:** a restart (no first-boot work) without an IPv6
+  default route was ready in 12 s.
 
 ## Installing on a host
 
 This is an owner task: it needs root, and it changes the host's firewall.
 Do it only after the lab gate.
 
-**What it changes:** packets from sockets of user `stallo` only. Other
-users, other services and packets without a socket are not matched (lab:
-root's traffic and another table's TCP resets were unaffected). Until a
-`stallo` daemon runs `internet` VMs, nothing sends as that user.
+**What it changes:**
+- **Matched:** packets from sockets of user `stallo` only. Other users,
+  other services and packets without a socket are not matched. In the lab,
+  root's traffic and another table's TCP resets were unaffected.
+- **Until a `stallo` daemon runs `internet` VMs,** nothing sends as that
+  user.
+- **Host-wide side effect:** the table's `ct` match turns on connection
+  tracking for IPv4 and IPv6 for the whole host (shared
+  `nf_conntrack_max`, 262144 here). IPv4 is likely tracked already
+  (Docker); IPv6 may be new.
+
+**Check the host first.** Both checks are read-only:
+
+- `ip -6 addr show scope global`
+  - If it shows addresses, the LAN has global IPv6. Guests could then
+    reach LAN devices by their global addresses, because no deny set can
+    tell them from the internet.
+  - Add the LAN prefix to `deny6`, or do not enable `internet` VMs. A
+    prefix that changes over time makes the entry stale, which fails open.
+  - On 2026-10-13 this host had no global IPv6 address.
+- **The router's public (WAN) address** is not in any deny set.
+  - Many home routers answer on it from inside: their admin page, or
+    hairpin NAT to the LAN's port forwards.
+  - If yours does, add the WAN address to `deny4`.
+
+**Steps.** Roll back in reverse order, 5 to 1.
 
 1. **Install passt:**
    - `sudo apt install passt`
    - Rollback: `sudo apt remove passt`
-2. **Create the user** (the table resolves its uid when loaded):
+2. **Create the user.** The table resolves the user's uid when it loads.
    - `sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups kvm stallo`
-   - Rollback: `sudo userdel stallo`
+   - Rollback: `sudo userdel stallo`. Undo steps 3 to 5 first: a table
+     file that names a missing user does not load.
 3. **Load the table:**
    - `sudo install -D -m 644 packaging/stallo.nft /etc/stallo/stallo.nft`
    - `sudo nft -f /etc/stallo/stallo.nft`
-   - Check: `sudo nft list table inet stallo`
-   - Rollback: `sudo nft delete table inet stallo && sudo rm -r /etc/stallo`
-4. **Optional: keep the table across reboots.** Without this, the table is
+   - Check that it exists: `sudo nft list table inet stallo`
+   - Rollback: `sudo nft delete table inet stallo && sudo rm /etc/stallo/stallo.nft`
+4. **Check that it works.** `<router>` is your LAN router's address.
+   - `sudo -u stallo curl -m 3 http://<router>/` must fail with
+     "Operation not permitted" or time out.
+   - `sudo -u stallo curl -m 3 http://127.0.0.1:<some local service port>/` must
+     also fail.
+   - `sudo -u stallo curl -sI -m 5 https://example.com` must work (DNS
+     through `127.0.0.53` is allowed for the daemon).
+   - Your own user's `curl http://<router>/` must still work.
+5. **Optional: keep the table across reboots.** Without this, the table is
    gone after a reboot and `internet` VMs are refused (fail closed) until
    it is loaded again. The unit is
    `/etc/systemd/system/stallo-nft.service`:
@@ -407,29 +473,40 @@ root's traffic and another table's TCP resets were unaffected). Until a
    ```
    [Unit]
    Description=Stallo network isolation table
-   Before=network-pre.target
-   Wants=network-pre.target
+   After=nftables.service
 
    [Service]
    Type=oneshot
    RemainAfterExit=yes
    ExecStart=/usr/sbin/nft -f /etc/stallo/stallo.nft
-   ExecStop=/usr/sbin/nft delete table inet stallo
+   ExecReload=/usr/sbin/nft -f /etc/stallo/stallo.nft
 
    [Install]
    WantedBy=multi-user.target
    ```
 
+   - **Why it looks like this:**
+     - There is no `ExecStop`: removing the table is the manual rollback
+       in step 3, not a side effect of `systemctl stop` or `restart`.
+     - A reload replaces the table in one transaction.
+     - It is not ordered before the network, because stallod fails closed
+       without the table.
+   - Check it first: `sudo systemd-analyze verify /etc/systemd/system/stallo-nft.service`
    - Enable it: `sudo systemctl daemon-reload && sudo systemctl enable --now stallo-nft`
-   - Rollback: `sudo systemctl disable --now stallo-nft && sudo rm /etc/systemd/system/stallo-nft.service && sudo systemctl daemon-reload`
-5. **If `nftables.service` is enabled**, a reload of `/etc/nftables.conf`
-   runs `flush ruleset` and removes the table. Running `internet` VMs then
-   pause within a few seconds (the probe repeats every 2 s). Add `include "/etc/stallo/stallo.nft"` at the end of
-   that file to keep the table.
+   - Rollback: `sudo systemctl disable stallo-nft && sudo rm /etc/systemd/system/stallo-nft.service && sudo systemctl daemon-reload`
+   - **If `nftables.service` is enabled:** a reload of
+     `/etc/nftables.conf` runs `flush ruleset` and removes this table.
+     Running `internet` guests then lose their network within 0.5 s.
+     Afterwards, run `sudo systemctl reload stallo-nft`.
+     - Do not `include` the table in `/etc/nftables.conf`: if user
+       `stallo` is ever removed, the whole host firewall would then fail
+       to load.
 
 **After the install:**
-- `internet` VMs still need `stallod` in production mode as user
-  `stallo`. That service is packaged in M5. Dev mode keeps refusing
-  `internet`.
-- `[net] dns` in `/var/lib/stallo/stallod.toml` picks the public resolver
-  for guests (default `9.9.9.9`, Quad9).
+- **The daemon:** `internet` VMs still need `stallod` in production mode
+  as user `stallo`. That service is packaged in M5, and it should be
+  ordered `After=stallo-nft.service`. Dev mode keeps refusing `internet`.
+- **Guest DNS:** `[net] dns` in `/var/lib/stallo/stallod.toml` picks the
+  public IPv4 resolver for guests (default `9.9.9.9`, Quad9).
+- **The table also limits the daemon itself.** Its image downloads cannot
+  use a proxy or mirror on the LAN or on localhost.

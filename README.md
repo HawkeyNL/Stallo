@@ -72,8 +72,10 @@ user: they can reach the daemon socket just like `stallo` can.
 
 - `offline` (the default): no network device at all.
 - `internet`: the guest reaches the internet and nothing else. It cannot
-  reach the host's own addresses, the LAN, Tailscale, link-local or
-  multicast.
+  reach the host's own addresses, private and shared ranges (the LAN,
+  Tailscale), link-local or multicast.
+  - A LAN with global IPv6 addresses, or a router that answers on its
+    public address, needs the extra steps in the install notes.
   - passt gives the guest its network; an nftables table on the host
     (`packaging/stallo.nft`) drops every connection the `stallo` user
     opens to those ranges.
@@ -88,9 +90,11 @@ user: they can reach the daemon socket just like `stallo` can.
 
 The `internet` profile needs production mode (`stallod` without `--dev`,
 as user `stallo`), passt and the table. Without them the daemon refuses it
-(`isolation unavailable`), and dev mode always refuses it. The daemon
-checks the table before every start and every 2 s while such VMs run, and
-pauses them if it is gone. The lab results and the host install steps are
+(`isolation unavailable`), and dev mode always refuses it.
+- The daemon checks the table before every start and every 0.5 s while
+  such VMs run.
+- If the table is gone, it kills their passt at once. The guests keep
+  running without network until they restart. The lab results and the host install steps are
 in [docs/network-verification.md](docs/network-verification.md).
 
 ## Agents (MCP)

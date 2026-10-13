@@ -7,15 +7,19 @@
 # reaches the internet and nothing else. It does not touch packets of other
 # users or packets without a socket.
 #
-# stallod refuses to start `internet` VMs, and pauses running ones, unless
-# its probe sees this table drop traffic (docs/network-verification.md).
+# stallod refuses to start `internet` VMs, and cuts the network of running
+# ones, unless its probe sees this table drop traffic
+# (docs/network-verification.md).
 #
 # Load:   nft -f /etc/stallo/stallo.nft   (root; `stallo` must exist first,
-#         its uid is resolved now)
-# Remove: nft delete table inet stallo
+#         its uid is resolved now). Reloading replaces the table in one
+#         transaction.
+# Remove: nft delete table inet stallo   (running guests lose isolation
+#         until stallod's next probe, at most 0.5 s, cuts their network)
 #
 # A `flush ruleset` (e.g. a reload of /etc/nftables.conf) removes this table
-# too; include this file there if nftables.service is used.
+# too. The `ct` match turns on connection tracking for IPv4 and IPv6 host
+# wide (shared nf_conntrack_max).
 
 table inet stallo
 delete table inet stallo
@@ -78,5 +82,9 @@ table inet stallo {
 		fib daddr type { local, broadcast, multicast, anycast } drop
 		ip daddr @deny4 drop
 		ip6 daddr @deny6 drop
+		# Version canary, the last rule: stallod's probe expects a drop of
+		# UDP to 192.0.2.1 port <version>. An older or half-loaded table
+		# fails the probe. Bump both together (src/net.rs CANARY).
+		ip daddr 192.0.2.1 udp dport 1 drop
 	}
 }
