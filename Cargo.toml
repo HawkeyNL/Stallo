@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.97"
 description = "Agent-first VM manager for Ubuntu (QEMU/KVM)"
 repository = "https://github.com/HawkeyNL/Stallo"
+license-file = "LICENSE"
 publish = false
 
 [dependencies]

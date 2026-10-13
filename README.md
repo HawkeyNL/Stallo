@@ -92,4 +92,4 @@ call is logged in `<data>/audit/`; see SECURITY.md.
 
 ## Licence
 
-Licence: to be decided.
+Proprietary, all rights reserved; see [LICENSE](LICENSE).

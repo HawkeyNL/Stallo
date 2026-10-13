@@ -10,7 +10,8 @@ allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC", "Zlib"]
 confidence-threshold = 0.9
 # The list is shared by future dependencies; do not warn while some are unused.
 unused-allowed-license = "allow"
-# Stallo itself is not published and its licence is still to be decided.
+# Stallo itself is proprietary (LICENSE) and not published (publish = false);
+# skip the licence check for it.
 private = { ignore = true }
 
 [bans]
