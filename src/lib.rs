@@ -66,9 +66,15 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(
 // ponytail: stdout and stderr are buffered whole; fine for the small outputs
 // of curl, gpgv, qemu-img and xorriso. Stream them if a chatty tool appears.
 pub async fn run_tool(cmd: &mut Command, limit: Duration) -> anyhow::Result<Vec<u8>> {
+    cgroup::confine_tool(cmd)?;
+    run_prepared(cmd, limit).await
+}
+
+/// [`run_tool`] for a command that already joins the tools cgroup (that
+/// `pre_exec` hook must come before any confinement hook).
+pub(crate) async fn run_prepared(cmd: &mut Command, limit: Duration) -> anyhow::Result<Vec<u8>> {
     let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     cmd.stdin(Stdio::null()).kill_on_drop(true);
-    cgroup::confine_tool(cmd)?;
     let out = tokio::time::timeout(limit, cmd.output())
         .await
         .map_err(|_| anyhow::anyhow!("{program} timed out after {limit:?}"))?

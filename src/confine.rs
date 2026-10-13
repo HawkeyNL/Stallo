@@ -89,6 +89,25 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, base_image: &Path) -> Vec<Rule> 
     .collect()
 }
 
+/// The rules for `qemu-img` on a VM's own files, which a compromised QEMU
+/// may have crafted: the system files it loads, and read-write access to
+/// `files` only.
+pub fn tool_rules(files: &[PathBuf]) -> Vec<Rule> {
+    use AccessFs::*;
+    [
+        ("/usr".into(), ReadFile | ReadDir | Execute),
+        ("/etc/ld.so.cache".into(), ReadFile.into()),
+        ("/dev/null".into(), ReadFile | WriteFile),
+    ]
+    .into_iter()
+    .chain(
+        files
+            .iter()
+            .map(|f| (f.clone(), ReadFile | WriteFile | Truncate)),
+    )
+    .collect()
+}
+
 /// Builds the ruleset in the daemon, so the child only has to enforce it.
 pub fn build(rules: &[Rule]) -> Result<RulesetCreated> {
     let mut ruleset = Ruleset::default()
@@ -282,6 +301,37 @@ pub fn confine_on_exec(cmd: &mut Command, ruleset: RulesetCreated) {
     }
 }
 
+/// The running kernel's Landlock ABI (0 without Landlock).
+#[cfg(test)]
+pub(crate) fn kernel_abi() -> i64 {
+    // SAFETY: LANDLOCK_CREATE_RULESET_VERSION with a null attribute only
+    // returns a number.
+    #[allow(unsafe_code)]
+    let v = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0,
+            1,
+        )
+    };
+    v.max(0)
+}
+
+/// Whether confinement works here; tests that need it skip otherwise.
+#[cfg(test)]
+pub(crate) fn available() -> bool {
+    let ok = kernel_abi() >= REQUIRED as i64;
+    if !ok {
+        eprintln!(
+            "skipped: kernel Landlock ABI {} < {}",
+            kernel_abi(),
+            REQUIRED as u32
+        );
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,31 +367,10 @@ mod tests {
         }
     }
 
-    /// The running kernel's Landlock ABI (0 without Landlock).
-    fn kernel_abi() -> i64 {
-        // SAFETY: LANDLOCK_CREATE_RULESET_VERSION with a null attribute only
-        // returns a number.
-        #[allow(unsafe_code)]
-        let v = unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                std::ptr::null::<u8>(),
-                0,
-                1,
-            )
-        };
-        v.max(0)
-    }
-
     /// Runs `sh -c script` confined to `rules`; returns whether it succeeded,
     /// or `None` (skipped) if the kernel lacks the required Landlock ABI.
     fn confined(rules: &[Rule], script: &str) -> Option<bool> {
-        if kernel_abi() < REQUIRED as i64 {
-            eprintln!(
-                "skipped: kernel Landlock ABI {} < {}",
-                kernel_abi(),
-                REQUIRED as u32
-            );
+        if !available() {
             return None;
         }
         let mut cmd = Command::new("/usr/bin/sh");

@@ -156,3 +156,91 @@ fn running_snapshot_round_trip() {
     d.assert_safe("dev");
     assert_eq!(sh(&d, "echo ok"), "ok");
 }
+
+#[test]
+#[ignore = "boots a VM; run with STALLO_IT=1"]
+fn stopped_snapshots() {
+    if !common::enabled() {
+        return;
+    }
+    let d = Daemon::start("snapshot-stopped", "");
+    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    let call = |r: Request| d.api(Via::Cli, r);
+    let snap = |tag: &str| {
+        call(Request::Snapshot {
+            name: "dev".into(),
+            tag: Some(tag.into()),
+        })
+        .unwrap()
+    };
+    let restore = |tag: &str| {
+        call(Request::Restore {
+            name: "dev".into(),
+            tag: Some(tag.into()),
+        })
+    };
+
+    // A RAM snapshot with state only in RAM, and a file on disk.
+    sh(
+        &d,
+        "echo live > /dev/shm/marker && echo one > /var/tmp/marker && sync",
+    );
+    let live = snap("live");
+    assert_eq!(live["ram"], true);
+    d.ok(&["stop", "dev"]);
+
+    // Stopped: a disk-only snapshot.
+    let disk = snap("disk");
+    eprintln!("MEASURE snapshot of a stopped VM: {disk}");
+    assert_eq!(disk["ram"], false);
+    let list = call(Request::Snapshots { name: "dev".into() }).unwrap();
+    let got: Vec<(String, bool)> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap().to_owned(), s["ram_bytes"] != 0))
+        .collect();
+    assert_eq!(got, [("live".into(), true), ("disk".into(), false)]);
+
+    // Change the disk, then go back to the disk-only snapshot.
+    d.ok(&["start", "dev"]);
+    sh(&d, "echo two > /var/tmp/marker && sync");
+    let err = restore("disk").unwrap_err();
+    assert!(err.to_string().contains("no RAM state"), "{err}");
+    d.ok(&["stop", "dev"]);
+    let restored = restore("disk").unwrap();
+    assert_eq!(restored["state"], "stopped");
+    d.ok(&["start", "dev"]);
+    assert_eq!(sh(&d, "cat /var/tmp/marker"), "one");
+    assert!(
+        exec(&d, "cat /dev/shm/marker")["exit_code"] != 0,
+        "booted fresh"
+    );
+    d.ok(&["stop", "dev"]);
+
+    // A RAM snapshot of a stopped VM starts it from that moment.
+    let t = Instant::now();
+    let restored = restore("live").unwrap();
+    let marker = sh(&d, "cat /dev/shm/marker");
+    eprintln!("MEASURE restore RAM snapshot of a stopped VM: {restored}");
+    eprintln!("MEASURE stopped restore -> exec ok: {:?}", t.elapsed());
+    assert_eq!(restored["state"], "running");
+    assert_eq!(marker, "live");
+    assert!(t.elapsed() < Duration::from_secs(20));
+    d.assert_safe("dev");
+
+    // Clean up: one snapshot while running, one while stopped.
+    call(Request::SnapshotDelete {
+        name: "dev".into(),
+        tag: "live".into(),
+    })
+    .unwrap();
+    d.ok(&["stop", "dev"]);
+    call(Request::SnapshotDelete {
+        name: "dev".into(),
+        tag: "disk".into(),
+    })
+    .unwrap();
+    let list = call(Request::Snapshots { name: "dev".into() }).unwrap();
+    assert!(list.as_array().unwrap().is_empty());
+}

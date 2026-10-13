@@ -310,6 +310,16 @@ impl Manager {
     pub async fn start(self: &Arc<Self>, name: &str) -> Result<Arc<Running>> {
         self.check_exists(name)?;
         let _op = self.lock(name).await;
+        self.start_locked(name, false).await
+    }
+
+    /// [`Manager::start`] for a caller that holds the VM's lifecycle lock.
+    /// With `paused`, the guest's CPUs wait for `cont` (QEMU `-S`).
+    pub(crate) async fn start_locked(
+        self: &Arc<Self>,
+        name: &str,
+        paused: bool,
+    ) -> Result<Arc<Running>> {
         let cfg = self.load(name)?;
         ensure!(self.running(name).is_none(), "{name} is already running");
 
@@ -329,7 +339,10 @@ impl Manager {
         if !vm_dir.join(qemu::STATE).exists() {
             qemu::create_state(&vm_dir.join(qemu::STATE)).await?;
         }
-        let argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
+        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir)?;
+        if paused {
+            argv.push("-S".to_owned());
+        }
 
         // Held until the VM is registered as running, so concurrent starts
         // see each other.
@@ -570,6 +583,11 @@ impl Manager {
     pub async fn stop(&self, name: &str, force: bool) -> Result<()> {
         self.check_exists(name)?;
         let _op = self.lock(name).await;
+        self.stop_locked(name, force).await
+    }
+
+    /// [`Manager::stop`] for a caller that holds the VM's lifecycle lock.
+    pub(crate) async fn stop_locked(&self, name: &str, force: bool) -> Result<()> {
         let vm = self
             .running(name)
             .with_context(|| format!("{name} is not running"))?;
