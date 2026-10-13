@@ -39,6 +39,8 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(600);
 /// Job status is polled this often while no event arrives (events are
 /// missed when the broadcast lags).
 const JOB_POLL: Duration = Duration::from_secs(1);
+/// How long a restore waits for the guest agent to answer again.
+const AGENT_AFTER_RESTORE: Duration = Duration::from_secs(10);
 /// Most snapshots per VM. Each can hold the full guest RAM, agents may take
 /// snapshots but never delete them, and the QMP reply that lists them must
 /// stay far below the reply cap.
@@ -292,6 +294,12 @@ pub struct Restored {
     pub pause_ms: Option<u64>,
     /// How long the whole restore took, in milliseconds.
     pub ms: u64,
+    /// After a RAM snapshot: how long after the load the guest agent
+    /// answered again (reconnected and synced), in milliseconds, roughly.
+    /// `None` if it did not within 10 s (for example, the snapshot was taken
+    /// before the agent ran) or the VM is not running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_ms: Option<u64>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -518,12 +526,24 @@ impl Manager {
             Some(vm) => vm.state().await,
             None => "stopped".to_owned(),
         };
+        // The old agent connection was dropped with the load: reconnect and
+        // sync now, so the caller knows the guest is usable. Never fails
+        // the restore, which has happened.
+        let agent = if state == "running" {
+            self.wait_ready(name, AGENT_AFTER_RESTORE)
+                .await
+                .inspect_err(|e| tracing::warn!("{name}: {e:#}"))
+                .ok()
+        } else {
+            None
+        };
         tracing::info!("{name}: restored {}, now {state}", snap.name);
         Ok(Restored {
             name: snap.name,
             state,
             pause_ms: pause.map(ms),
             ms: ms(started.elapsed()),
+            agent_ms: agent.map(ms),
         })
     }
 

@@ -11,6 +11,7 @@ use serde_json::Value;
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Via, VmInfo};
 use stallo::config::NetProfile;
 use stallo::host::HostInfo;
+use stallo::snapshot::{Restored, Snapshot, Taken};
 
 #[derive(Parser)]
 #[command(version, about = "Agent-first VMs on Ubuntu", propagate_version = true)]
@@ -83,6 +84,24 @@ enum Cmd {
         #[arg(long)]
         admin: bool,
     },
+    /// Take a snapshot (with RAM and running programs if the VM runs; disk
+    /// only if it is stopped), or delete one.
+    Snap {
+        vm: String,
+        /// Snapshot name (default snap<N>).
+        name: Option<String>,
+        /// Delete snapshot NAME instead.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        delete: Option<String>,
+        /// Do not ask before deleting.
+        #[arg(long, requires = "delete")]
+        yes: bool,
+    },
+    /// List a VM's snapshots.
+    Snaps { vm: String },
+    /// Go back to a snapshot (default: the newest). A RAM snapshot brings
+    /// the running guest back; a disk-only one needs the VM stopped.
+    Restore { vm: String, name: Option<String> },
     /// Let agents (MCP) control a VM, or stop them.
     Agent {
         vm: String,
@@ -297,6 +316,62 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&serde_json::json!({"bytes": bytes}));
             } else {
                 println!("copied {bytes} bytes");
+            }
+        }
+        Cmd::Snap {
+            vm,
+            delete: Some(tag),
+            yes,
+            ..
+        } => {
+            if !yes {
+                confirm(&format!("Delete snapshot {tag} of {vm}?"))?;
+            }
+            call(Request::SnapshotDelete {
+                name: vm.clone(),
+                tag: tag.clone(),
+            })
+            .await?;
+            if !json {
+                println!("{vm}  snapshot {tag} deleted");
+            }
+        }
+        Cmd::Snap { vm, name, .. } => {
+            let v = call(Request::Snapshot {
+                name: vm.clone(),
+                tag: name,
+            })
+            .await?;
+            if json {
+                print_json(&v);
+            } else {
+                let t: Taken = serde_json::from_value(v)?;
+                println!("{vm}  {}", taken_line(&t));
+            }
+        }
+        Cmd::Snaps { vm } => {
+            let v = call(Request::Snapshots { name: vm }).await?;
+            if json {
+                print_json(&v);
+            } else {
+                let list: Vec<Snapshot> = serde_json::from_value(v)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                print!("{}", snaps_table(&list, now));
+            }
+        }
+        Cmd::Restore { vm, name } => {
+            let v = call(Request::Restore {
+                name: vm.clone(),
+                tag: name,
+            })
+            .await?;
+            if json {
+                print_json(&v);
+            } else {
+                let r: Restored = serde_json::from_value(v)?;
+                println!("{vm}  {}", restored_line(&r));
             }
         }
         Cmd::Agent { vm, state } => {
@@ -571,6 +646,62 @@ fn mib(m: u64) -> String {
     }
 }
 
+fn secs(ms: u64) -> String {
+    format!("{:.1} s", ms as f64 / 1000.0)
+}
+
+/// `snapshot s1 taken (RAM, guest paused 2.2 s)`.
+fn taken_line(t: &Taken) -> String {
+    let what = match (t.ram, t.pause_ms) {
+        (true, Some(p)) => format!("RAM, guest paused {}", secs(p)),
+        (true, None) => "RAM".to_owned(),
+        (false, _) => "disk only; the VM is stopped".to_owned(),
+    };
+    format!("snapshot {} taken ({what})", t.name)
+}
+
+/// `restored s1, running (guest agent back after 0.1 s)`.
+fn restored_line(r: &Restored) -> String {
+    let agent = match r.agent_ms {
+        Some(ms) => format!(" (guest agent back after {})", secs(ms)),
+        None if r.state == "running" => " (guest agent not answering yet)".to_owned(),
+        None => String::new(),
+    };
+    format!("restored {}, {}{agent}", r.name, r.state)
+}
+
+/// How long ago, roughly: `42 s`, `5 min`, `3 h`, `2 d`.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs / 60),
+        3600..86400 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86400),
+    }
+}
+
+fn snaps_table(list: &[Snapshot], now: u64) -> String {
+    use std::fmt::Write;
+    if list.is_empty() {
+        return "no snapshots; take one with `stallo snap <vm>`\n".to_owned();
+    }
+    let w = list.iter().map(|s| s.name.len()).max().unwrap_or(0).max(24);
+    let mut out = format!(
+        "{:<w$} {:>10} {:>9} {:>9}\n",
+        "NAME", "TAKEN", "RAM", "UPTIME"
+    );
+    for s in list {
+        let (ram, up) = if s.ram_bytes > 0 {
+            (mib(s.ram_bytes >> 20), ago(s.vm_clock_ms / 1000))
+        } else {
+            ("-".to_owned(), "-".to_owned())
+        };
+        let taken = format!("{} ago", ago(now.saturating_sub(s.created)));
+        let _ = writeln!(out, "{:<w$} {taken:>10} {ram:>9} {up:>9}", s.name);
+    }
+    out
+}
+
 fn print_table(vms: &[VmInfo]) {
     if vms.is_empty() {
         println!("no VMs; create one with `stallo new`");
@@ -639,6 +770,65 @@ fn parse_gib(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_output() {
+        let snap = |name: &str, ram_bytes, created, vm_clock_ms| Snapshot {
+            name: name.into(),
+            ram_bytes,
+            created,
+            vm_clock_ms,
+        };
+        let list = [
+            snap("before-upgrade", 412 << 20, 1000, 754_000),
+            snap("disk", 0, 9000, 0),
+        ];
+        assert_eq!(
+            snaps_table(&list, 10_000),
+            "NAME                          TAKEN       RAM    UPTIME\n\
+             before-upgrade              2 h ago   412 MiB    12 min\n\
+             disk                     16 min ago         -         -\n"
+        );
+        assert!(snaps_table(&[], 0).starts_with("no snapshots"));
+        assert_eq!(ago(59), "59 s");
+        assert_eq!(ago(86_400 * 3), "3 d");
+        let t = Taken {
+            name: "s1".into(),
+            ram: true,
+            pause_ms: Some(2210),
+            ms: 2220,
+        };
+        assert_eq!(
+            taken_line(&t),
+            "snapshot s1 taken (RAM, guest paused 2.2 s)"
+        );
+        let t = Taken {
+            ram: false,
+            pause_ms: None,
+            ..t
+        };
+        assert_eq!(
+            taken_line(&t),
+            "snapshot s1 taken (disk only; the VM is stopped)"
+        );
+        let r = Restored {
+            name: "s1".into(),
+            state: "running".into(),
+            pause_ms: Some(2500),
+            ms: 2600,
+            agent_ms: Some(120),
+        };
+        assert_eq!(
+            restored_line(&r),
+            "restored s1, running (guest agent back after 0.1 s)"
+        );
+        let r = Restored {
+            state: "stopped".into(),
+            agent_ms: None,
+            ..r
+        };
+        assert_eq!(restored_line(&r), "restored s1, stopped");
+    }
 
     #[test]
     fn sizes() {

@@ -184,6 +184,17 @@ struct CreateArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SnapArgs {
+    /// VM name.
+    vm: String,
+    /// Snapshot name: 1-64 characters A-Z, a-z, 0-9, '.', '_', '-',
+    /// starting with a letter. Default: a new `snap<N>` when taking one,
+    /// the newest when restoring.
+    name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct StartArgs {
     /// VM name.
     vm: String,
@@ -358,10 +369,15 @@ struct WriteArgs {
 
 /// Daemon time limits as seen by the adapter: the daemon's own worst case
 /// (waiting for an earlier operation on the VM, connecting to the guest
-/// agent, a grace period) plus slack. The daemon finishes a request even
+/// agent, a grace period) plus slack. Waiting behind a snapshot job of the
+/// same VM (up to 600 s) can exceed `QUICK` for lifecycle tools; the
+/// adapter then says the operation may still complete. The daemon finishes a request even
 /// if the adapter gives up, so these must not be shorter.
 const QUICK: Duration = Duration::from_secs(90);
 const FILE: Duration = Duration::from_secs(300);
+/// A snapshot job (at most 600 s in the daemon), a start and the wait for
+/// the guest agent, plus waiting for another snapshot job on the VM.
+const SNAPSHOT: Duration = Duration::from_secs(1300);
 const EXEC_OVERHEAD: Duration = Duration::from_secs(150);
 
 impl Server {
@@ -452,6 +468,48 @@ impl Server {
         Parameters(a): Parameters<VmArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.text(Request::Reset { name: a.vm }, QUICK).await
+    }
+
+    #[tool(
+        description = "Take a snapshot of a VM. A running VM's snapshot includes its RAM and running programs (the guest pauses for a few seconds); a stopped VM's covers the disk only. At most 16 per VM; only a human can delete them.",
+        annotations(destructive_hint = false)
+    )]
+    async fn snapshot_create(
+        &self,
+        Parameters(a): Parameters<SnapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let request = Request::Snapshot {
+            name: a.vm,
+            tag: a.name,
+        };
+        self.text(request, SNAPSHOT).await
+    }
+
+    #[tool(
+        description = "Go back to a snapshot (default: the newest). Everything since is lost. A RAM snapshot brings back the running guest (a stopped VM starts); agent_ms is the ms until the guest agent answered, absent if not within 10 s (exec may fail until it does). A disk-only snapshot needs the VM stopped and leaves it stopped.",
+        annotations(destructive_hint = true)
+    )]
+    async fn snapshot_restore(
+        &self,
+        Parameters(a): Parameters<SnapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let request = Request::Restore {
+            name: a.vm,
+            tag: a.name,
+        };
+        self.text(request, SNAPSHOT).await
+    }
+
+    #[tool(
+        description = "List a VM's snapshots, oldest first: name, ram_bytes (0 = disk only), created (Unix seconds), vm_clock_ms (guest uptime).",
+        annotations(read_only_hint = true)
+    )]
+    async fn snapshot_list(
+        &self,
+        Parameters(a): Parameters<VmArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // May wait behind a snapshot job on the same VM.
+        self.text(Request::Snapshots { name: a.vm }, SNAPSHOT).await
     }
 
     #[tool(
@@ -830,6 +888,9 @@ mod tests {
             "exec",
             "file_read",
             "file_write",
+            "snapshot_create",
+            "snapshot_restore",
+            "snapshot_list",
         ];
         let mut tools = tools;
         tools.sort();
@@ -918,6 +979,26 @@ mod tests {
         )
         .await;
         assert_eq!((r["isError"].as_bool(), seen.len()), (Some(true), 0));
+
+        let (r, seen) = tool("snapshot_create", json!({"vm": "dev", "name": "s1"})).await;
+        assert_eq!(r["isError"], true, "the fake daemon says nope");
+        assert_eq!(
+            seen,
+            [Request::Snapshot {
+                name: "dev".into(),
+                tag: Some("s1".into())
+            }]
+        );
+        let (_, seen) = tool("snapshot_restore", json!({"vm": "dev"})).await;
+        assert_eq!(
+            seen,
+            [Request::Restore {
+                name: "dev".into(),
+                tag: None
+            }]
+        );
+        let (_, seen) = tool("snapshot_list", json!({"vm": "dev"})).await;
+        assert_eq!(seen, [Request::Snapshots { name: "dev".into() }]);
 
         // The daemon's refusal reaches the agent as a tool error.
         let (r, _) = tool("exec", json!({"vm": "dev", "argv": ["true"]})).await;

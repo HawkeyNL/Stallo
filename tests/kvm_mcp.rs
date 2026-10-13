@@ -205,3 +205,76 @@ fn agent_session_over_mcp() {
     assert!(!audit.contains("gate-"), "typed text in the audit log");
     assert!(!audit.contains("ünïcode"));
 }
+
+/// M2 gate over MCP: a snapshot of a running guest with a running process
+/// brings back the process and RAM, and exec works right after.
+#[test]
+#[ignore = "boots a VM; run with STALLO_IT=1"]
+fn snapshots_over_mcp() {
+    if !common::enabled() {
+        return;
+    }
+    let d = Daemon::start("mcp-snapshot", "");
+    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&["agent", "dev", "on"]);
+    let mut m = Mcp::start(&d);
+    let sh = |m: &mut Mcp, cmd: &str| -> String {
+        let out = m.text(
+            "exec",
+            json!({"vm": "dev", "admin": true, "argv": ["sh", "-c", cmd]}),
+        );
+        assert_eq!(out["exit_code"], 0, "{cmd}: {out}");
+        out["stdout"].as_str().unwrap().trim().to_owned()
+    };
+
+    sh(
+        &mut m,
+        "systemd-run --unit=counter sh -c 'i=0; while :; do i=$((i+1)); echo $i > /dev/shm/counter; sleep 0.1; done' \
+         && echo before > /dev/shm/marker && sleep 0.3",
+    );
+    let pid = sh(&mut m, "systemctl show -P MainPID counter");
+    let taken = m.text("snapshot_create", json!({"vm": "dev", "name": "gate"}));
+    eprintln!("MEASURE snapshot_create over MCP: {taken}");
+    assert_eq!(taken["ram"], true);
+    sh(
+        &mut m,
+        "systemctl stop counter && echo after > /dev/shm/marker",
+    );
+
+    let list = m.text("snapshot_list", json!({"vm": "dev"}));
+    assert_eq!(list[0]["name"], "gate");
+    let t = std::time::Instant::now();
+    let restored = m.text("snapshot_restore", json!({"vm": "dev"}));
+    let marker = sh(&mut m, "cat /dev/shm/marker");
+    let restore_to_exec = t.elapsed();
+    eprintln!("MEASURE snapshot_restore over MCP: {restored}");
+    eprintln!("MEASURE snapshot_restore -> exec ok over MCP: {restore_to_exec:?}");
+    assert_eq!(restored["state"], "running");
+    assert!(
+        restored["agent_ms"].as_u64().is_some_and(|ms| ms < 10_000),
+        "{restored}"
+    );
+    assert!(restore_to_exec < std::time::Duration::from_secs(10));
+    assert_eq!(marker, "before");
+    assert_eq!(sh(&mut m, "systemctl show -P MainPID counter"), pid);
+
+    // The human side: the CLI.
+    let out = d.ok(&["snap", "dev", "cli1"]);
+    assert!(
+        out.contains("snapshot cli1 taken (RAM, guest paused"),
+        "{out}"
+    );
+    let out = d.ok(&["snaps", "dev"]);
+    assert!(out.contains("gate") && out.contains("cli1"), "{out}");
+    let out = d.ok(&["restore", "dev", "cli1"]);
+    assert!(
+        out.contains("restored cli1, running (guest agent back after"),
+        "{out}"
+    );
+    for tag in ["gate", "cli1"] {
+        d.ok(&["snap", "dev", "--delete", tag, "--yes"]);
+    }
+    assert!(d.ok(&["snaps", "dev"]).starts_with("no snapshots"));
+    // Deleting is for humans only: there is no MCP tool, and the daemon
+    // refuses it from agents (kvm_snapshot).
+}
