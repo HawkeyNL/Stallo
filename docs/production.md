@@ -158,7 +158,39 @@ script, it refuses to run without `/etc/stallo-lab` and outside a VM.
   apt's signed index) and served to the lab from a read-only ISO.
 - The host only ran this one offline VM.
 
-GATE_RESULTS
+**Result: all 114 checks passed** in a freshly installed lab VM, with
+the package built from this branch.
+
+| Check | Result |
+|---|---|
+| Install with `apt-get`: user `stallo` (nologin, home `/var/lib/stallo`), both units enabled and active, table loaded, `stallo.nft` a conffile | PASS |
+| S18: `systemd-analyze security stallod` | **2.3** (≤ 2.5) |
+| The daemon: uid `stallo`, no capabilities, `NoNewPrivs`, delegated `cpu memory pids`, its own cgroup namespace | PASS |
+| A restart and a reload of `nftables.service` (which flush the ruleset) load the Stallo table again | PASS |
+| Guest-agent packages pulled under the unit (`apt-get download` as `stallo`) | PASS |
+| S1: no TCP or UDP socket of `stallod` | PASS |
+| S2: `api.sock` `0660` and `/run/stallo` `0750`; a supplementary member of `stallo` uses the API; a non-member is refused by the file permissions, and, given access through an ACL, by the daemon's group check (logged); the CLI picks the production socket | PASS |
+| S3: per-VM runtime dir `0700`; a group member cannot connect to QMP; data dir `0700` | PASS |
+| S4: `-sandbox …spawn=deny…`, `-nodefaults`, `-nic none`, no `-vnc`; QEMU has `NoNewPrivs` and seccomp | PASS |
+| S7: bad VM name and snapshot name refused | PASS |
+| S8: MCP `exec` refused while agent control is off, audited as `via: mcp` | PASS |
+| S11: exec timeout (killed in the guest), output cap | PASS |
+| S12: over-budget VM refused; `memory.max`, `memory.swap.max = 0`, `pids.max`, `cpu.max` set; a limit below QEMU's usage OOM-kills QEMU in `vm-box` only, the daemon survives, the VM shows `stopped` | PASS |
+| S13: data disk filled below the floor → `paused (disk full)`; resume after freeing space | PASS |
+| S16: `secret` `0600`; not in `stallo info`, not in MCP `vm_info` | PASS |
+| S14, S15: `m3-network.sh` against the packaged daemon (47 checks, including the 13 positive controls, port forwards, RAM snapshot with passt, the table removed at runtime) | PASS |
+| Stop with a running VM: the guest powers off over ACPI (3.5 s), QEMU gets no signal, no process of `stallo` is left | PASS |
+| Upgrade (`--reinstall`): VMs stopped, daemon back, table loaded | PASS |
+| `apt remove`: no process left, table deleted, VM data and user kept; reinstall brings everything back | PASS |
+
+- **S12, how the OOM kill was forced.** A guest alone cannot push QEMU
+  past its limit (guest RAM plus overhead), and its RAM is already backed
+  after boot. So the gate lowers `memory.max` below QEMU's anonymous
+  memory. With no swap, the kernel kills QEMU (`oom_memcg=…/vm-box`), and
+  nothing else.
+- **The lab disk uses `cache=none`.** With the host page cache, a full run
+  stalled the lab VM during the RAM snapshot: the snapshot's writes were
+  charged to the lab's 3.7 GiB memory cgroup on the host.
 
 **S-checks that do not depend on the mode** run as unit tests on every
 `cargo test` and in CI: S5 (image formats), S6 (`safe_remove`), S9
