@@ -443,6 +443,11 @@ Do it only after the lab gate.
     hairpin NAT to the LAN's port forwards.
   - If yours does, add the WAN address to `deny4`.
 
+**Since M5 the package does steps 1, 2, 3 and 5** (passt as a dependency,
+the user, the table and `stallo-nft.service`); follow
+[production.md](production.md) instead. The manual steps below remain for
+reference.
+
 **Steps.** Roll back in reverse order, 5 to 1.
 
 1. **Install passt:**

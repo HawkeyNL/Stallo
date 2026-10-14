@@ -469,11 +469,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", mcp_install(&exe, socket.as_deref(), &path)?);
         }
         Cmd::Images { action } => {
-            let request = match action {
-                None => Request::Images,
-                Some(ImagesCmd::Pull { id }) => Request::Pull { image: id },
-            };
-            let v = call(request).await?;
+            // A pull answers null; show the catalog afterwards either way.
+            if let Some(ImagesCmd::Pull { id }) = action {
+                call(Request::Pull { image: id }).await?;
+            }
+            let v = call(Request::Images).await?;
             if json {
                 print_json(&v);
             } else {

@@ -1,0 +1,8 @@
+#!/bin/sh
+# stallo prerm: stopping the daemon stops every VM (they live in its cgroup).
+set -e
+
+if [ -d /run/systemd/system ]; then
+	deb-systemd-invoke stop stallod.service >/dev/null || true
+fi
+exit 0

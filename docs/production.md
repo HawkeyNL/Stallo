@@ -1,0 +1,236 @@
+# Production mode: the package, the service and the M5 gate
+
+Production mode runs `stallod` as the system user `stallo` under
+`stallod.service`, with data in `/var/lib/stallo` and runtime files in
+`/run/stallo`. It is the only mode that offers the `internet` network
+profile (see [network-verification.md](network-verification.md)). This
+document covers the package, the systemd hardening and the evidence for it,
+the M5 lab gate, and the owner's install and rollback steps.
+
+## The package
+
+`packaging/build-deb.sh` builds `target/deb/stallo_<version>_amd64.deb` from
+a release build with `dpkg-deb` (no root, no extra tools).
+
+| Path | What |
+|---|---|
+| `/usr/bin/stallo`, `/usr/bin/stallod` | the CLI and the daemon |
+| `/usr/lib/systemd/system/stallod.service` | the daemon (`packaging/stallod.service`) |
+| `/usr/lib/systemd/system/stallo-nft.service` | loads the network table at boot (`packaging/stallo-nft.service`) |
+| `/etc/stallo/stallo.nft` | the table (`packaging/stallo.nft`), a conffile: local edits such as a LAN IPv6 prefix in `deny6` survive upgrades |
+
+**Depends:** `nftables`, `passt`, `qemu-system-x86 (>= 1:10.2)`,
+`qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
+`ubuntu-cloudimage-keyring`, `systemd`.
+
+**Maintainer scripts:**
+
+- **postinst:**
+  - Creates the system user `stallo` (group `stallo`, home
+    `/var/lib/stallo`, shell `nologin`) if it does not exist.
+  - Refuses to continue if `stallo` exists but is a human account
+    (uid 0 or ≥ 1000): the table and the daemon would then apply to it.
+  - The user is not added to group `kvm`; the unit grants `/dev/kvm`
+    (`SupplementaryGroups=kvm`).
+  - Enables both units on first install, and keeps the owner's choice on
+    upgrades.
+  - Loads the table (`restart stallo-nft`), then starts `stallod`.
+- **prerm:** stops `stallod`. **That stops every VM**, on upgrade and
+  removal alike: VMs live in the daemon's cgroup.
+- **postrm remove:** deletes the table (nothing runs as `stallo` any more)
+  and masks the units, as debhelper does.
+  - It never deletes VMs, images, `/var/lib/stallo` or the user, not even
+    on purge. The steps below remove them by hand.
+
+**Why not `cargo-deb`** (as the plan said): it is not installed here, and
+installing tools needs the owner's approval. `dpkg-deb` is part of every
+Ubuntu system, and the package is small enough to build by hand.
+
+## API access
+
+- `/run/stallo` is `0750` and `api.sock` is `0660`, both group `stallo`.
+  The per-VM directories below stay `0700`, so QMP and QGA sockets remain
+  private to the daemon (S3).
+- The daemon accepts its own uid, root, and members of its group. It reads
+  the peer's supplementary groups with `SO_PEERGROUPS` (S2).
+- **Every member of group `stallo` has the full API**, the same as the
+  owner. Add only trusted users.
+- The CLI uses `/run/stallo/api.sock` when it exists and the user can
+  reach it, else the dev-mode socket. `--socket` and `$STALLO_SOCKET`
+  override both.
+
+## The service unit
+
+`systemd-analyze security stallod`: **2.3** (gate: ≤ 2.5), measured in the
+lab on the installed unit. Every setting below was in place for the whole
+gate.
+
+| Setting | Why |
+|---|---|
+| `User=stallo`, `Group=stallo`, `SupplementaryGroups=kvm` | the table matches this user; `/dev/kvm` through the group |
+| `Delegate=cpu memory pids` | the daemon writes the VM cgroups itself |
+| `CPUWeight=50`, `IOWeight=50` | host services win under contention |
+| `KillMode=mixed`, `TimeoutStopSec=120` | stopping the unit powers every VM off, see below |
+| `StateDirectory=` (0700), `RuntimeDirectory=` (0750), `UMask=0027` | see API access |
+| `NoNewPrivileges`, `CapabilityBoundingSet=` (empty) | no privileges at all |
+| `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp` | writes only to its own directories |
+| `PrivateDevices=yes`, `BindPaths=/dev/kvm`, `DevicePolicy=closed`, `DeviceAllow=/dev/kvm rw` | a private `/dev` with `/dev/kvm` only |
+| `ProtectControlGroups=private` | a cgroup namespace rooted at the unit, writable for the delegated tree |
+| `ProtectProc=invisible` | other users' processes are hidden |
+| `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` | passt and image downloads |
+| `RestrictNamespaces=user mnt ipc uts pid` | passt's own sandbox |
+| `SystemCallFilter=@system-service @mount seccomp landlock_*` | see below |
+| `MemoryDenyWriteExecute`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID`, `RemoveIPC`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `SystemCallArchitectures=native` | standard hardening; QEMU (KVM, no TCG) and passt run fine with them |
+
+**Measured in the lab, not assumed:**
+
+- **`ProtectControlGroups` and `Delegate`** (an open question in the plan):
+  - `yes` makes `/sys/fs/cgroup` read-only, the delegated subtree too, so
+    the daemon could not create VM cgroups.
+  - `private` gives the unit its own cgroup namespace with a writable
+    `/sys/fs/cgroup`. The daemon sees `0::/daemon` in `/proc/self/cgroup`,
+    and its `/sys/fs/cgroup` shows only its own subtree (no
+    `system.slice`). The code needed no change: it already resolves its
+    cgroup through `/proc/self/cgroup`.
+  - `systemd-analyze security` counts `private` as protected.
+- **passt needs `@mount` and the PID namespace.** With either one removed
+  (a drop-in without `@mount`, or `RestrictNamespaces=user mnt ipc uts`),
+  `stallo new --net internet` failed: `passt exited (exit status: 1)`.
+  passt uses its own user, mount, IPC and UTS namespaces (seen in
+  `/proc/<passt>/ns`) and pivots into an empty root.
+- **`KillMode=mixed`, not `control-group`** (the plan's choice).
+  - With `control-group`, systemd sends SIGTERM to every process in the
+    unit at once. QEMU exits on it (`terminating on signal 15 from pid 1`
+    in `qemu.log`), so the guests lose power before the daemon can shut
+    them down.
+  - With `mixed`, only the daemon gets SIGTERM. A booted guest powered
+    off over ACPI in 3.3 s, and QEMU logged no signal.
+  - The daemon's stop takes at most 110 s (30 s for requests in flight,
+    60 s for the ACPI power-off, then `quit` and `cgroup.kill`), inside
+    `TimeoutStopSec=120`. systemd kills whatever is left when the daemon
+    exits.
+- **`seccomp` and `landlock_*`** are not in `@system-service`, and the
+  daemon needs them to confine every QEMU (`src/confine.rs`).
+- **`MemoryDenyWriteExecute`** is inherited by QEMU and passt: QEMU with
+  KVM does not generate code, and every VM in the gate ran with it.
+- **Not used, and why:**
+  - `PrivateUsers`: it would drop group `kvm`.
+  - `PrivateNetwork` and `IPAddressDeny`: guests need the internet. The
+    nftables table does the filtering, and the probe checks it.
+  - `ProcSubset=pid`: the daemon reads `/proc/meminfo` for admission.
+
+**AppArmor.**
+
+- **passt:** it runs under Ubuntu's `passt` profile (`passt (enforce)`)
+  and works unchanged: it gets its socket with `--fd`.
+  - The only denial is passt's syslog socket, as in M3; passt logs to
+    stderr instead.
+- **QEMU:** unconfined by AppArmor. It is confined by Landlock and seccomp
+  (`src/confine.rs`); a dedicated profile is M5-3.
+- **swtpm:** not used before M4 (Windows).
+- So **no AppArmor override is needed** and the package ships none.
+
+## M5 gate (lab VM)
+
+`tests/lab/m5-production.sh` runs the gate inside the lab VM. Like the M3
+script, it refuses to run without `/etc/stallo-lab` and outside a VM.
+
+- It installs the `.deb` with `apt-get` from a local apt source in the lab,
+  so the package's dependencies are resolved for real.
+- It runs the S-checks against the packaged daemon, then
+  `m3-network.sh` (S14, S15) against it, then stop, upgrade, removal and
+  reinstall.
+
+**The lab:**
+
+- Ubuntu 26.04 cloud image, 2 vCPU, 3 GiB, `-nic none`, nested KVM.
+- Nested guests: 1 vCPU, 1 GiB.
+- Packages: fetched on the host with `apt-get download` (checked against
+  apt's signed index) and served to the lab from a read-only ISO.
+- The host only ran this one offline VM.
+
+GATE_RESULTS
+
+**S-checks that do not depend on the mode** run as unit tests on every
+`cargo test` and in CI: S5 (image formats), S6 (`safe_remove`), S9
+(audit redaction), S10 (oversized QGA/QMP replies). S17 is CI
+(`cargo deny`). S2 also has a unit test for `authorize` and one for
+`SO_PEERGROUPS`.
+
+**Not verified:**
+
+- **The image download** (`curl` to cloud-images.ubuntu.com) under the
+  unit: the lab is offline.
+  - The guest-agent download (`apt-get download`) did run under the unit,
+    from the lab's local apt source.
+  - DNS for both goes through `127.0.0.53`, which the table allows for
+    the daemon.
+- **A reboot of a host with the package installed.** The units are
+  enabled, and the lab was not rebooted after the install.
+
+## Installing on the host (owner)
+
+This needs root and changes the host: a new system user, a firewall table
+and a service. It touches no other service. Rivetlink and PersonalJarvis
+keep running, and the table matches only packets of user `stallo`.
+
+**Before you start (read-only):**
+
+1. The checks in [network-verification.md](network-verification.md),
+   "Check the host first": global IPv6 on the LAN, and whether your
+   router answers on its public address.
+2. `getent passwd stallo; getent group stallo`: both empty (on
+   2026-10-14 they were).
+3. `systemctl is-enabled nftables`: if it is enabled, a reload of
+   `/etc/nftables.conf` flushes the table. Afterwards run
+   `sudo systemctl reload stallo-nft`. It was `disabled` on 2026-10-14.
+4. Memory: the production daemon admits VMs against its own budget
+   (`memory_budget_pct`, default 50% of RAM), independent of a dev-mode
+   daemon. Do not run VMs in both at once without lowering one budget.
+
+**Steps.** Each step has its rollback; to undo everything, run the
+rollbacks in reverse order.
+
+1. **Build the package** (as your user, no root):
+   - `cd ~/projects/Stallo && packaging/build-deb.sh`
+   - Inspect it: `dpkg-deb -I target/deb/stallo_0.1.0_amd64.deb` and
+     `dpkg-deb -c target/deb/stallo_0.1.0_amd64.deb`
+   - Rollback: `rm -r target/deb`
+2. **Install:**
+   - `sudo apt install ./target/deb/stallo_0.1.0_amd64.deb`
+     - This also installs `passt` and `ubuntu-cloudimage-keyring`; the
+       other dependencies are already installed.
+   - What it does: creates user and group `stallo`, loads the table,
+     enables and starts `stallo-nft.service` and `stallod.service`.
+   - Rollback: `sudo apt remove stallo`
+     - It stops the daemon (and every VM) and deletes the table.
+     - It keeps `/var/lib/stallo` and the user (step 6).
+     - `sudo apt remove passt ubuntu-cloudimage-keyring` removes the two
+       new dependencies, if nothing else needs them.
+3. **Check:**
+   - `systemctl status stallod stallo-nft`: both active.
+   - `sudo systemd-analyze security stallod`: ≤ 2.5.
+   - `sudo nft list table inet stallo`: shows the table.
+   - The functional checks from network-verification.md, step 4:
+     - `sudo -u stallo curl -m 3 http://<router>/` fails;
+     - `sudo -u stallo curl -sI -m 5 https://example.com` works;
+     - your own `curl http://<router>/` still works.
+4. **Give your user access:**
+   - `sudo usermod -aG stallo $USER`, then log in again (or `newgrp stallo`).
+   - `stallo ls` now talks to the production daemon.
+   - Rollback: `sudo gpasswd -d $USER stallo`
+5. **Optional, configure:** `/var/lib/stallo/stallod.toml`.
+   - Keys: `[host]` `memory_budget_pct`, `reserve_mib`, `disk_floor_gib`,
+     `reserved_cores`, and `[net] dns`.
+   - Edit it with `sudo -u stallo nano /var/lib/stallo/stallod.toml`.
+   - Then `sudo systemctl restart stallod`. **This stops all VMs.**
+   - Rollback: delete the file and restart (the defaults apply).
+6. **Full removal**, only if you also want to delete all VMs and images:
+   - `sudo apt purge stallo`
+   - `sudo rm -r /var/lib/stallo`: **deletes every VM disk and snapshot**.
+   - `sudo userdel stallo`, then `sudo groupdel stallo` if the group is
+     still there.
+
+**Upgrades:** `sudo apt install ./target/deb/stallo_<new>_amd64.deb`. The
+upgrade stops the daemon and every VM, then starts the new daemon. The VMs
+stay defined (`stopped`); start them again with `stallo start`.

@@ -97,6 +97,15 @@ as user `stallo`), passt and the table. Without them the daemon refuses it
   running without network until they restart. The lab results and the host install steps are
 in [docs/network-verification.md](docs/network-verification.md).
 
+## Production mode
+
+`packaging/build-deb.sh` builds a `.deb`. It installs `stallod.service`
+(user `stallo`, hardened: `systemd-analyze security` 2.3) and the network
+table with its loader unit. Members of group `stallo` use the API socket
+`/run/stallo/api.sock`, which the CLI picks by default when it exists.
+Install steps, rollback and the lab gate are in
+[docs/production.md](docs/production.md).
+
 ## Agents (MCP)
 
 `stallo mcp` is an MCP server on stdin/stdout. Register it with Claude Code

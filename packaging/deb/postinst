@@ -1,0 +1,39 @@
+#!/bin/sh
+# stallo postinst: the system user, then the network table and the daemon.
+set -e
+
+if [ "$1" = configure ]; then
+	if ! getent passwd stallo >/dev/null; then
+		# No login, no home of its own; /dev/kvm comes from the unit's
+		# SupplementaryGroups=kvm, not from /etc/group.
+		useradd --system --user-group --home-dir /var/lib/stallo \
+			--no-create-home --shell /usr/sbin/nologin \
+			--comment "Stallo VM daemon" stallo
+	fi
+	# Never adopt a human account: the daemon and the network table would
+	# then apply to it.
+	uid=$(id -u stallo)
+	if [ "$uid" -ge 1000 ] || [ "$uid" = 0 ]; then
+		echo "stallo: user stallo exists but is not a system user (uid $uid); refusing" >&2
+		exit 1
+	fi
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload >/dev/null || true
+	fi
+	for unit in stallo-nft.service stallod.service; do
+		# Only lifts the mask that postrm set on removal.
+		deb-systemd-helper unmask "$unit" >/dev/null || true
+		# Enable on first install; later, keep the owner's choice.
+		if deb-systemd-helper --quiet was-enabled "$unit"; then
+			deb-systemd-helper enable "$unit" >/dev/null || true
+		else
+			deb-systemd-helper update-state "$unit" >/dev/null || true
+		fi
+	done
+	if [ -d /run/systemd/system ]; then
+		# The table first: stallod refuses `internet` VMs without it.
+		deb-systemd-invoke restart stallo-nft.service >/dev/null || true
+		deb-systemd-invoke start stallod.service >/dev/null || true
+	fi
+fi
+exit 0

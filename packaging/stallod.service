@@ -1,0 +1,72 @@
+[Unit]
+Description=Stallo VM daemon
+Documentation=https://github.com/HawkeyNL/Stallo
+# stallod refuses `internet` VMs until the table is loaded (fail closed),
+# so this is ordering, not a dependency.
+After=stallo-nft.service
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/stallod
+User=stallo
+Group=stallo
+SupplementaryGroups=kvm
+UMask=0027
+
+# The daemon creates the per-VM cgroups and writes their limits itself.
+# Stopping the unit stops every VM in it.
+Delegate=cpu memory pids
+CPUWeight=50
+IOWeight=50
+# SIGTERM to the daemon only: it powers the guests off (ACPI, then quit,
+# then kill; at most 110 s). control-group would SIGTERM every QEMU at
+# once, which pulls the plug on the guests. Anything left is killed when
+# the daemon exits or at the timeout.
+KillMode=mixed
+TimeoutStopSec=120
+
+StateDirectory=stallo
+StateDirectoryMode=0700
+# 0750: group stallo reaches api.sock (0660); per-VM dirs stay 0700.
+RuntimeDirectory=stallo
+RuntimeDirectoryMode=0750
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# A private /dev with only /dev/kvm added.
+PrivateDevices=yes
+BindPaths=/dev/kvm
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+# A cgroup namespace rooted at this unit, writable for the delegated tree.
+# (`yes` would make the delegated cgroup read-only too.)
+ProtectControlGroups=private
+ProtectProc=invisible
+# The daemon reads /proc/meminfo, so no ProcSubset=pid.
+# AF_INET/AF_INET6/AF_NETLINK: passt and image downloads.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# passt sandboxes itself in user, mount, IPC, UTS and PID namespaces; it
+# fails to start without any of them (lab, M5).
+RestrictNamespaces=user mnt ipc uts pid
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+# @mount: passt pivots into an empty root (it fails without). seccomp and
+# landlock_*: the daemon confines every QEMU (src/confine.rs).
+SystemCallFilter=@system-service @mount seccomp landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

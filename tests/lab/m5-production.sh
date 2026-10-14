@@ -1,0 +1,238 @@
+#!/bin/sh
+# M5 gate: the .deb in production mode.
+#
+# LAB VM ONLY. It installs and removes the package, creates users, loads
+# nftables rules and fills the disk, so it refuses to run unless
+# /etc/stallo-lab exists and this is a VM. Never run it on a real host.
+#
+# Needs in the lab VM: an apt source with the package's dependencies, the
+# packages of tests/lab/m3-network.sh, python3, and
+#   $DEB     the stallo .deb (packaging/build-deb.sh)
+#   $IMAGES  directory with ubuntu-26.04.qcow2 and debs/26.04/*.deb
+#
+# Checks: install, S18 (systemd hardening), S1-S4, S7, S8, S11-S13, S16 on
+# an offline VM, then S14/S15 with m3-network.sh against the packaged
+# daemon, then stop, upgrade and removal. Prints PASS/FAIL per check and
+# exits non-zero on any failure.
+set -eu
+[ "$(id -u)" = 0 ] || { echo "run as root (inside the lab VM)"; exit 2; }
+[ -e /etc/stallo-lab ] || { echo "refusing: /etc/stallo-lab is missing; this is not a lab VM"; exit 2; }
+systemd-detect-virt --vm -q || { echo "refusing: not a virtual machine"; exit 2; }
+: "${DEB:?}" "${IMAGES:?}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+CG=/sys/fs/cgroup/system.slice/stallod.service
+fails=0
+pass() { echo "PASS  $*"; }
+fail() { echo "FAIL  $*"; fails=$((fails + 1)); }
+check() { name=$1; shift; if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi; }
+refused() {
+	name=$1 want=$2; shift 2
+	if out=$("$@" 2>&1); then fail "$name (succeeded)"
+	elif echo "$out" | grep -q "$want"; then pass "$name"
+	else fail "$name ($out)"; fi
+}
+as() { u=$1; shift; runuser -u "$u" -- "$@"; }
+qemu_pid() { pgrep -u stallo -f "qemu-system-x86_64 -name guest=$1," | head -n 1; }
+wait_sock() { for _ in $(seq 50); do [ -S /run/stallo/api.sock ] && return 0; sleep 0.2; done; return 1; }
+# One MCP tool call over `stallo mcp` as user $1; prints the JSON-RPC reply.
+mcp() {
+	u=$1 tool=$2 args=$3
+	{
+		echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"lab","version":"0"}}}'
+		echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+		echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
+		sleep 3
+	} | as "$u" stallo mcp | grep '"id":2'
+}
+
+install_pkg() {
+	echo "== install"
+	DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB" >/dev/null
+	check "user stallo, no login, home /var/lib/stallo" sh -c 'getent passwd stallo | grep -q ":/var/lib/stallo:/usr/sbin/nologin$"'
+	check "stallo-nft enabled and active" sh -c 'systemctl is-enabled -q stallo-nft && systemctl is-active -q stallo-nft'
+	check "stallod enabled and active" sh -c 'systemctl is-enabled -q stallod && systemctl is-active -q stallod'
+	check "table inet stallo loaded" nft list table inet stallo
+	check "/etc/stallo/stallo.nft is a conffile" sh -c 'dpkg-query -W -f="\${Conffiles}" stallo | grep -q /etc/stallo/stallo.nft'
+}
+
+configure() {
+	echo "== configure (lab sizes, offline image cache)"
+	install -d -o stallo -g stallo -m 700 /var/lib/stallo/images /var/lib/stallo/images/debs
+	install -o stallo -g stallo -m 444 "$IMAGES/ubuntu-26.04.qcow2" /var/lib/stallo/images/
+	cp -r "$IMAGES/debs/26.04" /var/lib/stallo/images/debs/ && chown -R stallo:stallo /var/lib/stallo/images/debs
+	cat >/var/lib/stallo/stallod.toml <<-'EOF'
+		[host]
+		memory_budget_pct = 60
+		reserve_mib = 256
+		disk_floor_gib = 2
+		reserved_cores = 1
+		[net]
+		dns = "198.51.100.1"
+	EOF
+	chown stallo:stallo /var/lib/stallo/stallod.toml
+	systemctl restart stallod
+	wait_sock || { journalctl -u stallod --no-pager | tail; exit 1; }
+	# labuser may use Stallo (supplementary group), outsider may not.
+	id labuser >/dev/null 2>&1 || useradd --create-home --groups stallo labuser
+	id outsider >/dev/null 2>&1 || useradd --create-home outsider
+}
+
+service_checks() {
+	echo "== S18 and the unit"
+	score=$(systemd-analyze security stallod --no-pager | sed -n 's/.*stallod.service: \([0-9.]*\).*/\1/p')
+	echo "systemd-analyze security stallod: $score"
+	check "S18: exposure $score <= 2.5" awk "BEGIN { exit !($score <= 2.5) }"
+	pid=$(systemctl show -p MainPID --value stallod)
+	check "daemon runs as stallo" sh -c "[ \"\$(stat -c %U /proc/$pid)\" = stallo ]"
+	check "daemon has no capabilities" grep -q '^CapEff:	0000000000000000$' /proc/"$pid"/status
+	check "daemon has NoNewPrivs" grep -q '^NoNewPrivs:	1$' /proc/"$pid"/status
+	check "daemon cgroup is delegated (cpu memory pids)" sh -c "[ \"\$(cat $CG/cgroup.subtree_control)\" = 'cpu memory pids' ]"
+	# ProtectControlGroups=private: a cgroup namespace rooted at the unit.
+	check "daemon's cgroup namespace is rooted at the unit" sh -c "nsenter -t $pid -C cat /proc/$pid/cgroup | grep -qx '0::/daemon'"
+	check "daemon's /sys/fs/cgroup shows only its subtree" sh -c "nsenter -t $pid -m test -d /sys/fs/cgroup/daemon && ! nsenter -t $pid -m test -e /sys/fs/cgroup/system.slice"
+}
+
+vm_checks() {
+	echo "== image pull under the unit (apt-get download from the lab's apt source)"
+	mv /var/lib/stallo/images/debs/26.04 /var/lib/stallo/images/debs-26.04.seeded
+	check "pull of the guest-agent packages as stallo" stallo images pull ubuntu-26.04
+	check "pulled the same packages" sh -c '[ "$(ls /var/lib/stallo/images/debs/26.04)" = "$(ls /var/lib/stallo/images/debs-26.04.seeded)" ]'
+	rm -rf /var/lib/stallo/images/debs-26.04.seeded
+
+	echo "== offline VM in production mode"
+	stallo new box --cpus 1 --mem 1G --disk 5G >/dev/null
+	check "CLI default socket is /run/stallo/api.sock" sh -c 'stallo ls | grep -q "^box"'
+	pid=$(qemu_pid box)
+	check "QEMU runs as stallo in vm-box" sh -c "[ \"\$(stat -c %U /proc/$pid)\" = stallo ] && grep -qx '0::/system.slice/stallod.service/vm-box' /proc/$pid/cgroup"
+
+	echo "== S1: no IP listener"
+	check "S1: stallod has no TCP/UDP socket" sh -c '! ss -H -tuanp | grep -q "\"stallod\""'
+
+	echo "== S2: socket access"
+	check "S2: api.sock is 0660 stallo:stallo" sh -c '[ "$(stat -c "%a %U %G" /run/stallo/api.sock)" = "660 stallo stallo" ]'
+	check "S2: /run/stallo is 0750" sh -c '[ "$(stat -c %a /run/stallo)" = 750 ]'
+	check "S2: group member (supplementary) may use the API" as labuser stallo ls
+	refused "S2: non-member is refused" "ermission denied" as outsider stallo --socket /run/stallo/api.sock ls
+	check "S2: non-member does not get the production socket by default" sh -c '! runuser -u outsider -- stallo ls'
+
+	echo "== S3: per-VM runtime dir"
+	check "S3: vms/box is 0700 stallo" sh -c '[ "$(stat -c "%a %U" /run/stallo/vms/box)" = "700 stallo" ]'
+	check "S3: QMP socket unreachable for a group member" sh -c "! runuser -u labuser -- python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"/run/stallo/vms/box/qmp.sock\")'"
+	check "S3: data dir is 0700" sh -c '[ "$(stat -c %a /var/lib/stallo)" = 700 ]'
+
+	echo "== S4: QEMU argv"
+	argv=$(tr '\0' ' ' </proc/"$pid"/cmdline)
+	check "S4: -sandbox with spawn=deny" sh -c "echo '$argv' | grep -q -- '-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny'"
+	check "S4: -nodefaults and -nic none" sh -c "echo '$argv' | grep -q -- '-nodefaults' && echo '$argv' | grep -q -- '-nic none'"
+	check "S4: no -vnc" sh -c "! echo '$argv' | grep -q -- '-vnc'"
+	check "S4: QEMU has NoNewPrivs and seccomp" sh -c "grep -q '^NoNewPrivs:	1' /proc/$pid/status && grep -q '^Seccomp:	2' /proc/$pid/status"
+
+	echo "== S7: names and tags"
+	refused "S7: bad VM name" "invalid VM name" stallo new 'Bad!' --cpus 1 --mem 1G
+	refused "S7: bad snapshot tag" "invalid snapshot name" stallo snap box 'bad tag!'
+
+	echo "== S8: agent control off by default"
+	r=$(mcp labuser exec '{"vm":"box","argv":["true"]}')
+	check "S8: MCP exec refused while agent control is off" sh -c "echo '$r' | grep -q 'agent control is off'"
+	check "S8: refusal is audited as via mcp" sh -c 'tail -n 1 /var/lib/stallo/audit/box.jsonl | grep -q "\"via\":\"mcp\""'
+
+	echo "== S16: secrets"
+	check "S16: secret is 0600 stallo" sh -c '[ "$(stat -c "%a %U" /var/lib/stallo/vms/box/secret)" = "600 stallo" ]'
+	secret=$(cat /var/lib/stallo/vms/box/secret)
+	check "S16: info does not contain the secret" sh -c "! stallo info box --json | grep -qF '$secret'"
+	stallo agent box on
+	r=$(mcp labuser vm_info '{"vm":"box"}')
+	check "S16: MCP vm_info does not contain the secret" sh -c "echo '$r' | grep -q '\"result\"' && ! echo '$r' | grep -qF '$secret'"
+	stallo agent box off
+
+	echo "== S11: exec limits"
+	t0=$(date +%s)
+	refused "S11: exec timeout" "timed out" stallo exec --timeout 2 box -- sleep 60
+	check "S11: timeout took < 10 s" sh -c "[ \$(( \$(date +%s) - $t0 )) -lt 10 ]"
+	check "S11: the guest process was killed" sh -c '! stallo exec box -- pgrep -x sleep'
+	check "S11: output is capped" sh -c 'stallo exec box -- head -c 3000000 /dev/zero 2>&1 >/dev/null | grep -q "output truncated"'
+
+	echo "== S12: admission and limits"
+	refused "S12: over-budget VM refused" "memory" stallo new huge --cpus 1 --mem 64G --disk 5G
+	check "S12: memory.max set" sh -c "[ \"\$(cat $CG/vm-box/memory.max)\" -gt 1073741824 ]"
+	check "S12: swap off, pids and cpu capped" sh -c "[ \"\$(cat $CG/vm-box/memory.swap.max)\" = 0 ] && [ \"\$(cat $CG/vm-box/pids.max)\" = 512 ] && [ \"\$(cat $CG/vm-box/cpu.max)\" = '100000 100000' ]"
+	# A guest alone cannot push QEMU past its limit (guest RAM + overhead),
+	# and the guest's RAM is already backed after boot. So lower the limit
+	# below QEMU's anonymous memory: without swap the kernel must OOM-kill,
+	# and it may only kill inside vm-box.
+	since=$(date '+%Y-%m-%d %H:%M:%S')
+	anon=$(awk '$1 == "anon" { print $2 }' "$CG/vm-box/memory.stat")
+	echo $((anon - (64 << 20))) >"$CG/vm-box/memory.max" || true
+	for _ in $(seq 20); do
+		journalctl -k --no-pager --since "$since" >/tmp/m5-kern.log
+		grep -q 'Killed process' /tmp/m5-kern.log && break
+		sleep 0.5
+	done
+	check "S12: QEMU OOM-killed in vm-box" grep -q 'oom_memcg=/system.slice/stallod.service/vm-box,.*task=qemu-system-x86' /tmp/m5-kern.log
+	check "S12: nothing else was OOM-killed" sh -c '[ "$(grep -c "Killed process" /tmp/m5-kern.log)" = 1 ] && ! grep "oom-kill:" /tmp/m5-kern.log | grep -qv "oom_memcg=/system.slice/stallod.service/vm-box,"'
+	check "S12: the daemon survived" sh -c 'systemctl is-active -q stallod && stallo ls >/dev/null'
+	for _ in $(seq 25); do stallo ls | grep -q '^box .*stopped' && break; sleep 0.2; done
+	check "S12: the VM is stopped" sh -c 'stallo ls | grep -q "^box .*stopped"'
+
+	echo "== S13: disk watchdog"
+	stallo start box >/dev/null
+	free=$(df --output=avail -B1 /var/lib/stallo | tail -n 1)
+	fallocate -l $((free - (1 << 30))) /var/tmp/fill
+	paused=
+	for _ in $(seq 30); do stallo ls | grep -q 'paused (disk full)' && { paused=1; break; }; sleep 1; done
+	rm -f /var/tmp/fill
+	[ -n "$paused" ] && pass "S13: VM paused below the floor" || fail "S13: VM paused below the floor"
+	check "S13: resume after freeing space" stallo resume box
+	check "S13: the guest runs again" stallo exec box -- true
+	check "stop and remove" sh -c 'stallo stop box && stallo rm --yes box'
+}
+
+lifecycle() {
+	echo "== service lifecycle"
+	stallo new box --cpus 1 --mem 1G --disk 5G >/dev/null
+	since=$(date '+%Y-%m-%d %H:%M:%S')
+	t0=$(date +%s%N)
+	systemctl stop stallod
+	echo "stop with one running VM: $(( ($(date +%s%N) - t0) / 1000000 )) ms"
+	# KillMode=mixed: the daemon powers the guest off; systemd must not
+	# have signalled QEMU itself.
+	check "stop powers the guest off (QEMU got no signal)" sh -c '! grep -q "terminating on signal" /var/lib/stallo/vms/box/qemu.log'
+	check "stop: no forced power-off" sh -c "! journalctl -u stallod --no-pager --since '$since' | grep -q 'no power-off'"
+	check "stop leaves no stallo process" sh -c '! pgrep -u stallo'
+	check "stop removes the API socket" sh -c '[ ! -e /run/stallo/api.sock ]'
+	systemctl start stallod && wait_sock
+	check "start: box is stopped, not lost" sh -c 'stallo ls | grep -q "^box .*stopped"'
+	stallo start box >/dev/null
+	DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$DEB" >/dev/null
+	wait_sock || true
+	check "upgrade: daemon back, VMs stopped" sh -c 'systemctl is-active -q stallod && stallo ls | grep -q "^box .*stopped"'
+	check "upgrade: table still loaded" nft list table inet stallo
+	DEBIAN_FRONTEND=noninteractive apt-get remove -y stallo >/dev/null
+	check "remove: no stallo process" sh -c '! pgrep -u stallo'
+	check "remove: table deleted" sh -c '! nft list table inet stallo'
+	check "remove: VM data and user kept" sh -c 'id stallo && [ -f /var/lib/stallo/vms/box/vm.toml ]'
+	DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB" >/dev/null
+	wait_sock || true
+	check "reinstall: daemon, table and VM back" sh -c 'systemctl is-active -q stallod && nft list table inet stallo && stallo ls | grep -q "^box"'
+	check "remove box" stallo rm --yes box
+}
+
+case "${1:-all}" in
+install) install_pkg; configure ;;
+service) service_checks ;;
+vm) vm_checks ;;
+net)
+	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" net
+	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" checks || fails=$((fails + 1))
+	;;
+lifecycle) lifecycle ;;
+all)
+	install_pkg; configure; service_checks; vm_checks
+	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" net
+	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" checks || fails=$((fails + 1))
+	lifecycle
+	;;
+*) echo "usage: $0 [all|install|service|vm|net|lifecycle]"; exit 2 ;;
+esac
+echo "failures: $fails"
+[ "$fails" = 0 ]

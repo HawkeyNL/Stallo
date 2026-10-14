@@ -1,0 +1,24 @@
+[Unit]
+Description=Stallo network isolation table
+Documentation=https://github.com/HawkeyNL/Stallo
+After=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No ExecStop: removing the table is a manual rollback step, never a side
+# effect of stop or restart (stallod would cut its guests' network). A
+# reload replaces the table in one transaction.
+ExecStart=/usr/sbin/nft -f /etc/stallo/stallo.nft
+ExecReload=/usr/sbin/nft -f /etc/stallo/stallo.nft
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

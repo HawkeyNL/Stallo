@@ -1,0 +1,20 @@
+#!/bin/sh
+# stallo postrm. Never deletes VMs: /var/lib/stallo and the `stallo` user
+# stay, even on purge (see docs/production.md to remove them by hand).
+set -e
+
+case "$1" in
+remove)
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload >/dev/null || true
+	fi
+	# Nothing runs as `stallo` any more; drop its table.
+	nft delete table inet stallo >/dev/null 2>&1 || true
+	deb-systemd-helper mask stallo-nft.service stallod.service >/dev/null || true
+	;;
+purge)
+	deb-systemd-helper purge stallo-nft.service stallod.service >/dev/null || true
+	deb-systemd-helper unmask stallo-nft.service stallod.service >/dev/null || true
+	;;
+esac
+exit 0
