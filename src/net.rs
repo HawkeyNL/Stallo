@@ -300,6 +300,7 @@ mod tests {
             agent_control: false,
             throwaway_of: None,
             forwards: vec![],
+            vnc: false,
         }
     }
 

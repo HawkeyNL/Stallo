@@ -130,6 +130,7 @@ impl Manager {
             throwaway_of: Some(src.name.clone()),
             // A run only needs the guest agent, not the source's ports.
             forwards: vec![],
+            vnc: false,
             ..src.clone()
         }
         .save(&to)
@@ -175,6 +176,34 @@ mod tests {
             agent_control: false,
             throwaway_of: throwaway_of.map(Into::into),
             forwards: vec![],
+            vnc: false,
+        }
+    }
+
+    /// VNC: a human setting, saved in vm.toml; never on run clones. The
+    /// socket directories are shared with group `stallo` in production only.
+    #[tokio::test]
+    async fn vnc_setting_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, want) in [(Mode::Dev, 0o700), (Mode::Production, 0o750)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+            m.cleanup_leftovers().await.unwrap();
+            let got = fs::metadata(m.paths.vnc_root())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(got & 0o777, want, "{mode:?}");
+            for cfg in [vm("dev", None), vm("run-0a1b2c3d", Some("dev"))] {
+                let dir = m.paths.vm_dir(&cfg.name);
+                fs::create_dir(&dir).unwrap();
+                cfg.save(&dir).unwrap();
+            }
+            m.set_vnc("dev", true).await.unwrap();
+            assert!(m.load("dev").unwrap().vnc);
+            m.set_vnc("dev", false).await.unwrap();
+            assert!(!m.load("dev").unwrap().vnc);
+            assert!(m.set_vnc("run-0a1b2c3d", true).await.is_err());
         }
     }
 

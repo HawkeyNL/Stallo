@@ -130,6 +130,14 @@ enum Cmd {
         #[arg(value_enum)]
         state: OnOff,
     },
+    /// Change a VM setting; it applies from the VM's next start.
+    Set {
+        vm: String,
+        /// A VNC server on a Unix socket for humans (never TCP); reach it
+        /// with `ssh -L 5901:<socket> <host>`.
+        #[arg(long, value_enum)]
+        vnc: OnOff,
+    },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
     /// Show host resources and what VMs use.
@@ -417,6 +425,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 let r: Restored = serde_json::from_value(v)?;
                 println!("{vm}  {}", restored_line(&r));
+            }
+        }
+        Cmd::Set { vm, vnc } => {
+            let on = matches!(vnc, OnOff::On);
+            let v = call(Request::SetVnc {
+                name: vm.clone(),
+                on,
+            })
+            .await?;
+            if json {
+                print_json(&v);
+            } else {
+                let when = if v["running"] == true {
+                    " from the next start"
+                } else {
+                    ""
+                };
+                println!("{vm}  vnc {}{when}", if on { "on" } else { "off" });
+                if let Some(sock) = v["socket"].as_str() {
+                    println!("socket: {sock}");
+                }
             }
         }
         Cmd::Agent { vm, state } => {

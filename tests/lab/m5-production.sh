@@ -200,6 +200,24 @@ vm_checks() {
 	[ -n "$paused" ] && pass "S13: VM paused below the floor" || fail "S13: VM paused below the floor"
 	check "S13: resume after freeing space" stallo resume box
 	check "S13: the guest runs again" stallo exec box -- true
+	echo "== VNC on a Unix socket (M5-4)"
+	stallo stop box >/dev/null
+	check "set --vnc on" stallo set box --vnc on
+	stallo start box >/dev/null
+	vnc=/run/stallo/vnc/box/vnc.sock
+	rfb="import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); assert s.recv(12).startswith(b'RFB ')"
+	check "VNC socket 0660 stallo:stallo, dir 0750" sh -c "[ \"\$(stat -c '%a %U %G' $vnc)\" = '660 stallo stallo' ] && [ \"\$(stat -c %a /run/stallo/vnc/box)\" = 750 ]"
+	check "group member gets the RFB greeting" as labuser python3 -c "$rfb" "$vnc"
+	check "non-member cannot connect" sh -c "! runuser -u outsider -- python3 -c \"$rfb\" $vnc"
+	pid=$(qemu_pid box)
+	check "QEMU argv: -vnc unix: only" sh -c "tr '\0' ' ' </proc/$pid/cmdline | grep -q -- '-vnc unix:$vnc ' && ! tr '\0' ' ' </proc/$pid/cmdline | grep -qE 'tcp:|host=|:59[0-9][0-9]'"
+	check "QEMU has no TCP/UDP socket" sh -c "! ss -H -tuanp | grep -q 'pid=$pid,'"
+	refused "agents cannot turn VNC on" "only available to humans" sh -c "r=\$(printf '%s\n' '{\"via\":\"mcp\",\"request\":{\"op\":\"set_vnc\",\"name\":\"box\",\"on\":true}}' | python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(\"/run/stallo/api.sock\"); s.sendall(sys.stdin.buffer.read()); print(s.recv(4096).decode())'); echo \"\$r\"; echo \"\$r\" | grep -q '\"ok\":true' && exit 0 || exit 1"
+	stallo stop box >/dev/null
+	check "stop removes the VNC dir" sh -c '[ ! -e /run/stallo/vnc/box ]'
+	stallo set box --vnc off >/dev/null
+	stallo start box >/dev/null
+	check "VNC off: no -vnc, no socket" sh -c "! tr '\0' ' ' </proc/$(qemu_pid box)/cmdline | grep -q -- -vnc && [ ! -e $vnc ]"
 	check "stop and remove" sh -c 'stallo stop box && stallo rm --yes box'
 }
 

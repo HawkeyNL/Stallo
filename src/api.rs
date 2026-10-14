@@ -182,6 +182,11 @@ pub enum Request {
         name: String,
         on: bool,
     },
+    /// Turns a VM's VNC socket on or off from its next start (humans only).
+    SetVnc {
+        name: String,
+        on: bool,
+    },
     Host,
     Images,
     Pull {
@@ -230,6 +235,8 @@ pub struct VmInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<PortForward>,
     pub agent_control: bool,
+    #[serde(default)]
+    pub vnc: bool,
 }
 
 /// `info`: a VM plus what only a running guest or the disk can tell.
@@ -242,6 +249,9 @@ pub struct VmDetails {
     pub addresses: Option<Vec<(String, String)>>,
     /// Host disk space the VM's disk uses (its overlay, not the base).
     pub disk_used_bytes: u64,
+    /// The VNC socket, when VNC is on (it exists while the VM runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vnc_socket: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,9 +326,12 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
     match r {
         List | Host | Images => Gate::Open,
         New { .. } => Gate::Create,
-        Rm { .. } | Pull { .. } | Resume { .. } | SetAgent { .. } | SnapshotDelete { .. } => {
-            Gate::Closed
-        }
+        Rm { .. }
+        | Pull { .. }
+        | Resume { .. }
+        | SetAgent { .. }
+        | SetVnc { .. }
+        | SnapshotDelete { .. } => Gate::Closed,
         Start { name, .. }
         | Stop { name, .. }
         | Exec { name, .. }
@@ -475,6 +488,14 @@ mod tests {
             Gate::Closed
         );
         assert_eq!(agent_gate(&Request::Rm { name: name() }), Gate::Closed);
+        // VNC bypasses agent control and the audit log: humans only.
+        assert_eq!(
+            agent_gate(&Request::SetVnc {
+                name: name(),
+                on: true
+            }),
+            Gate::Closed
+        );
         assert_eq!(
             agent_gate(&Request::SnapshotDelete {
                 name: name(),

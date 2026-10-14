@@ -53,7 +53,12 @@ pub type Rule = (PathBuf, BitFlags<AccessFs>);
 /// The rules for one VM's QEMU. `backing` are the read-only images below
 /// its disk: the base image and, for a `stallo run` clone, the source VM's
 /// disk. All paths must exist when the ruleset is built.
-pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, backing: &[PathBuf]) -> Vec<Rule> {
+pub fn qemu_rules(
+    vm_dir: &Path,
+    rt_dir: &Path,
+    vnc_dir: Option<&Path>,
+    backing: &[PathBuf],
+) -> Vec<Rule> {
     use AccessFs::*;
     let read = ReadFile | ReadDir;
     let rw_file = ReadFile | WriteFile;
@@ -83,6 +88,8 @@ pub fn qemu_rules(vm_dir: &Path, rt_dir: &Path, backing: &[PathBuf]) -> Vec<Rule
         (rt_dir.into(), MakeSock | RemoveFile),
     ]
     .into_iter()
+    // The VNC socket, like the others (`stallo set <vm> --vnc on`).
+    .chain(vnc_dir.map(|d| (d.into(), MakeSock | RemoveFile)))
     .chain(backing.iter().map(|b| (b.clone(), ReadFile.into())))
     // Screendumps overwrite files the daemon created (no new files).
     .chain(
@@ -346,6 +353,7 @@ mod tests {
         let rules = qemu_rules(
             Path::new("/d/vms/dev"),
             Path::new("/r/vms/dev"),
+            None,
             &["/d/images/ubuntu-26.04.qcow2".into()],
         );
         let paths: Vec<&str> = rules.iter().map(|(p, _)| p.to_str().unwrap()).collect();
@@ -361,6 +369,21 @@ mod tests {
                 "{p}"
             );
         }
+        // VNC adds its own socket directory, nothing else.
+        let with_vnc = qemu_rules(
+            Path::new("/d/vms/dev"),
+            Path::new("/r/vms/dev"),
+            Some(Path::new("/r/vnc/dev")),
+            &["/d/images/ubuntu-26.04.qcow2".into()],
+        );
+        let extra: Vec<_> = with_vnc.iter().filter(|r| !rules.contains(r)).collect();
+        assert_eq!(
+            extra,
+            [&(
+                PathBuf::from("/r/vnc/dev"),
+                AccessFs::MakeSock | AccessFs::RemoveFile
+            )]
+        );
         // The VM directory itself is not granted (vm.toml, secret, logs), only
         // its disk files; nothing may execute outside /usr.
         assert!(!paths.contains(&"/d/vms/dev"));
@@ -423,7 +446,7 @@ mod tests {
         fs::write(&img, b"base").unwrap();
         fs::write(own.join("secret"), b"pw").unwrap();
         screen_files(&rt);
-        let rules = qemu_rules(&own, &rt, std::slice::from_ref(&img));
+        let rules = qemu_rules(&own, &rt, None, std::slice::from_ref(&img));
         let q = |p: &Path| format!("'{}'", p.display());
         let disk = |d: &Path| q(&d.join(crate::qemu::DISK));
 
@@ -480,7 +503,12 @@ mod tests {
         assert_eq!(fs::read(other.join(crate::qemu::DISK)).unwrap(), b"x");
 
         // A `stallo run` clone of `other` reads its disk, nothing more.
-        let clone = qemu_rules(&own, &rt, &[img.clone(), other.join(crate::qemu::DISK)]);
+        let clone = qemu_rules(
+            &own,
+            &rt,
+            None,
+            &[img.clone(), other.join(crate::qemu::DISK)],
+        );
         assert_eq!(
             confined(&clone, &format!("cat {}", disk(&other))),
             Some(true)
@@ -548,7 +576,7 @@ assert libc.syscall(250, 0, 0) == -1 and ctypes.get_errno() == 1, "keyctl"
             api = api.display(),
             rt = rt.display()
         );
-        let rules = qemu_rules(&vm, &rt, &[root.join("img")]);
+        let rules = qemu_rules(&vm, &rt, None, &[root.join("img")]);
         if let Some(ok) = confined(&rules, &script) {
             assert!(ok, "a socket, connect or io_uring was allowed");
         }

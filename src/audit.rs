@@ -149,6 +149,7 @@ pub fn describe(r: &Request) -> Described<'_> {
             ("snapshot_delete", Some(name), vec![("tag", len(tag))], None)
         }
         Request::SetAgent { name, on } => ("agent", Some(name), vec![("on", u64::from(*on))], None),
+        Request::SetVnc { name, on } => ("vnc", Some(name), vec![("on", u64::from(*on))], None),
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),
         Request::Pull { .. } => ("pull", None, vec![], None),

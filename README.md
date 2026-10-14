@@ -106,6 +106,21 @@ table with its loader unit. Members of group `stallo` use the API socket
 Install steps, rollback and the lab gate are in
 [docs/production.md](docs/production.md).
 
+## Viewing a VM's screen
+
+`stallo set <vm> --vnc on` gives the VM a VNC server from its next start,
+on a Unix socket only (never TCP): `<runtime>/vnc/<vm>/vnc.sock`, in
+production `/run/stallo/vnc/<vm>/vnc.sock`, for members of group
+`stallo`. From another machine, forward it over SSH and point a VNC
+viewer at `localhost:5901`:
+
+```sh
+ssh -N -L 5901:/run/stallo/vnc/<vm>/vnc.sock <host>
+```
+
+VNC input bypasses agent control and the audit log, so only humans can
+turn it on. `stallo set <vm> --vnc off` removes it at the next start.
+
 ## Agents (MCP)
 
 `stallo mcp` is an MCP server on stdin/stdout. Register it with Claude Code

@@ -31,6 +31,7 @@ pub const SEED: &str = "seed.iso";
 pub const STATES: &str = "states";
 pub const QMP_SOCK: &str = "qmp.sock";
 pub const QGA_SOCK: &str = "qga.sock";
+pub const VNC_SOCK: &str = "vnc.sock";
 /// Screendumps; created by the daemon, written by QEMU.
 pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
 
@@ -43,15 +44,26 @@ pub const MACHINE: &str = "pc-q35-10.2";
 
 /// Builds the QEMU argv (without the program) for `vm`. `net_fd` is QEMU's
 /// end of the passt socketpair: required for the `internet` profile, and
-/// refused for `offline`.
+/// refused for `offline`. `vnc` is the VNC socket: required when `vm.vnc`
+/// is on, and refused otherwise.
 pub fn argv(
     vm: &VmConfig,
     vm_dir: &Path,
     rt_dir: &Path,
     net_fd: Option<RawFd>,
+    vnc: Option<&Path>,
 ) -> Result<Vec<String>> {
     // Names and uuids end up inside option strings; never trust the caller.
     vm.validate()?;
+    ensure!(
+        vm.vnc == vnc.is_some(),
+        "vnc {} with socket {vnc:?}",
+        vm.vnc
+    );
+    // A Unix socket only: VNC has no usable authentication.
+    let vnc = vnc
+        .map(|p| Ok::<_, anyhow::Error>(format!("-vnc unix:{}", opt_path(p)?)))
+        .transpose()?;
     let network = match (vm.net, net_fd) {
         // No NIC means no link ever comes online, and Ubuntu's boot then
         // waits 2 minutes for systemd-networkd-wait-online. An empty
@@ -122,6 +134,7 @@ pub fn argv(
     Ok(args
         .iter()
         .chain(&network)
+        .chain(&vnc)
         .flat_map(|a| a.split(' ').map(str::to_owned))
         .collect())
 }
@@ -188,6 +201,7 @@ mod tests {
             agent_control: false,
             throwaway_of: None,
             forwards: vec![],
+            vnc: false,
         }
     }
 
@@ -198,6 +212,7 @@ mod tests {
             &vm(),
             Path::new("/d/vms/dev"),
             Path::new("/r/vms/dev"),
+            None,
             None,
         )
         .unwrap();
@@ -232,7 +247,7 @@ mod tests {
     /// S4: the security-relevant flags, checked one by one.
     #[test]
     fn security_flags() {
-        let a = argv(&vm(), Path::new("/d"), Path::new("/r"), None).unwrap();
+        let a = argv(&vm(), Path::new("/d"), Path::new("/r"), None, None).unwrap();
         let after = |flag: &str| {
             a.windows(2)
                 .filter(|w| w[0] == flag)
@@ -257,14 +272,14 @@ mod tests {
         assert_eq!(opt_path(Path::new("/a,b/c")).unwrap(), "/a,,b/c");
         assert!(opt_path(Path::new("/a b")).is_err());
         assert!(opt_path(Path::new("/a\nb")).is_err());
-        let a = argv(&vm(), Path::new("/x,y"), Path::new("/r"), None).unwrap();
+        let a = argv(&vm(), Path::new("/x,y"), Path::new("/r"), None, None).unwrap();
         assert!(a.iter().any(|x| x.contains("filename=/x,,y/disk.qcow2,")));
         for name in ["a,b", "a b", "a\nb"] {
             let bad = VmConfig {
                 name: name.into(),
                 ..vm()
             };
-            assert!(argv(&bad, Path::new("/d"), Path::new("/r"), None).is_err());
+            assert!(argv(&bad, Path::new("/d"), Path::new("/r"), None, None).is_err());
         }
     }
 
@@ -276,8 +291,8 @@ mod tests {
             net: NetProfile::Internet,
             ..vm()
         };
-        let a = argv(&inet, Path::new("/d"), Path::new("/r"), Some(9)).unwrap();
-        let offline = argv(&vm(), Path::new("/d"), Path::new("/r"), None).unwrap();
+        let a = argv(&inet, Path::new("/d"), Path::new("/r"), Some(9), None).unwrap();
+        let offline = argv(&vm(), Path::new("/d"), Path::new("/r"), None, None).unwrap();
         let tail = &a[a.len() - 4..];
         assert_eq!(
             tail.join(" "),
@@ -287,7 +302,31 @@ mod tests {
         assert_eq!(a[..a.len() - 4], offline[..offline.len() - 4]);
         assert!(!a.iter().any(|x| x == "-nic" || x.contains(WAIT_ONLINE)));
         // The profile and the socket go together.
-        assert!(argv(&inet, Path::new("/d"), Path::new("/r"), None).is_err());
-        assert!(argv(&vm(), Path::new("/d"), Path::new("/r"), Some(9)).is_err());
+        assert!(argv(&inet, Path::new("/d"), Path::new("/r"), None, None).is_err());
+        assert!(argv(&vm(), Path::new("/d"), Path::new("/r"), Some(9), None).is_err());
+    }
+
+    /// S4: VNC only on a Unix socket, only when the VM asks for it.
+    #[test]
+    fn vnc_on_unix_socket() {
+        let on = VmConfig { vnc: true, ..vm() };
+        let sock = Path::new("/r/vnc/dev/vnc.sock");
+        let a = argv(&on, Path::new("/d"), Path::new("/r"), None, Some(sock)).unwrap();
+        let offline = argv(&vm(), Path::new("/d"), Path::new("/r"), None, None).unwrap();
+        assert_eq!(a[a.len() - 2..], ["-vnc", "unix:/r/vnc/dev/vnc.sock"]);
+        assert_eq!(a[..a.len() - 2], offline[..]);
+        assert!(!a.iter().any(|x| x.contains("tcp:") || x.contains("host=")));
+        assert!(argv(&on, Path::new("/d"), Path::new("/r"), None, None).is_err());
+        assert!(argv(&vm(), Path::new("/d"), Path::new("/r"), None, Some(sock)).is_err());
+        assert!(
+            argv(
+                &on,
+                Path::new("/d"),
+                Path::new("/r"),
+                None,
+                Some(Path::new("/a b"))
+            )
+            .is_err()
+        );
     }
 }

@@ -471,10 +471,12 @@ async fn dispatch(
         Request::Info { name } => {
             let vm = info(m, &m.load(&name)?).await;
             let (addresses, disk_used_bytes) = m.details(&name).await?;
+            let vnc_socket = vm.vnc.then(|| m.paths.vnc_socket(&name));
             json!(api::VmDetails {
                 vm,
                 addresses,
-                disk_used_bytes
+                disk_used_bytes,
+                vnc_socket,
             })
         }
         Request::Reset { name } => {
@@ -541,6 +543,13 @@ async fn dispatch(
             m.set_agent(&name, on).await?;
             Value::Null
         }
+        Request::SetVnc { name, on } => {
+            m.set_vnc(&name, on).await?;
+            json!({
+                "running": m.running(&name).is_some(),
+                "socket": on.then(|| m.paths.vnc_socket(&name)),
+            })
+        }
         Request::Resume { name } => {
             m.resume(&name).await?;
             Value::Null
@@ -598,5 +607,6 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         net: cfg.net,
         forwards: cfg.forwards.clone(),
         agent_control: cfg.agent_control,
+        vnc: cfg.vnc,
     }
 }

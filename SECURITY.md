@@ -49,6 +49,13 @@ and, in production, the separate `stallo` user.
 
 In production the API socket is `/run/stallo/api.sock`, mode `0660`, group
 `stallo`, and the daemon also checks the peer's groups (`SO_PEERGROUPS`).
+VNC (`stallo set <vm> --vnc on`) listens only on a Unix socket in
+`/run/stallo/vnc/<vm>/` (`0660`, group `stallo`; dev mode `0600`), never
+on TCP, and has no password: the socket permissions are the boundary.
+Keyboard and mouse input over VNC is not audited and ignores agent
+control, so agents cannot turn VNC on. QEMU's Landlock ruleset gains only
+that directory (create and remove sockets).
+
 Every member of group `stallo` has the full API, the same as the owner:
 add only trusted users, and agents only through `stallo mcp`.
 

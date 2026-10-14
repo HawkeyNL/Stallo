@@ -102,6 +102,18 @@ impl Paths {
     pub fn vm_runtime_dir(&self, name: &str) -> PathBuf {
         self.vms_runtime_dir().join(name)
     }
+
+    /// `<runtime>/vnc`: one directory per VM with a VNC socket. Kept apart
+    /// from the per-VM runtime dirs, because in production group `stallo`
+    /// may reach these sockets but never QMP or QGA.
+    pub fn vnc_root(&self) -> PathBuf {
+        self.runtime.join("vnc")
+    }
+
+    /// `<runtime>/vnc/<name>/vnc.sock`.
+    pub fn vnc_socket(&self, name: &str) -> PathBuf {
+        self.vnc_root().join(name).join(crate::qemu::VNC_SOCK)
+    }
 }
 
 fn env_dir(var: &str) -> Result<PathBuf> {

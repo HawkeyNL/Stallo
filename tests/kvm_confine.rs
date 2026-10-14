@@ -108,7 +108,7 @@ fn run(base: &Path, runtime: &Path) {
     rt_main.block_on(async {
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]).stdin(Stdio::null()).kill_on_drop(true);
-        let rules = confine::qemu_rules(&own, &rt, std::slice::from_ref(&image));
+        let rules = confine::qemu_rules(&own, &rt, None, std::slice::from_ref(&image));
         confine::confine_on_exec(&mut cmd, confine::build(&rules).unwrap());
         let mut child = cmd.spawn().unwrap();
 

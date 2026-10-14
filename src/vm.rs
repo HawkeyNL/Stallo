@@ -179,12 +179,30 @@ impl Manager {
         })
     }
 
+    /// File modes for what the daemon shares with API users: in production
+    /// group `stallo` (directory, socket), in dev mode nobody else.
+    fn shared_modes(&self) -> (u32, u32) {
+        match self.mode {
+            Mode::Dev => (0o700, 0o600),
+            Mode::Production => (0o750, 0o660),
+        }
+    }
+
+    /// Creates `dir` for API users (see [`Manager::shared_modes`]).
+    fn shared_dir(&self, dir: &Path) -> Result<()> {
+        ensure_private_dir(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(self.shared_modes().0))?;
+        Ok(())
+    }
+
     /// Kills leftovers of an earlier daemon: VM cgroups and runtime dirs,
     /// and the throwaway clones of runs it did not finish.
     pub async fn cleanup_leftovers(&self) -> Result<()> {
         self.cgroups.remove_leftovers().await?;
         safe_remove(&self.paths.runtime, &self.paths.vms_runtime_dir())?;
         ensure_private_dir(&self.paths.vms_runtime_dir())?;
+        safe_remove(&self.paths.runtime, &self.paths.vnc_root())?;
+        self.shared_dir(&self.paths.vnc_root())?;
         ensure_private_dir(&self.paths.vms_dir())?;
         ensure_private_dir(&self.paths.audit_dir())?;
         // Clones of runs that were cut off, also half-made ones.
@@ -311,6 +329,7 @@ impl Manager {
             agent_control: new.agent_control,
             throwaway_of: None,
             forwards: new.forwards.clone(),
+            vnc: false,
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
@@ -413,7 +432,13 @@ impl Manager {
             NetProfile::Offline => None,
         };
         let qemu_fd = link.as_ref().map(|(_, q)| q.as_raw_fd());
-        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd)?;
+        let vnc_dir = self.paths.vnc_root().join(name);
+        safe_remove(&self.paths.runtime, &vnc_dir)?;
+        if cfg.vnc {
+            self.shared_dir(&vnc_dir)?;
+        }
+        let vnc = cfg.vnc.then(|| self.paths.vnc_socket(name));
+        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd, vnc.as_deref())?;
         if paused {
             argv.push("-S".to_owned());
         }
@@ -443,6 +468,7 @@ impl Manager {
                 // Best effort: the error that matters is `e`.
                 let _ = self.cgroups.remove_vm(name).await;
                 let _ = safe_remove(&self.paths.runtime, &rt_dir);
+                let _ = safe_remove(&self.paths.runtime, &vnc_dir);
                 Err(e)
             }
         }
@@ -515,7 +541,8 @@ impl Manager {
         if let Some(source) = &cfg.throwaway_of {
             backing.push(self.paths.vm_dir(source).join(qemu::DISK));
         }
-        let rules = confine::qemu_rules(&vm_dir, &rt_dir, &backing);
+        let vnc_dir = cfg.vnc.then(|| self.paths.vnc_root().join(name));
+        let rules = confine::qemu_rules(&vm_dir, &rt_dir, vnc_dir.as_deref(), &backing);
         confine::confine_on_exec(&mut cmd, confine::build(&rules)?);
         let mut child = cmd.spawn().context("cannot start QEMU")?;
         // Closes our copy of QEMU's socket end, so passt sees QEMU exit.
@@ -532,6 +559,17 @@ impl Manager {
                 return Err(e.context(format!("QEMU did not start; see {}", log_path.display())));
             }
         };
+        // QEMU created the VNC socket before it answered QMP; it carries
+        // QEMU's umask, so open it to API users here.
+        if cfg.vnc {
+            let sock = self.paths.vnc_socket(name);
+            let mode = fs::Permissions::from_mode(self.shared_modes().1);
+            if let Err(e) = fs::set_permissions(&sock, mode) {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(anyhow::Error::from(e).context("cannot share the VNC socket"));
+            }
+        }
         // passt checks its arguments at once; by the time QMP answers, a
         // passt that refused them has exited. The isolation is checked
         // again too: the table may have gone since `check_net`, and the
@@ -665,6 +703,19 @@ impl Manager {
         cfg.save(&self.paths.vm_dir(name))
     }
 
+    /// Turns the VNC socket on or off; it takes effect at the next start.
+    pub async fn set_vnc(&self, name: &str, on: bool) -> Result<()> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; it has no VNC"
+        );
+        cfg.vnc = on;
+        cfg.save(&self.paths.vm_dir(name))
+    }
+
     /// Continues a paused VM, unless the disk is still below the floor.
     pub async fn resume(&self, name: &str) -> Result<()> {
         self.check_exists(name)?;
@@ -727,6 +778,9 @@ impl Manager {
         }
         if let Err(e) = safe_remove(&self.paths.runtime, &self.paths.vm_runtime_dir(&name)) {
             tracing::error!("{name}: runtime dir cleanup failed: {e:#}");
+        }
+        if let Err(e) = safe_remove(&self.paths.runtime, &self.paths.vnc_root().join(&name)) {
+            tracing::error!("{name}: VNC dir cleanup failed: {e:#}");
         }
         self.running.lock().unwrap().remove(&name);
         let _ = tx.send(true);
@@ -1662,6 +1716,7 @@ mod tests {
                 agent_control: false,
                 throwaway_of: None,
                 forwards: vec![],
+                vnc: false,
             },
             pid: 0,
             qmp,

@@ -104,6 +104,10 @@ pub struct VmConfig {
     /// profile only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<PortForward>,
+    /// A VNC server on a Unix socket (`<runtime>/vnc/<name>/vnc.sock`) for
+    /// humans, from the next start. Never on TCP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vnc: bool,
 }
 
 /// One TCP port forward: `bind:host` on the host to `guest` in the guest.
@@ -435,6 +439,7 @@ mod tests {
             agent_control: false,
             throwaway_of: None,
             forwards: vec![],
+            vnc: false,
         }
     }
 
