@@ -143,6 +143,16 @@ vm_checks() {
 	check "S4: no -vnc" sh -c "! echo '$argv' | grep -q -- '-vnc'"
 	check "S4: QEMU has NoNewPrivs and seccomp" sh -c "grep -q '^NoNewPrivs:	1' /proc/$pid/status && grep -q '^Seccomp:	2' /proc/$pid/status"
 
+	echo "== M5-3: QEMU AppArmor profile"
+	# Changing profile from unconfined as a non-root user stacks it on
+	# `unconfined`; the effective rules are the profile's.
+	check "QEMU runs under stallo-qemu (enforce)" grep -qxE 'stallo-qemu(//&unconfined)? \(enforce\)' /proc/"$pid"/attr/apparmor/current
+	stallo stop box >/dev/null
+	apparmor_parser -R /etc/apparmor.d/stallo-qemu
+	refused "start refused without the profile" "AppArmor profile stallo-qemu" stallo start box
+	apparmor_parser -r -W /etc/apparmor.d/stallo-qemu
+	check "start with the profile loaded again" stallo start box
+
 	echo "== S7: names and tags"
 	refused "S7: bad VM name" "invalid VM name" stallo new 'Bad!' --cpus 1 --mem 1G
 	refused "S7: bad snapshot tag" "invalid snapshot name" stallo snap box 'bad tag!'
@@ -269,6 +279,8 @@ all)
 	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" net
 	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" checks || fails=$((fails + 1))
 	lifecycle
+	echo "== AppArmor denials for QEMU during the whole gate"
+	check "no stallo-qemu denials" sh -c '! journalctl -k --no-pager | grep "apparmor=\"DENIED\"" | grep -q "profile=\"stallo-qemu\""'
 	;;
 *) echo "usage: $0 [all|install|service|vm|net|lifecycle]"; exit 2 ;;
 esac

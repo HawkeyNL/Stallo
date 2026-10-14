@@ -17,9 +17,10 @@ a release build with `dpkg-deb` (no root, no extra tools).
 | `/usr/bin/stallo`, `/usr/bin/stallod` | the CLI and the daemon |
 | `/usr/lib/systemd/system/stallod.service` | the daemon (`packaging/stallod.service`) |
 | `/usr/lib/systemd/system/stallo-nft.service` | loads the network table at boot (`packaging/stallo-nft.service`) |
+| `/etc/apparmor.d/stallo-qemu` | QEMU's AppArmor profile (`packaging/apparmor/stallo-qemu`), a conffile |
 | `/etc/stallo/stallo.nft` | the table (`packaging/stallo.nft`), a conffile: local edits such as a LAN IPv6 prefix in `deny6` survive upgrades |
 
-**Depends:** `nftables`, `passt`, `qemu-system-x86 (>= 1:10.2)`,
+**Depends:** `apparmor`, `nftables`, `passt`, `qemu-system-x86 (>= 1:10.2)`,
 `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
 `ubuntu-cloudimage-keyring`, `passwd` (`useradd`), and `systemd (>= 257)`
 (older versions ignore `ProtectControlGroups=private`).
@@ -38,13 +39,14 @@ a release build with `dpkg-deb` (no root, no extra tools).
     (`SupplementaryGroups=kvm`).
   - Enables both units on first install, and keeps the owner's choice on
     upgrades.
-  - Loads the table (`restart stallo-nft`), then starts `stallod`. It
+  - Loads QEMU's AppArmor profile (if AppArmor is enabled), the table
+    (`restart stallo-nft`), then starts `stallod`. It
     does the same when dpkg rolls a failed upgrade back
     (`abort-upgrade`), so the daemon that prerm stopped comes back.
 - **prerm:** stops `stallod`. **That stops every VM**, on upgrade and
   removal alike: VMs live in the daemon's cgroup.
-- **postrm remove:** deletes the table (nothing runs as `stallo` any more)
-  and masks the units, as debhelper does.
+- **postrm remove:** deletes the table (nothing runs as `stallo` any more),
+  unloads QEMU's AppArmor profile, and masks the units, as debhelper does.
   - It never deletes VMs, images, `/var/lib/stallo` or the user, not even
     on purge. The steps below remove them by hand.
 
@@ -134,10 +136,28 @@ gate.
   and works unchanged: it gets its socket with `--fd`.
   - The only denial is passt's syslog socket, as in M3; passt logs to
     stderr instead.
-- **QEMU:** unconfined by AppArmor. It is confined by Landlock and seccomp
-  (`src/confine.rs`); a dedicated profile is M5-3.
+- **QEMU (M5-3):** the package ships the profile `stallo-qemu`
+  (`/etc/apparmor.d/stallo-qemu`, a conffile; `packaging/apparmor/`) and
+  postinst loads it.
+  - In production the daemon makes every QEMU enter it at exec
+    (`/proc/self/attr/apparmor/exec`, as `aa_change_onexec` does).
+  - After QMP answers, it checks QEMU's label and kills the VM unless it is
+    `stallo-qemu (enforce)`. **Without the profile, VMs do not start**
+    (fail closed); the gate tests that.
+  - As user `stallo` (unconfined, not root) the kernel stacks the profile
+    on `unconfined`: the label reads `stallo-qemu//&unconfined (enforce)`,
+    and the rules in force are the profile's. Both forms are accepted.
+  - The profile allows Stallo's files below `/var/lib/stallo` and
+    `/run/stallo`, `/usr/share/{qemu,seabios,OVMF}`, `/dev/kvm` and Unix
+    sockets. It denies the network, capabilities, ptrace and mount.
+    - It covers all VMs; the per-VM Landlock ruleset still narrows each
+      QEMU to its own files.
+  - **No `stallo-qemu` denial** was logged during the whole gate, which
+    includes VNC, port forwards and RAM snapshots.
+  - Dev mode does not use the profile: its paths are under `$HOME`, and
+    loading a profile needs root.
 - **swtpm:** not used before M4 (Windows).
-- So **no AppArmor override is needed** and the package ships none.
+- **No override of Ubuntu's profiles is needed.**
 
 ## M5 gate (lab VM)
 
@@ -159,7 +179,8 @@ script, it refuses to run without `/etc/stallo-lab` and outside a VM.
 - The host only ran this one offline VM.
 
 **Result: all 114 checks passed** in a freshly installed lab VM, with
-the package built from this branch.
+the package built from this branch. With VNC (M5-4) and the QEMU AppArmor
+profile (M5-3) on top, the same gate grew to **127 checks, all passed**.
 
 | Check | Result |
 |---|---|
@@ -180,6 +201,7 @@ the package built from this branch.
 | S16: `secret` `0600`; not in `stallo info`, not in MCP `vm_info` | PASS |
 | S14, S15: `m3-network.sh` against the packaged daemon (47 checks, including the 13 positive controls, port forwards, RAM snapshot with passt, the table removed at runtime) | PASS |
 | VNC (M5-4, run with #34 in the 127-check gate): `/run/stallo/vnc/<vm>/vnc.sock` `0660` in a `0750` dir; a group member gets the RFB greeting, a non-member cannot connect; QEMU has `-vnc unix:` only and no TCP/UDP socket; an MCP `set_vnc` is refused; stop removes the dir; `--vnc off` removes `-vnc` | PASS |
+| AppArmor (M5-3): QEMU runs as `stallo-qemu//&unconfined (enforce)`; with the profile unloaded a start is refused; it starts again after a reload; no `stallo-qemu` denial in the kernel log for the whole gate | PASS |
 | Stop with a running VM: the guest powers off over ACPI (3.5 s), QEMU gets no signal, no process of `stallo` is left | PASS |
 | Upgrade (`--reinstall`): VMs stopped, daemon back, table loaded | PASS |
 | `apt remove`: no process left, table deleted, VM data and user kept; reinstall brings everything back | PASS |
@@ -252,10 +274,12 @@ rollbacks in reverse order.
    - `sudo apt install ./target/deb/stallo_0.1.0_amd64.deb`
      - This also installs `passt` and `ubuntu-cloudimage-keyring`; the
        other dependencies are already installed.
-   - What it does: creates user and group `stallo`, loads the table,
-     enables and starts `stallo-nft.service` and `stallod.service`.
+   - What it does: creates user and group `stallo`, loads the table and
+     QEMU's AppArmor profile, enables and starts `stallo-nft.service` and
+     `stallod.service`.
    - Rollback: `sudo apt remove stallo`
-     - It stops the daemon (and every VM) and deletes the table.
+     - It stops the daemon (and every VM), deletes the table and unloads
+       the AppArmor profile.
      - It keeps `/var/lib/stallo` and the user (step 6).
      - `sudo apt remove passt ubuntu-cloudimage-keyring` removes the two
        new dependencies, if nothing else needs them.

@@ -32,7 +32,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
     Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
@@ -274,6 +274,52 @@ fn filter() -> Vec<sock_filter> {
     f
 }
 
+/// The AppArmor profile of QEMU in production mode
+/// (`packaging/apparmor/stallo-qemu`).
+pub const QEMU_PROFILE: &str = "stallo-qemu";
+
+/// Makes `cmd` enter the [`QEMU_PROFILE`] AppArmor profile at `exec`
+/// (what libapparmor's `aa_change_onexec` does). The spawn fails if the
+/// profile is not loaded. Register it before [`confine_on_exec`], whose
+/// Landlock ruleset denies `/proc`.
+pub fn apparmor_on_exec(cmd: &mut Command) {
+    // SAFETY: the closure runs in the forked child before exec. It only makes
+    // raw syscalls through rustix (open, write, close) on static data, with
+    // no allocation, locking or logging.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let attr = rustix::fs::open(
+                c"/proc/self/attr/apparmor/exec",
+                rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            rustix::io::write(&attr, b"exec stallo-qemu")?;
+            Ok(())
+        });
+    }
+}
+
+/// Checks that process `pid` runs under the enforced [`QEMU_PROFILE`];
+/// anything else is an error (fail closed).
+pub fn check_qemu_profile(pid: u32) -> Result<()> {
+    let label = std::fs::read_to_string(format!("/proc/{pid}/attr/apparmor/current"))
+        .context("cannot read QEMU's AppArmor label")?;
+    ensure!(
+        is_qemu_label(label.trim_end()),
+        "QEMU runs as {:?}, not under the AppArmor profile {QEMU_PROFILE} in enforce mode",
+        label.trim_end()
+    );
+    Ok(())
+}
+
+/// An unprivileged, unconfined process that changes profile gets the
+/// profile stacked on `unconfined` (lab, Ubuntu 26.04); the intersection
+/// is the profile itself.
+fn is_qemu_label(label: &str) -> bool {
+    label == "stallo-qemu (enforce)" || label == "stallo-qemu//&unconfined (enforce)"
+}
+
 /// Makes `cmd` confine itself right before `exec`: first the Landlock
 /// `ruleset` (which also sets `no_new_privs`), then the seccomp filter.
 /// Register it after every other `pre_exec` hook: those still open files
@@ -391,6 +437,22 @@ mod tests {
             if access.contains(AccessFs::Execute) {
                 assert_eq!(p, Path::new("/usr"));
             }
+        }
+    }
+
+    #[test]
+    fn qemu_label() {
+        assert!(is_qemu_label("stallo-qemu (enforce)"));
+        assert!(is_qemu_label("stallo-qemu//&unconfined (enforce)"));
+        for bad in [
+            "unconfined",
+            "stallo-qemu (complain)",
+            "stallo-qemu//&unconfined (complain)",
+            "stallo-qemu//&other (enforce)",
+            "other (enforce)",
+            "",
+        ] {
+            assert!(!is_qemu_label(bad), "{bad}");
         }
     }
 

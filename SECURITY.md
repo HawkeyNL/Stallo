@@ -31,6 +31,11 @@ into QEMU therefore cannot open other VMs' disks or sockets, the daemon's
 socket, cgroup files or the user's home. VMs do not start on kernels
 without Landlock ABI 6 (Linux 6.12).
 
+In production, QEMU also runs under the AppArmor profile `stallo-qemu`
+(`packaging/apparmor/`): Stallo's own files only, no network, no
+capabilities. The daemon checks QEMU's label after each start and refuses
+to run a VM that is not confined by it.
+
 ## Agent policy
 
 Agents reach Stallo through `stallo mcp`, which marks its requests

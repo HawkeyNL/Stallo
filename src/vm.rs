@@ -537,6 +537,11 @@ impl Manager {
         if let Some(fd) = qemu_end {
             net::inherit_on_exec(&mut cmd, fd);
         }
+        // Production only: the profile is installed by the package and
+        // names the production paths.
+        if self.mode == Mode::Production {
+            confine::apparmor_on_exec(&mut cmd);
+        }
         let mut backing = vec![images::image_path(&self.paths, &cfg.image)];
         if let Some(source) = &cfg.throwaway_of {
             backing.push(self.paths.vm_dir(source).join(qemu::DISK));
@@ -544,7 +549,13 @@ impl Manager {
         let vnc_dir = cfg.vnc.then(|| self.paths.vnc_root().join(name));
         let rules = confine::qemu_rules(&vm_dir, &rt_dir, vnc_dir.as_deref(), &backing);
         confine::confine_on_exec(&mut cmd, confine::build(&rules)?);
-        let mut child = cmd.spawn().context("cannot start QEMU")?;
+        let mut child = cmd.spawn().with_context(|| match self.mode {
+            Mode::Production => format!(
+                "cannot start QEMU (is the AppArmor profile {} loaded?)",
+                confine::QEMU_PROFILE
+            ),
+            Mode::Dev => "cannot start QEMU".to_owned(),
+        })?;
         // Closes our copy of QEMU's socket end, so passt sees QEMU exit.
         drop(cmd);
         let pid = child
@@ -559,6 +570,15 @@ impl Manager {
                 return Err(e.context(format!("QEMU did not start; see {}", log_path.display())));
             }
         };
+        // Fail closed if QEMU is not confined as asked (profile in complain
+        // mode, or replaced by an unconfined one).
+        if self.mode == Mode::Production
+            && let Err(e) = confine::check_qemu_profile(pid)
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(e);
+        }
         // QEMU created the VNC socket before it answered QMP; it carries
         // QEMU's umask, so open it to API users here.
         if cfg.vnc {
