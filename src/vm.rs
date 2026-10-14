@@ -439,7 +439,11 @@ impl Manager {
         }
         let vnc = cfg.vnc.then(|| self.paths.vnc_socket(name));
         let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd, vnc.as_deref())?;
-        if paused {
+        // Production: the guest's CPUs wait until the spawn checks (AppArmor
+        // label, VNC socket, passt) have passed, so no guest code runs in
+        // a QEMU that is about to be refused.
+        let hold = paused || self.mode == Mode::Production;
+        if hold {
             argv.push("-S".to_owned());
         }
 
@@ -463,6 +467,14 @@ impl Manager {
             }
         }
         match self.spawn(&cfg, &argv, link).await {
+            Ok(running) if hold && !paused => match running.qmp.execute("cont", None).await {
+                Ok(_) => Ok(running),
+                Err(e) => {
+                    // The reaper (`watch`) cleans up after the kill.
+                    let _ = self.cgroups.kill_vm(name);
+                    Err(e.context("cannot start the guest's CPUs"))
+                }
+            },
             Ok(running) => Ok(running),
             Err(e) => {
                 // Best effort: the error that matters is `e`.
@@ -867,6 +879,22 @@ impl Manager {
             "{name} did not exit after kill"
         );
         Ok(())
+    }
+
+    /// Production: kills every VM whose QEMU is no longer confined by its
+    /// AppArmor profile (e.g. the profile was reloaded in complain mode).
+    pub fn check_confinement(&self) {
+        if self.mode != Mode::Production {
+            return;
+        }
+        for vm in self.all_running() {
+            if let Err(e) = confine::check_qemu_profile(vm.pid) {
+                tracing::error!("{}: {e:#}; killing it", vm.config.name);
+                if let Err(e) = self.cgroups.kill_vm(&vm.config.name) {
+                    tracing::error!("{}: {e:#}", vm.config.name);
+                }
+            }
+        }
     }
 
     /// Kills every VM that still runs (its whole cgroup), without waiting.

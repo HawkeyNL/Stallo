@@ -140,22 +140,33 @@ gate.
   (`/etc/apparmor.d/stallo-qemu`, a conffile; `packaging/apparmor/`) and
   postinst loads it.
   - In production the daemon makes every QEMU enter it at exec
-    (`/proc/self/attr/apparmor/exec`, as `aa_change_onexec` does).
+    (`/proc/self/attr/apparmor/exec`, as `aa_change_onexec` does). The
+    guest's CPUs stay stopped (`-S`) until the checks below pass.
   - After QMP answers, it checks QEMU's label and kills the VM unless it is
-    `stallo-qemu (enforce)`. **Without the profile, VMs do not start**
-    (fail closed); the gate tests that.
-  - As user `stallo` (unconfined, not root) the kernel stacks the profile
-    on `unconfined`: the label reads `stallo-qemu//&unconfined (enforce)`,
-    and the rules in force are the profile's. Both forms are accepted.
-  - The profile allows Stallo's files below `/var/lib/stallo` and
-    `/run/stallo`, `/usr/share/{qemu,seabios,OVMF}`, `/dev/kvm` and Unix
-    sockets. It denies the network, capabilities, ptrace and mount.
-    - It covers all VMs; the per-VM Landlock ruleset still narrows each
-      QEMU to its own files.
+    the profile in enforce mode. It checks again every 10 s (with the disk
+    watchdog), so a profile reloaded in complain mode kills the VMs.
+    **Without the profile, VMs do not start** (fail closed); the gate
+    tests that.
+  - Started by user `stallo`, the profile is stacked on `unconfined`: the
+    label reads `stallo-qemu//&unconfined (enforce)`, and the rules in
+    force are the profile's. Measured in the lab: as root the label is
+    plain `stallo-qemu (enforce)` with or without `no_new_privs`; as user
+    `stallo` it is stacked either way. Both forms are accepted.
+  - The profile allows Stallo's **files** below `/var/lib/stallo` and
+    `/run/stallo`, `/usr/share/{qemu,seabios,OVMF}` and `/dev/kvm`. It
+    denies, and logs (`audit deny`), the network, capabilities, ptrace,
+    mount, `connect` on Unix sockets and binding abstract ones.
+  - It is one profile for all VMs. At the AppArmor layer a QEMU could
+    still reach another VM's sockets and signal its QEMU; the per-VM
+    Landlock ruleset (files, signals) and the seccomp filter (`connect`)
+    stop that.
   - **No `stallo-qemu` denial** was logged during the whole gate, which
     includes VNC, port forwards and RAM snapshots.
   - Dev mode does not use the profile: its paths are under `$HOME`, and
     loading a profile needs root.
+  - Removing the package unloads the profile; the conffile stays until
+    purge, so `apparmor.service` loads it again at boot (harmless: it
+    attaches to nothing by itself).
 - **swtpm:** not used before M4 (Windows).
 - **No override of Ubuntu's profiles is needed.**
 

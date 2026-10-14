@@ -294,7 +294,10 @@ pub fn apparmor_on_exec(cmd: &mut Command) {
                 rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )?;
-            rustix::io::write(&attr, b"exec stallo-qemu")?;
+            const CMD: &[u8] = b"exec stallo-qemu";
+            if rustix::io::write(&attr, CMD)? != CMD.len() {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
             Ok(())
         });
     }

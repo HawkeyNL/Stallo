@@ -33,8 +33,10 @@ without Landlock ABI 6 (Linux 6.12).
 
 In production, QEMU also runs under the AppArmor profile `stallo-qemu`
 (`packaging/apparmor/`): Stallo's own files only, no network, no
-capabilities. The daemon checks QEMU's label after each start and refuses
-to run a VM that is not confined by it.
+capabilities. The daemon checks QEMU's label before the guest's CPUs
+start and every 10 s after, and kills a VM that is not confined by it.
+The profile is shared by all VMs; keeping one VM's QEMU away from
+another's stays the job of Landlock and seccomp.
 
 ## Agent policy
 

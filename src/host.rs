@@ -178,6 +178,7 @@ pub async fn watchdog(manager: Arc<Manager>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        manager.check_confinement();
         let floor = manager.config.host.disk_floor_gib;
         let free = match disk_free(&manager.paths.data) {
             Ok(f) => f,

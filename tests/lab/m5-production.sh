@@ -149,7 +149,7 @@ vm_checks() {
 	check "QEMU runs under stallo-qemu (enforce)" grep -qxE 'stallo-qemu(//&unconfined)? \(enforce\)' /proc/"$pid"/attr/apparmor/current
 	stallo stop box >/dev/null
 	apparmor_parser -R /etc/apparmor.d/stallo-qemu
-	refused "start refused without the profile" "AppArmor profile stallo-qemu" stallo start box
+	refused "start refused without the profile (exec refused)" "cannot start QEMU (is the AppArmor profile stallo-qemu loaded?)" stallo start box
 	apparmor_parser -r -W /etc/apparmor.d/stallo-qemu
 	check "start with the profile loaded again" stallo start box
 
@@ -280,7 +280,9 @@ all)
 	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" checks || fails=$((fails + 1))
 	lifecycle
 	echo "== AppArmor denials for QEMU during the whole gate"
-	check "no stallo-qemu denials" sh -c '! journalctl -k --no-pager | grep "apparmor=\"DENIED\"" | grep -q "profile=\"stallo-qemu\""'
+	# The profile's deny rules are `audit deny`, so attempts are logged too.
+	# Stacked labels log as stallo-qemu//&unconfined: no closing quote.
+	check "no stallo-qemu denials (kernel log, audit log)" sh -c '! { journalctl -k --no-pager; cat /var/log/audit/audit.log 2>/dev/null; } | grep "apparmor=\"DENIED\"" | grep -q "profile=\"stallo-qemu"'
 	;;
 *) echo "usage: $0 [all|install|service|vm|net|lifecycle]"; exit 2 ;;
 esac

@@ -24,7 +24,7 @@ Architecture: amd64
 Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
 Section: admin
 Priority: optional
-Depends: libc6, passwd, systemd (>= 257), apparmor, nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring
 Description: Agent-first VM manager (QEMU/KVM)
  stallod runs VMs as the system user stallo with per-VM cgroup limits;
  stallo is its CLI and MCP server. The internet network profile is
