@@ -24,6 +24,10 @@ IOWeight=50
 # the daemon exits or at the timeout.
 KillMode=mixed
 TimeoutStopSec=120
+# A crash kills the VMs with the cgroup; bring the API back (VMs stay
+# stopped until started again).
+Restart=on-failure
+RestartSec=5s
 
 StateDirectory=stallo
 StateDirectoryMode=0700

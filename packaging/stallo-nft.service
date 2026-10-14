@@ -2,6 +2,10 @@
 Description=Stallo network isolation table
 Documentation=https://github.com/HawkeyNL/Stallo
 After=nftables.service
+# nftables.service flushes the whole ruleset on stop, restart and reload;
+# load this table again after it (a stop leaves it gone: fail closed).
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
 
 [Service]
 Type=oneshot

@@ -33,6 +33,8 @@ use tokio::net::unix::UCred;
 
 /// Most API connections served at once.
 const MAX_CONNECTIONS: usize = 64;
+/// How long a shutdown waits for the VMs to power off before killing them.
+const STOP_ALL_TIMEOUT: Duration = Duration::from_secs(80);
 
 #[derive(Parser)]
 #[command(version, about = "Stallo daemon: owns VMs, serves the stallo API")]
@@ -179,7 +181,16 @@ async fn serve(paths: Paths, config: DaemonConfig, cgroups: Cgroups, mode: Mode)
     if drained.is_err() {
         tracing::warn!("requests still running after 30 s; stopping VMs anyway");
     }
-    manager.stop_all().await;
+    // Within systemd's TimeoutStopSec=120 (30 s above + 80 s): a VM whose
+    // lifecycle lock is held (snapshot job, `stallo run`) is killed here
+    // rather than by systemd at the timeout.
+    if tokio::time::timeout(STOP_ALL_TIMEOUT, manager.stop_all())
+        .await
+        .is_err()
+    {
+        tracing::warn!("VMs still running after {STOP_ALL_TIMEOUT:?}; killing them");
+    }
+    manager.kill_all();
     Ok(())
 }
 

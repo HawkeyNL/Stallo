@@ -87,6 +87,13 @@ service_checks() {
 	check "daemon has no capabilities" grep -q '^CapEff:	0000000000000000$' /proc/"$pid"/status
 	check "daemon has NoNewPrivs" grep -q '^NoNewPrivs:	1$' /proc/"$pid"/status
 	check "daemon cgroup is delegated (cpu memory pids)" sh -c "[ \"\$(cat $CG/cgroup.subtree_control)\" = 'cpu memory pids' ]"
+	# nftables.service runs `flush ruleset` on start, restart and reload.
+	systemctl restart nftables
+	check "table reloaded after an nftables restart" nft list table inet stallo
+	systemctl reload nftables
+	check "table reloaded after an nftables reload" nft list table inet stallo
+	systemctl stop nftables
+	systemctl restart stallo-nft
 	# ProtectControlGroups=private: a cgroup namespace rooted at the unit.
 	check "daemon's cgroup namespace is rooted at the unit" sh -c "nsenter -t $pid -C cat /proc/$pid/cgroup | grep -qx '0::/daemon'"
 	check "daemon's /sys/fs/cgroup shows only its subtree" sh -c "nsenter -t $pid -m test -d /sys/fs/cgroup/daemon && ! nsenter -t $pid -m test -e /sys/fs/cgroup/system.slice"
@@ -113,7 +120,14 @@ vm_checks() {
 	check "S2: /run/stallo is 0750" sh -c '[ "$(stat -c %a /run/stallo)" = 750 ]'
 	check "S2: group member (supplementary) may use the API" as labuser stallo ls
 	refused "S2: non-member is refused" "ermission denied" as outsider stallo --socket /run/stallo/api.sock ls
-	check "S2: non-member does not get the production socket by default" sh -c '! runuser -u outsider -- stallo ls'
+	refused "S2: non-member does not get the production socket by default" "XDG_RUNTIME_DIR" as outsider stallo ls
+	# Past the file permissions: the daemon's own group check must refuse.
+	setfacl -m u:outsider:x /run/stallo
+	setfacl -m u:outsider:rw /run/stallo/api.sock
+	since=$(date '+%Y-%m-%d %H:%M:%S')
+	refused "S2: daemon refuses a non-member that can reach the socket" "without an answer" as outsider stallo --socket /run/stallo/api.sock ls
+	check "S2: the refusal is logged" sh -c "journalctl -u stallod --no-pager --since '$since' | grep -q 'refused API peer uid $(id -u outsider)'"
+	setfacl -b /run/stallo/api.sock /run/stallo
 
 	echo "== S3: per-VM runtime dir"
 	check "S3: vms/box is 0700 stallo" sh -c '[ "$(stat -c "%a %U" /run/stallo/vms/box)" = "700 stallo" ]'
@@ -139,7 +153,7 @@ vm_checks() {
 	echo "== S16: secrets"
 	check "S16: secret is 0600 stallo" sh -c '[ "$(stat -c "%a %U" /var/lib/stallo/vms/box/secret)" = "600 stallo" ]'
 	secret=$(cat /var/lib/stallo/vms/box/secret)
-	check "S16: info does not contain the secret" sh -c "! stallo info box --json | grep -qF '$secret'"
+	check "S16: ls --json does not contain the secret" sh -c "stallo --json ls | grep -q '\"box\"' && ! stallo --json ls | grep -qF '$secret'"
 	stallo agent box on
 	r=$(mcp labuser vm_info '{"vm":"box"}')
 	check "S16: MCP vm_info does not contain the secret" sh -c "echo '$r' | grep -q '\"result\"' && ! echo '$r' | grep -qF '$secret'"
@@ -149,7 +163,7 @@ vm_checks() {
 	t0=$(date +%s)
 	refused "S11: exec timeout" "timed out" stallo exec --timeout 2 box -- sleep 60
 	check "S11: timeout took < 10 s" sh -c "[ \$(( \$(date +%s) - $t0 )) -lt 10 ]"
-	check "S11: the guest process was killed" sh -c '! stallo exec box -- pgrep -x sleep'
+	check "S11: the guest process was killed" stallo exec box -- sh -c '! pgrep -x sleep'
 	check "S11: output is capped" sh -c 'stallo exec box -- head -c 3000000 /dev/zero 2>&1 >/dev/null | grep -q "output truncated"'
 
 	echo "== S12: admission and limits"

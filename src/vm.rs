@@ -789,6 +789,15 @@ impl Manager {
         Ok(())
     }
 
+    /// Kills every VM that still runs (its whole cgroup), without waiting.
+    pub fn kill_all(&self) {
+        for vm in self.all_running() {
+            if let Err(e) = self.cgroups.kill_vm(&vm.config.name) {
+                tracing::error!("{}: {e:#}", vm.config.name);
+            }
+        }
+    }
+
     /// Stops every running VM, gracefully and in parallel.
     pub async fn stop_all(self: &Arc<Self>) {
         let names: Vec<String> = self.running.lock().unwrap().keys().cloned().collect();

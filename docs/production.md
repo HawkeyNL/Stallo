@@ -21,7 +21,8 @@ a release build with `dpkg-deb` (no root, no extra tools).
 
 **Depends:** `nftables`, `passt`, `qemu-system-x86 (>= 1:10.2)`,
 `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
-`ubuntu-cloudimage-keyring`, `systemd`.
+`ubuntu-cloudimage-keyring`, `passwd` (`useradd`), and `systemd (>= 257)`
+(older versions ignore `ProtectControlGroups=private`).
 
 **Maintainer scripts:**
 
@@ -30,11 +31,16 @@ a release build with `dpkg-deb` (no root, no extra tools).
     `/var/lib/stallo`, shell `nologin`) if it does not exist.
   - Refuses to continue if `stallo` exists but is a human account
     (uid 0 or ≥ 1000): the table and the daemon would then apply to it.
+  - Refuses to continue if a group `stallo` exists without the user: its
+    members would get the full API. At the end it prints the group's
+    members.
   - The user is not added to group `kvm`; the unit grants `/dev/kvm`
     (`SupplementaryGroups=kvm`).
   - Enables both units on first install, and keeps the owner's choice on
     upgrades.
-  - Loads the table (`restart stallo-nft`), then starts `stallod`.
+  - Loads the table (`restart stallo-nft`), then starts `stallod`. It
+    does the same when dpkg rolls a failed upgrade back
+    (`abort-upgrade`), so the daemon that prerm stopped comes back.
 - **prerm:** stops `stallod`. **That stops every VM**, on upgrade and
   removal alike: VMs live in the daemon's cgroup.
 - **postrm remove:** deletes the table (nothing runs as `stallo` any more)
@@ -71,6 +77,7 @@ gate.
 | `Delegate=cpu memory pids` | the daemon writes the VM cgroups itself |
 | `CPUWeight=50`, `IOWeight=50` | host services win under contention |
 | `KillMode=mixed`, `TimeoutStopSec=120` | stopping the unit powers every VM off, see below |
+| `Restart=on-failure`, `RestartSec=5s` | a crashed daemon comes back; its VMs died with it and stay stopped |
 | `StateDirectory=` (0700), `RuntimeDirectory=` (0750), `UMask=0027` | see API access |
 | `NoNewPrivileges`, `CapabilityBoundingSet=` (empty) | no privileges at all |
 | `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp` | writes only to its own directories |
@@ -105,10 +112,12 @@ gate.
     them down.
   - With `mixed`, only the daemon gets SIGTERM. A booted guest powered
     off over ACPI in 3.3 s, and QEMU logged no signal.
-  - The daemon's stop takes at most 110 s (30 s for requests in flight,
-    60 s for the ACPI power-off, then `quit` and `cgroup.kill`), inside
-    `TimeoutStopSec=120`. systemd kills whatever is left when the daemon
-    exits.
+  - The daemon's stop takes at most 110 s, inside `TimeoutStopSec=120`:
+    up to 30 s for requests in flight, then up to 80 s for the VMs (ACPI
+    power-off for 60 s, then `quit`, then `cgroup.kill`). A VM whose
+    lifecycle lock stays held (a long snapshot job, `stallo run`) is
+    killed when the 80 s run out. systemd kills whatever is left when
+    the daemon exits.
 - **`seccomp` and `landlock_*`** are not in `@system-service`, and the
   daemon needs them to confine every QEMU (`src/confine.rs`).
 - **`MemoryDenyWriteExecute`** is inherited by QEMU and passt: QEMU with
@@ -181,10 +190,20 @@ keep running, and the table matches only packets of user `stallo`.
    router answers on its public address.
 2. `getent passwd stallo; getent group stallo`: both empty (on
    2026-10-14 they were).
-3. `systemctl is-enabled nftables`: if it is enabled, a reload of
-   `/etc/nftables.conf` flushes the table. Afterwards run
-   `sudo systemctl reload stallo-nft`. It was `disabled` on 2026-10-14.
-4. Memory: the production daemon admits VMs against its own budget
+3. `systemctl is-enabled nftables`: `nftables.service` runs
+   `flush ruleset` on start, stop, restart and reload, which removes the
+   Stallo table too. Running `internet` guests then lose their network
+   until they restart.
+   - `stallo-nft.service` follows a restart or reload of `nftables`
+     (`PartOf=`, `ReloadPropagatedFrom=`) and loads the table again.
+   - After a plain start of `nftables`, or a stop and start, run
+     `sudo systemctl restart stallo-nft`.
+   - It was `disabled` on 2026-10-14.
+4. Nothing from the manual M3 steps: `/etc/systemd/system/stallo-nft.service`
+   would override the packaged unit, and an existing
+   `/etc/stallo/stallo.nft` makes dpkg ask about the conffile. On
+   2026-10-14 neither existed (and the user did not either).
+5. Memory: the production daemon admits VMs against its own budget
    (`memory_budget_pct`, default 50% of RAM), independent of a dev-mode
    daemon. Do not run VMs in both at once without lowering one budget.
 
@@ -218,11 +237,15 @@ rollbacks in reverse order.
 4. **Give your user access:**
    - `sudo usermod -aG stallo $USER`, then log in again (or `newgrp stallo`).
    - `stallo ls` now talks to the production daemon.
-   - Rollback: `sudo gpasswd -d $USER stallo`
+   - Rollback: `sudo gpasswd -d $USER stallo`. This only affects new
+     logins: running sessions, tmux and user services keep the group
+     until they end, so log out completely.
+   - The CLI refuses to guess when both a production and a dev-mode
+     daemon run: pass `--socket` or set `STALLO_SOCKET`.
 5. **Optional, configure:** `/var/lib/stallo/stallod.toml`.
    - Keys: `[host]` `memory_budget_pct`, `reserve_mib`, `disk_floor_gib`,
      `reserved_cores`, and `[net] dns`.
-   - Edit it with `sudo -u stallo nano /var/lib/stallo/stallod.toml`.
+   - Edit it with `sudoedit -u stallo /var/lib/stallo/stallod.toml`.
    - Then `sudo systemctl restart stallod`. **This stops all VMs.**
    - Rollback: delete the file and restart (the defaults apply).
 6. **Full removal**, only if you also want to delete all VMs and images:
