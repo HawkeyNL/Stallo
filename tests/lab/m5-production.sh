@@ -265,6 +265,50 @@ lifecycle() {
 	check "remove box" stallo rm --yes box
 }
 
+mcp_http() {
+	echo "== M5-2: MCP over HTTP (loopback, bearer token)"
+	T=/home/labuser/.stallo-token
+	runuser -u labuser -- sh -c "umask 077; head -c 32 /dev/urandom | base64 > $T"
+	refused "--http 0.0.0.0 refused" "refusing to listen" as labuser stallo mcp --http 0.0.0.0:8765 --token-file $T
+	refused "--http on a LAN address refused" "refusing to listen" as labuser stallo mcp --http 192.168.77.1:8765 --token-file $T
+	runuser -u labuser -- cp $T $T.open && chmod 644 $T.open
+	refused "a world-readable token file refused" "chmod 600" as labuser stallo mcp --http 127.0.0.1:8765 --token-file $T.open
+	systemd-run --quiet --unit=mcphttp --uid=labuser --gid=labuser -p SupplementaryGroups=stallo \
+		stallo mcp --http 127.0.0.1:8765 --token-file $T
+	for _ in $(seq 25); do ss -H -ltn | grep -q 127.0.0.1:8765 && break; sleep 0.2; done
+	tok=$(cat $T)
+	post() { curl -s -m 30 -H Content-Type:application/json -H Accept:application/json,text/event-stream -H MCP-Protocol-Version:2025-06-18 "$@" http://127.0.0.1:8765/; }
+	code() { post -o /dev/null -w '%{http_code}' "$@"; }
+	init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"lab","version":"0"}}}'
+	call() { echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"; }
+	check "listener is the CLI process on 127.0.0.1 only" sh -c 'ss -H -ltnp | grep ":8765" | grep -q "127.0.0.1:8765.*\"stallo\"" && [ "$(ss -H -ltn | grep -c :8765)" = 1 ]'
+	check "S1 still holds: stallod has no IP socket" sh -c '! ss -H -tuanp | grep -q "\"stallod\""'
+	auth="Authorization: Bearer $tok"
+	r=$(code -d "$init"); check "no token: 401" [ "$r" = 401 ]
+	r=$(code -H "Authorization: Bearer x$tok" -d "$init"); check "wrong token: 401" [ "$r" = 401 ]
+	r=$(code -H 'Host: evil.example' -H "$auth" -d "$init"); check "foreign Host header: 403" [ "$r" = 403 ]
+	r=$(post -H "$auth" -d "$init"); check "initialize with the token" grep -q '"serverInfo"' <<-EOF
+		$r
+	EOF
+	stallo new box --cpus 1 --mem 1G --disk 5G >/dev/null
+	r=$(post -H "$auth" -d "$(call exec '{"vm":"box","argv":["true"]}')")
+	check "exec refused while agent control is off" sh -c 'echo "$1" | grep -q "agent control is off"' _ "$r"
+	stallo agent box on >/dev/null
+	r=$(post -H "$auth" -d "$(call exec '{"vm":"box","argv":["echo","via-http"]}')")
+	check "exec works with agent control on" sh -c 'echo "$1" | grep -q via-http' _ "$r"
+	check "audited as via mcp, peer uid labuser" sh -c "tail -n 1 /var/lib/stallo/audit/box.jsonl | grep -q '\"via\":\"mcp\"' && tail -n 1 /var/lib/stallo/audit/box.jsonl | grep -q '\"uid\":$(id -u labuser)'"
+	sleep 1.1
+	# 30 requests on one keep-alive connection, faster than the refill.
+	urls=$(for _ in $(seq 30); do printf -- '-o /dev/null http://127.0.0.1:8765/ '; done)
+	# shellcheck disable=SC2086
+	codes=$(curl -s -m 30 -w '%{http_code}\n' -H Content-Type:application/json \
+		-H Accept:application/json,text/event-stream -H "$auth" -d "$init" $urls)
+	echo "rate limit: $(echo "$codes" | sort | uniq -c | tr '\n' ' ')"
+	check "rate limit: 30 requests at once get 429s" sh -c 'echo "$1" | grep -q 429 && [ "$(echo "$1" | grep -c 200)" -le 21 ]' _ "$codes"
+	systemctl stop mcphttp
+	stallo stop box >/dev/null && stallo rm --yes box >/dev/null
+}
+
 case "${1:-all}" in
 install) install_pkg; configure ;;
 service) service_checks ;;
@@ -274,17 +318,19 @@ net)
 	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" checks || fails=$((fails + 1))
 	;;
 lifecycle) lifecycle ;;
+mcphttp) mcp_http ;;
 all)
 	install_pkg; configure; service_checks; vm_checks
 	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" net
 	BIN=/usr/bin IMAGES=$IMAGES NFT=/etc/stallo/stallo.nft sh "$HERE/m3-network.sh" checks || fails=$((fails + 1))
+	mcp_http
 	lifecycle
 	echo "== AppArmor denials for QEMU during the whole gate"
 	# The profile's deny rules are `audit deny`, so attempts are logged too.
 	# Stacked labels log as stallo-qemu//&unconfined: no closing quote.
 	check "no stallo-qemu denials (kernel log, audit log)" sh -c '! { journalctl -k --no-pager; cat /var/log/audit/audit.log 2>/dev/null; } | grep "apparmor=\"DENIED\"" | grep -q "profile=\"stallo-qemu"'
 	;;
-*) echo "usage: $0 [all|install|service|vm|net|lifecycle]"; exit 2 ;;
+*) echo "usage: $0 [all|install|service|vm|net|mcphttp|lifecycle]"; exit 2 ;;
 esac
 echo "failures: $fails"
 [ "$fails" = 0 ]

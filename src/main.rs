@@ -151,9 +151,18 @@ enum Cmd {
     },
     /// Serve the agent tools over MCP on stdin/stdout, or register them
     /// with Claude Code (`stallo mcp install`).
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
         #[command(subcommand)]
         action: Option<McpCmd>,
+        /// Serve over streamable HTTP on IP:PORT instead of stdio. Only
+        /// loopback or a Tailscale address; needs --token-file.
+        #[arg(long, value_name = "IP:PORT", value_parser = stallo::mcp_http::parse_addr, requires = "token_file")]
+        http: Option<std::net::SocketAddr>,
+        /// File with the bearer token for --http (mode 0600, at least 32
+        /// characters), e.g. from `head -c 32 /dev/urandom | base64`.
+        #[arg(long, value_name = "FILE", requires = "http")]
+        token_file: Option<PathBuf>,
     },
     /// List images, or download one.
     Images {
@@ -194,7 +203,7 @@ const STALLO_ERROR: u8 = 125;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // stdout is the MCP channel for `stallo mcp`: errors go to stderr.
-    let json = cli.json && !matches!(cli.command, Cmd::Mcp { action: None });
+    let json = cli.json && !matches!(cli.command, Cmd::Mcp { action: None, .. });
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -487,9 +496,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{vm}  removed");
             }
         }
-        Cmd::Mcp { action: None } => stallo::mcp::serve_stdio(socket).await?,
+        Cmd::Mcp {
+            action: None,
+            http: Some(addr),
+            token_file: Some(token),
+        } => stallo::mcp_http::serve(socket, addr, &token).await?,
+        Cmd::Mcp { action: None, .. } => stallo::mcp::serve_stdio(socket).await?,
         Cmd::Mcp {
             action: Some(McpCmd::Install),
+            ..
         } => {
             let exe = std::env::current_exe()?;
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -871,6 +886,48 @@ fn parse_gib(s: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mcp_http_args() {
+        use clap::Parser;
+        let parse = |a: &[&str]| super::Cli::try_parse_from(a);
+        assert!(
+            parse(&[
+                "stallo",
+                "mcp",
+                "--http",
+                "127.0.0.1:8765",
+                "--token-file",
+                "/t"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["stallo", "mcp", "--http", "127.0.0.1:8765"]).is_err());
+        assert!(parse(&["stallo", "mcp", "--token-file", "/t"]).is_err());
+        assert!(
+            parse(&[
+                "stallo",
+                "mcp",
+                "--http",
+                "localhost:8765",
+                "--token-file",
+                "/t"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "stallo",
+                "mcp",
+                "--http",
+                "127.0.0.1:8765",
+                "--token-file",
+                "/t",
+                "install"
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn default_socket_choice() {
         use std::path::PathBuf;

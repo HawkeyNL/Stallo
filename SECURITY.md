@@ -38,6 +38,25 @@ start and every 10 s after, and kills a VM that is not confined by it.
 The profile is shared by all VMs; keeping one VM's QEMU away from
 another's stays the job of Landlock and seccomp.
 
+## Remote MCP
+
+`stallo mcp --http <ip>:<port>` serves the agent tools over HTTP. It is a
+client of the daemon like stdio `stallo mcp` (every call `via: mcp`, same
+agent policy) and runs with the API access of the user who starts it; the
+daemon still has no IP listener. Before any request body is read:
+
+- the listening address was checked: loopback or Tailscale only, never a
+  wildcard or the LAN;
+- a global token bucket allows 20 requests per second, failed ones
+  included, so tokens cannot be guessed quickly;
+- the bearer token is compared as SHA-256 digests in constant time; the
+  token file must be a private regular file of the user (no symlink).
+
+rmcp refuses `Host` headers other than the listening address (DNS
+rebinding). Sessions are not kept (stateless), so there is no session
+table to fill. Anyone with the token can do what agents may do; keep the
+file private and rotate it by restarting with a new one.
+
 ## Agent policy
 
 Agents reach Stallo through `stallo mcp`, which marks its requests

@@ -141,6 +141,24 @@ Agents may only control VMs where you turned agent control on:
 stallo agent dev on
 ```
 
+**Remote agents** (another machine on your tailnet) can use the same
+tools over streamable HTTP. It runs as your user, never in the daemon:
+
+```sh
+mkdir -p ~/.config/stallo
+(umask 077; head -c 32 /dev/urandom | base64 > ~/.config/stallo/mcp-token)
+stallo mcp --http 100.101.102.103:8765 --token-file ~/.config/stallo/mcp-token
+```
+
+- Only loopback or a Tailscale address (`100.64.0.0/10`,
+  `fd7a:115c:a1e0::/48`) is accepted; `0.0.0.0` and LAN addresses are
+  refused. There is no TLS: Tailscale encrypts.
+- Clients send `Authorization: Bearer <token>`. The token file must be
+  yours and private (`0600`), at least 32 characters.
+- At most 20 requests per second and 8 connections; `Host` headers other
+  than the address itself are refused.
+- To keep it running: `systemd-run --user --unit=stallo-mcp-http stallo mcp --http ...`.
+
 Tools: `vm_list`, `vm_info`, `vm_create` (only with `agents_can_create =
 true` in `stallod.toml`), `vm_start`, `vm_stop`, `vm_reset`, `screenshot`,
 `wait_for_screen`, `mouse_move`, `click`, `drag`, `scroll`, `type_text`,

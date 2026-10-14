@@ -192,6 +192,8 @@ script, it refuses to run without `/etc/stallo-lab` and outside a VM.
 **Result: all 114 checks passed** in a freshly installed lab VM, with
 the package built from this branch. With VNC (M5-4) and the QEMU AppArmor
 profile (M5-3) on top, the same gate grew to **127 checks, all passed**.
+The final run, on the whole stack (with remote MCP, M5-2) after every
+review fix, passed **all 141 checks** on a fresh lab VM.
 
 | Check | Result |
 |---|---|
@@ -213,6 +215,7 @@ profile (M5-3) on top, the same gate grew to **127 checks, all passed**.
 | S14, S15: `m3-network.sh` against the packaged daemon (47 checks, including the 13 positive controls, port forwards, RAM snapshot with passt, the table removed at runtime) | PASS |
 | VNC (M5-4, run with #34 in the 127-check gate): `/run/stallo/vnc/<vm>/vnc.sock` `0660` in a `0750` dir; a group member gets the RFB greeting, a non-member cannot connect; QEMU has `-vnc unix:` only and no TCP/UDP socket; an MCP `set_vnc` is refused; stop removes the dir; `--vnc off` removes `-vnc` | PASS |
 | AppArmor (M5-3): QEMU runs as `stallo-qemu//&unconfined (enforce)`; with the profile unloaded a start is refused; it starts again after a reload; no `stallo-qemu` denial in the kernel log for the whole gate | PASS |
+| Remote MCP (M5-2): `--http` on `0.0.0.0` or a LAN address and a world-readable token file are refused; the listener is the CLI process on `127.0.0.1` only, `stallod` still has no IP socket; no token or a wrong one gets 401, a foreign `Host` 403; with the token, `initialize` works, `exec` is refused while agent control is off and works when on, audited as `via: mcp` with the caller's uid; 30 requests at once get 20 × 200 and 10 × 429 | PASS |
 | Stop with a running VM: the guest powers off over ACPI (3.5 s), QEMU gets no signal, no process of `stallo` is left | PASS |
 | Upgrade (`--reinstall`): VMs stopped, daemon back, table loaded | PASS |
 | `apt remove`: no process left, table deleted, VM data and user kept; reinstall brings everything back | PASS |
