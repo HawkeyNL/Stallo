@@ -249,7 +249,8 @@ pub struct VmDetails {
     pub addresses: Option<Vec<(String, String)>>,
     /// Host disk space the VM's disk uses (its overlay, not the base).
     pub disk_used_bytes: u64,
-    /// The VNC socket, when VNC is on (it exists while the VM runs).
+    /// The VNC socket, while the VM runs with VNC (`vnc` in the config may
+    /// differ until the next start).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vnc_socket: Option<std::path::PathBuf>,
 }

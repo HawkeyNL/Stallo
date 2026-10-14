@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -564,7 +564,13 @@ impl Manager {
         if cfg.vnc {
             let sock = self.paths.vnc_socket(name);
             let mode = fs::Permissions::from_mode(self.shared_modes().1);
-            if let Err(e) = fs::set_permissions(&sock, mode) {
+            // chmod follows symlinks: only ever touch QEMU's own socket.
+            let shared = match fs::symlink_metadata(&sock) {
+                Ok(m) if m.file_type().is_socket() => fs::set_permissions(&sock, mode),
+                Ok(_) => Err(std::io::Error::other("not a socket")),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = shared {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 return Err(anyhow::Error::from(e).context("cannot share the VNC socket"));

@@ -111,11 +111,15 @@ Install steps, rollback and the lab gate are in
 `stallo set <vm> --vnc on` gives the VM a VNC server from its next start,
 on a Unix socket only (never TCP): `<runtime>/vnc/<vm>/vnc.sock`, in
 production `/run/stallo/vnc/<vm>/vnc.sock`, for members of group
-`stallo`. From another machine, forward it over SSH and point a VNC
-viewer at `localhost:5901`:
+`stallo`. From another machine, forward it over SSH. VNC has no password
+here, so keep the forward private to you:
 
 ```sh
-ssh -N -L 5901:/run/stallo/vnc/<vm>/vnc.sock <host>
+# Best, if your viewer takes a Unix socket: a socket only you can reach.
+ssh -N -L "$XDG_RUNTIME_DIR/stallo-vnc.sock:/run/stallo/vnc/<vm>/vnc.sock" <host>
+# Otherwise a loopback port; every local user of this machine can use it
+# while the tunnel runs, so close it afterwards (never add -g).
+ssh -N -L 127.0.0.1:5901:/run/stallo/vnc/<vm>/vnc.sock <host>
 ```
 
 VNC input bypasses agent control and the audit log, so only humans can

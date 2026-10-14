@@ -208,9 +208,13 @@ vm_checks() {
 	rfb="import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); assert s.recv(12).startswith(b'RFB ')"
 	check "VNC socket 0660 stallo:stallo, dir 0750" sh -c "[ \"\$(stat -c '%a %U %G' $vnc)\" = '660 stallo stallo' ] && [ \"\$(stat -c %a /run/stallo/vnc/box)\" = 750 ]"
 	check "group member gets the RFB greeting" as labuser python3 -c "$rfb" "$vnc"
-	check "non-member cannot connect" sh -c "! runuser -u outsider -- python3 -c \"$rfb\" $vnc"
+	eacces="import socket,sys
+try: socket.socket(socket.AF_UNIX).connect(sys.argv[1])
+except PermissionError: print('EACCES')"
+	check "non-member cannot connect (EACCES)" sh -c "runuser -u outsider -- python3 -c \"$eacces\" $vnc | grep -qx EACCES"
 	pid=$(qemu_pid box)
 	check "QEMU argv: -vnc unix: only" sh -c "tr '\0' ' ' </proc/$pid/cmdline | grep -q -- '-vnc unix:$vnc ' && ! tr '\0' ' ' </proc/$pid/cmdline | grep -qE 'tcp:|host=|:59[0-9][0-9]'"
+	check "ss sees QEMU's sockets (control)" sh -c "ss -H -xlp | grep -q 'pid=$pid,'"
 	check "QEMU has no TCP/UDP socket" sh -c "! ss -H -tuanp | grep -q 'pid=$pid,'"
 	refused "agents cannot turn VNC on" "only available to humans" sh -c "r=\$(printf '%s\n' '{\"via\":\"mcp\",\"request\":{\"op\":\"set_vnc\",\"name\":\"box\",\"on\":true}}' | python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(\"/run/stallo/api.sock\"); s.sendall(sys.stdin.buffer.read()); print(s.recv(4096).decode())'); echo \"\$r\"; echo \"\$r\" | grep -q '\"ok\":true' && exit 0 || exit 1"
 	stallo stop box >/dev/null

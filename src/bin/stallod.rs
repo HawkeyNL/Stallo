@@ -471,7 +471,8 @@ async fn dispatch(
         Request::Info { name } => {
             let vm = info(m, &m.load(&name)?).await;
             let (addresses, disk_used_bytes) = m.details(&name).await?;
-            let vnc_socket = vm.vnc.then(|| m.paths.vnc_socket(&name));
+            // The live socket: it exists only while the VM runs with VNC.
+            let vnc_socket = Some(m.paths.vnc_socket(&name)).filter(|s| s.exists());
             json!(api::VmDetails {
                 vm,
                 addresses,
