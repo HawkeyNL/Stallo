@@ -20,7 +20,8 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
     /// API socket (default: $STALLO_SOCKET, else the production socket
-    /// /run/stallo/api.sock if it is there, else the dev-mode socket).
+    /// /run/stallo/api.sock if it is there, else the dev-mode socket; with
+    /// both daemons running, one must be chosen).
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     #[command(subcommand)]
@@ -488,13 +489,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 /// The production daemon's socket when it is there (and this user may
-/// reach it), else the dev-mode socket.
+/// reach it), else the dev-mode socket. Refuses to guess when both are
+/// there: a dev command must never hit production VMs by accident.
 fn default_socket() -> Result<PathBuf> {
     let production = stallo::paths::Paths::production()?.api_socket();
-    if production.exists() {
-        return Ok(production);
+    let dev = stallo::paths::Paths::dev().map(|p| p.api_socket());
+    let dev_up = dev.as_ref().is_ok_and(|d| d.exists());
+    pick_socket(production.exists().then_some(production), dev, dev_up)
+}
+
+fn pick_socket(production: Option<PathBuf>, dev: Result<PathBuf>, dev_up: bool) -> Result<PathBuf> {
+    match (production, dev) {
+        (Some(p), Ok(d)) if dev_up => bail!(
+            "both a production daemon ({}) and a dev-mode daemon ({}) are running; choose one with --socket or STALLO_SOCKET",
+            p.display(),
+            d.display()
+        ),
+        (Some(p), _) => Ok(p),
+        (None, d) => d,
     }
-    Ok(stallo::paths::Paths::dev()?.api_socket())
 }
 
 /// The arguments `stallo mcp` needs: `[--socket <path>] mcp`.
@@ -829,6 +842,31 @@ fn parse_gib(s: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_socket_choice() {
+        use std::path::PathBuf;
+        let (p, d) = (
+            PathBuf::from("/run/stallo/api.sock"),
+            PathBuf::from("/d/api.sock"),
+        );
+        let pick = |prod: bool, dev: bool, up: bool| {
+            let dev = if dev {
+                Ok(d.clone())
+            } else {
+                Err(anyhow::anyhow!("XDG_RUNTIME_DIR is not set"))
+            };
+            super::pick_socket(prod.then(|| p.clone()), dev, up)
+        };
+        assert_eq!(pick(true, true, false).unwrap(), p);
+        assert_eq!(pick(true, false, false).unwrap(), p);
+        assert_eq!(pick(false, true, false).unwrap(), d);
+        assert_eq!(pick(false, true, true).unwrap(), d);
+        assert!(pick(false, false, false).is_err());
+        // Both daemons up: no guessing.
+        let err = pick(true, true, true).unwrap_err().to_string();
+        assert!(err.contains("--socket"), "{err}");
+    }
+
     use super::*;
 
     #[test]
