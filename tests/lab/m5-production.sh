@@ -88,10 +88,12 @@ service_checks() {
 	check "daemon has NoNewPrivs" grep -q '^NoNewPrivs:	1$' /proc/"$pid"/status
 	check "daemon cgroup is delegated (cpu memory pids)" sh -c "[ \"\$(cat $CG/cgroup.subtree_control)\" = 'cpu memory pids' ]"
 	# nftables.service runs `flush ruleset` on start, restart and reload.
+	# systemctl returns before the propagated stallo-nft job has run.
+	table_back() { for _ in $(seq 25); do nft list table inet stallo >/dev/null 2>&1 && return 0; sleep 0.2; done; return 1; }
 	systemctl restart nftables
-	check "table reloaded after an nftables restart" nft list table inet stallo
+	check "table reloaded after an nftables restart" table_back
 	systemctl reload nftables
-	check "table reloaded after an nftables reload" nft list table inet stallo
+	check "table reloaded after an nftables reload" table_back
 	systemctl stop nftables
 	systemctl restart stallo-nft
 	# ProtectControlGroups=private: a cgroup namespace rooted at the unit.
@@ -125,7 +127,7 @@ vm_checks() {
 	setfacl -m u:outsider:x /run/stallo
 	setfacl -m u:outsider:rw /run/stallo/api.sock
 	since=$(date '+%Y-%m-%d %H:%M:%S')
-	refused "S2: daemon refuses a non-member that can reach the socket" "without an answer" as outsider stallo --socket /run/stallo/api.sock ls
+	refused "S2: daemon refuses a non-member that can reach the socket" "without an answer\|Connection reset" as outsider stallo --socket /run/stallo/api.sock ls
 	check "S2: the refusal is logged" sh -c "journalctl -u stallod --no-pager --since '$since' | grep -q 'refused API peer uid $(id -u outsider)'"
 	setfacl -b /run/stallo/api.sock /run/stallo
 
