@@ -283,13 +283,15 @@ mcp_http() {
 	call() { echo "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"; }
 	check "listener is the CLI process on 127.0.0.1 only" sh -c 'ss -H -ltnp | grep ":8765" | grep -q "127.0.0.1:8765.*\"stallo\"" && [ "$(ss -H -ltn | grep -c :8765)" = 1 ]'
 	check "S1 still holds: stallod has no IP socket" sh -c '! ss -H -tuanp | grep -q "\"stallod\""'
-	auth="Authorization: Bearer $tok"
+	# The token goes to curl in a file, not on its command line.
+	hdr=$(mktemp)
+	printf 'Authorization: Bearer %s\n' "$tok" >"$hdr"
+	auth="@$hdr"
 	r=$(code -d "$init"); check "no token: 401" [ "$r" = 401 ]
-	r=$(code -H "Authorization: Bearer x$tok" -d "$init"); check "wrong token: 401" [ "$r" = 401 ]
+	r=$(code -H "Authorization: Bearer wrong-token-that-is-long-enough-000" -d "$init"); check "wrong token: 401" [ "$r" = 401 ]
 	r=$(code -H 'Host: evil.example' -H "$auth" -d "$init"); check "foreign Host header: 403" [ "$r" = 403 ]
-	r=$(post -H "$auth" -d "$init"); check "initialize with the token" grep -q '"serverInfo"' <<-EOF
-		$r
-	EOF
+	r=$(code -H 'Origin: http://evil.example' -H "$auth" -d "$init"); check "browser Origin header: refused" [ "$r" = 403 ]
+	r=$(post -H "$auth" -d "$init"); check "initialize with the token" sh -c 'echo "$1" | grep -q "\"serverInfo\""' _ "$r"
 	stallo new box --cpus 1 --mem 1G --disk 5G >/dev/null
 	r=$(post -H "$auth" -d "$(call exec '{"vm":"box","argv":["true"]}')")
 	check "exec refused while agent control is off" sh -c 'echo "$1" | grep -q "agent control is off"' _ "$r"
@@ -298,14 +300,36 @@ mcp_http() {
 	check "exec works with agent control on" sh -c 'echo "$1" | grep -q via-http' _ "$r"
 	check "audited as via mcp, peer uid labuser" sh -c "tail -n 1 /var/lib/stallo/audit/box.jsonl | grep -q '\"via\":\"mcp\"' && tail -n 1 /var/lib/stallo/audit/box.jsonl | grep -q '\"uid\":$(id -u labuser)'"
 	sleep 1.1
+	# 10 wrong tokens in a burst: the failure budget (5/s) runs out ...
+	bad=$(for _ in $(seq 10); do code -H "Authorization: Bearer wrong-token-that-is-long-enough-000" -d "$init"; echo; done)
+	check "failed requests: 429 after their own budget" sh -c 'echo "$1" | grep -q 429' _ "$bad"
+	# ... and the agent is not starved by them.
+	r=$(code -H "$auth" -d "$init"); check "the agent still gets through" [ "$r" = 200 ]
+	sleep 1.1
 	# 30 requests on one keep-alive connection, faster than the refill.
 	urls=$(for _ in $(seq 30); do printf -- '-o /dev/null http://127.0.0.1:8765/ '; done)
 	# shellcheck disable=SC2086
 	codes=$(curl -s -m 30 -w '%{http_code}\n' -H Content-Type:application/json \
 		-H Accept:application/json,text/event-stream -H "$auth" -d "$init" $urls)
 	echo "rate limit: $(echo "$codes" | sort | uniq -c | tr '\n' ' ')"
-	check "rate limit: 30 requests at once get 429s" sh -c 'echo "$1" | grep -q 429 && [ "$(echo "$1" | grep -c 200)" -le 21 ]' _ "$codes"
+	check "rate limit: 30 quick requests on one connection: 20 pass, then 429" sh -c 'echo "$1" | grep -q 429 && [ "$(echo "$1" | grep -c 200)" -le 21 ]' _ "$codes"
 	systemctl stop mcphttp
+
+	echo "== M5-2: a Tailscale-class listener ignores LAN peers"
+	# Linux delivers LAN packets addressed to any local IP (weak host
+	# model). 100.64.7.7 stands in for the Tailscale address.
+	ip addr add 100.64.7.7/32 dev lo
+	systemd-run --quiet --unit=mcphttp2 --uid=labuser --gid=labuser -p SupplementaryGroups=stallo \
+		stallo mcp --http 100.64.7.7:8765 --token-file $T
+	for _ in $(seq 25); do ss -H -ltn | grep -q 100.64.7.7:8765 && break; sleep 0.2; done
+	r=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -d "$init" http://100.64.7.7:8765/)
+	check "a Tailscale-class peer is served (401 without token)" [ "$r" = 401 ]
+	r=$(ip netns exec lan curl -s -m 5 -o /dev/null -w '%{http_code}' -d "$init" http://100.64.7.7:8765/ || true)
+	check "a LAN peer gets no HTTP answer at all" [ "$r" = 000 ]
+	check "the LAN peer reached the socket and was logged" sh -c 'journalctl -u mcphttp2 --no-pager | grep -q "192.168.77.2.*refused (not a Tailscale address)"'
+	systemctl stop mcphttp2
+	ip addr del 100.64.7.7/32 dev lo
+	shred -u "$hdr"
 	stallo stop box >/dev/null && stallo rm --yes box >/dev/null
 }
 

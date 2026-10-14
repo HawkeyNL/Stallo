@@ -152,11 +152,17 @@ stallo mcp --http 100.101.102.103:8765 --token-file ~/.config/stallo/mcp-token
 
 - Only loopback or a Tailscale address (`100.64.0.0/10`,
   `fd7a:115c:a1e0::/48`) is accepted; `0.0.0.0` and LAN addresses are
-  refused. There is no TLS: Tailscale encrypts.
-- Clients send `Authorization: Bearer <token>`. The token file must be
-  yours and private (`0600`), at least 32 characters.
-- At most 20 requests per second and 8 connections; `Host` headers other
-  than the address itself are refused.
+  refused, and so are peers from other networks. There is no TLS:
+  Tailscale encrypts.
+- Clients send `Authorization: Bearer <token>` and use the IP address in
+  the URL: other `Host` names (MagicDNS too) and any browser `Origin` are
+  refused. The token file must be yours and private (`0600`), at least 32
+  characters.
+- At most 20 authenticated requests per second, 5 failed ones, 8
+  connections, 4 per peer. Each request is logged to stderr with the
+  peer's address (never the token).
+- Anyone who can reach the port can use up the connection slots, so let
+  your Tailscale ACLs allow only the agent's machine.
 - To keep it running: `systemd-run --user --unit=stallo-mcp-http stallo mcp --http ...`.
 
 Tools: `vm_list`, `vm_info`, `vm_create` (only with `agents_can_create =

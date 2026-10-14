@@ -46,15 +46,23 @@ agent policy) and runs with the API access of the user who starts it; the
 daemon still has no IP listener. Before any request body is read:
 
 - the listening address was checked: loopback or Tailscale only, never a
-  wildcard or the LAN;
-- a global token bucket allows 20 requests per second, failed ones
-  included, so tokens cannot be guessed quickly;
+  wildcard or a LAN address;
+- the peer must be of the same kind as the listening address: Linux also
+  delivers LAN packets that are addressed to the Tailscale IP, and those
+  connections are closed unanswered;
+- at most 8 connections, 4 per peer address, with a 3 s header timeout;
 - the bearer token is compared as SHA-256 digests in constant time; the
-  token file must be a private regular file of the user (no symlink).
+  token file must be a private regular file of the user (no symlink);
+- authenticated requests get 20 per second; failed ones have a separate
+  budget of 5 per second, so junk cannot starve the agent and tokens
+  cannot be guessed quickly.
 
 rmcp refuses `Host` headers other than the listening address (DNS
-rebinding). Sessions are not kept (stateless), so there is no session
-table to fill. Anyone with the token can do what agents may do; keep the
+rebinding) and every request with an `Origin` header (browsers). Sessions
+are not kept (stateless), so there is no session table to fill. Each
+request is logged to stderr with the peer's address. Anyone who can reach
+the port can still use up the connection slots: Tailscale ACLs are the
+real boundary. Anyone with the token can do what agents may do; keep the
 file private and rotate it by restarting with a new one.
 
 ## Agent policy
