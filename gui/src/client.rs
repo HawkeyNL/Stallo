@@ -53,13 +53,22 @@ pub async fn call(
     limit: Duration,
 ) -> Result<serde_json::Value, CallError> {
     static SLOTS: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
+    call_in(&SLOTS, socket, request, limit).await
+}
+
+async fn call_in(
+    slots: &Semaphore,
+    socket: &Path,
+    request: Request,
+    limit: Duration,
+) -> Result<serde_json::Value, CallError> {
     // The app is a human interface, like the CLI.
     let envelope = Envelope {
         via: Via::Cli,
         request,
     };
     let work = async {
-        let _slot = SLOTS.acquire().await;
+        let _slot = slots.acquire().await;
         stallo::api::call(socket, &envelope).await
     };
     match tokio::time::timeout(limit, work).await {
@@ -233,6 +242,22 @@ mod tests {
         let _listener = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(list_at(&socket, READ_TIMEOUT), Err(CallError::Denied));
+    }
+
+    #[test]
+    fn waiting_for_a_slot_counts() {
+        let (_d, s) = daemon(answer("{\"ok\":true,\"data\":[]}\n"));
+        let slots = std::sync::Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+        let held = runtime()
+            .block_on(slots.clone().acquire_many_owned(MAX_IN_FLIGHT as u32))
+            .unwrap();
+        let call = |slots: std::sync::Arc<Semaphore>, s: PathBuf| {
+            run(async move { call_in(&slots, &s, Request::List, Duration::from_millis(200)).await })
+        };
+        // The ninth request never gets a slot, so it never connects.
+        assert_eq!(call(slots.clone(), s.clone()), Err(CallError::Timeout));
+        drop(held);
+        assert_eq!(call(slots, s), Ok(serde_json::json!([])));
     }
 
     #[test]

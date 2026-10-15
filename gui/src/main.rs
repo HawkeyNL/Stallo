@@ -32,13 +32,33 @@ fn start_unit_args() -> glib::Variant {
     ("stallod.service", "replace").to_variant()
 }
 
+/// Text that is not ours to trust: no markup. Not selectable: as the only
+/// focusable widget on a page, a selectable label trips a GTK critical
+/// (gtk_widget_is_ancestor) once accessibility is active.
+fn plain_label(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label"])
+        .build()
+}
+
 /// POSIX shell quoting, for commands the user copies.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn main() -> glib::ExitCode {
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let mut flags = gio::ApplicationFlags::empty();
+    if !model::single_instance(std::env::var_os("STALLO_SOCKET").is_some()) {
+        flags |= gio::ApplicationFlags::NON_UNIQUE;
+    }
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(flags)
+        .build();
     app.connect_activate(|app| {
         if let Some(window) = app.active_window() {
             window.present();
@@ -223,15 +243,16 @@ impl Ui {
                     "Both the Stallo service and a dev-mode daemon are running, and Stallo will not guess which one you mean. Stop one of them, or start the app with STALLO_SOCKET set to the socket to use.",
                 )
             }
+            Onboarding::SocketDown { socket } => {
+                content.append(&plain_label(&socket.to_string_lossy()));
+                (
+                    "network-offline-symbolic",
+                    "Nothing Answers on the Chosen Socket",
+                    "STALLO_SOCKET points at the socket below, but no Stallo daemon answers there. Start the daemon that serves it, or open Stallo without STALLO_SOCKET.",
+                )
+            }
             Onboarding::Unreachable(error) => {
-                let label = gtk::Label::builder()
-                    .label(stallo::printable(error, 300))
-                    .wrap(true)
-                    .selectable(true)
-                    .justify(gtk::Justification::Center)
-                    .css_classes(["dim-label"])
-                    .build();
-                content.append(&label);
+                content.append(&plain_label(&stallo::printable(error, 300)));
                 (
                     "network-error-symbolic",
                     "Stallo Is Not Responding",

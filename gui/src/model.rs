@@ -67,6 +67,11 @@ pub enum Onboarding {
     TwoDaemons {
         dev: PathBuf,
     },
+    /// Nothing answers on the socket from `$STALLO_SOCKET`. Starting the
+    /// system service would not help: it may be another daemon.
+    SocketDown {
+        socket: PathBuf,
+    },
     /// The daemon is there but the request failed (timeout, error reply).
     Unreachable(String),
     Connected {
@@ -75,8 +80,7 @@ pub enum Onboarding {
 }
 
 /// The socket to send `list` to, or `None` when the probe already decides
-/// the state. Same rule as `stallo::paths::default_socket`: production
-/// when it is up, else dev mode, and never a guess when both are up.
+/// the state: `$STALLO_SOCKET`, else the CLI's choice (`pick_socket`).
 pub fn socket(p: &Probe) -> Option<PathBuf> {
     if !p.kvm {
         return None;
@@ -84,12 +88,23 @@ pub fn socket(p: &Probe) -> Option<PathBuf> {
     if let Some(s) = &p.explicit {
         return Some(s.clone());
     }
-    match (p.production, &p.dev) {
-        (Production::Up, Some(_)) if p.dev_up => None,
-        (Production::Up, _) => Some(stallo::paths::Paths::production().ok()?.api_socket()),
-        (Production::Denied, _) if !p.dev_up => None,
-        (_, dev) => dev.clone(),
-    }
+    let production = stallo::paths::Paths::production().ok()?.api_socket();
+    stallo::paths::pick_socket(
+        (p.production == Production::Up).then_some(production),
+        p.dev
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no dev-mode socket")),
+        p.dev_up,
+        p.production == Production::Denied,
+    )
+    .ok()
+}
+
+/// Whether this process may hand its window to an already running one.
+/// Not when `$STALLO_SOCKET` is set: that instance must talk to the chosen
+/// daemon, and must not take over plain launches from the app menu.
+pub fn single_instance(stallo_socket_set: bool) -> bool {
+    !stallo_socket_set
 }
 
 pub fn onboarding(p: &Probe) -> Onboarding {
@@ -102,16 +117,18 @@ pub fn onboarding(p: &Probe) -> Onboarding {
         Group { listed: false, .. } => Onboarding::NotInGroup,
         _ => Onboarding::NeedsRelogin,
     };
-    if p.explicit.is_none() {
-        match (p.production, &p.dev) {
-            (Production::Up, Some(dev)) if p.dev_up => {
-                return Onboarding::TwoDaemons { dev: dev.clone() };
-            }
-            (Production::Denied, _) if !p.dev_up => return denied(),
-            _ => {}
-        }
-    }
+    let Some(socket) = socket(p) else {
+        // Why the CLI's choice refused (or found nothing).
+        return match (p.production, &p.dev) {
+            (Production::Up, Some(dev)) if p.dev_up => Onboarding::TwoDaemons { dev: dev.clone() },
+            (Production::Denied, _) => denied(),
+            _ => Onboarding::DaemonStopped,
+        };
+    };
     match &p.list {
+        Some(Err(CallError::NotRunning)) | None if p.explicit.is_some() => {
+            Onboarding::SocketDown { socket }
+        }
         Some(Ok(vms)) => Onboarding::Connected { vms: *vms },
         Some(Err(CallError::Denied)) => denied(),
         Some(Err(CallError::Timeout)) => Onboarding::Unreachable("no answer in time".into()),
@@ -132,7 +149,8 @@ pub fn group(etc_group: &str, user: &str, gids: &[u32]) -> Group {
         return Group::default();
     };
     Group {
-        listed: members.split(',').any(|m| m == user),
+        // An unset $USER must never match an empty member.
+        listed: !user.is_empty() && members.split(',').any(|m| m == user),
         active: gids.contains(&gid),
     }
 }
@@ -151,7 +169,7 @@ impl View {
         let was_connected = matches!(self.page, Onboarding::Connected { .. });
         let lost = matches!(
             probed,
-            Onboarding::DaemonStopped | Onboarding::Unreachable(_)
+            Onboarding::DaemonStopped | Onboarding::SocketDown { .. } | Onboarding::Unreachable(_)
         );
         if was_connected && lost {
             let view = View {
@@ -375,5 +393,78 @@ mod tests {
         assert!(!back);
         assert!(!two.reconnecting);
         assert!(two.polls(true));
+    }
+
+    #[test]
+    fn explicit_socket_down() {
+        let p = Probe {
+            explicit: Some("/x/api.sock".into()),
+            list: Some(Err(CallError::NotRunning)),
+            ..probe()
+        };
+        let down = Onboarding::SocketDown {
+            socket: "/x/api.sock".into(),
+        };
+        assert_eq!(onboarding(&p), down);
+        // Lost while connected: the banner, as for the system service.
+        let connected = View {
+            page: Onboarding::Connected { vms: 1 },
+            reconnecting: false,
+        };
+        assert!(connected.next(down).0.reconnecting);
+    }
+
+    /// The GUI picks the same socket as the CLI, and shows a page that
+    /// matches: connected exactly when the CLI's choice gives a socket.
+    #[test]
+    fn same_choice_as_cli() {
+        let prod = PathBuf::from("/run/stallo/api.sock");
+        for production in [Production::Up, Production::Missing, Production::Denied] {
+            for dev in [None, probe().dev] {
+                for dev_up in [false, true] {
+                    if dev_up && dev.is_none() {
+                        continue; // no path, nothing to find
+                    }
+                    for group in [NOT_LISTED, NOT_ACTIVE] {
+                        let mut p = Probe {
+                            production,
+                            dev: dev.clone(),
+                            dev_up,
+                            group,
+                            ..probe()
+                        };
+                        let cli = stallo::paths::pick_socket(
+                            (production == Production::Up).then(|| prod.clone()),
+                            dev.clone().ok_or_else(|| anyhow::anyhow!("unset")),
+                            dev_up,
+                            production == Production::Denied,
+                        )
+                        .ok();
+                        assert_eq!(socket(&p), cli, "{p:?}");
+                        p.list = cli.as_ref().map(|_| Ok(1));
+                        let page = onboarding(&p);
+                        assert_eq!(
+                            page == Onboarding::Connected { vms: 1 },
+                            cli.is_some(),
+                            "{p:?} {page:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unset_user_is_not_listed() {
+        // A trailing comma or an empty list has an empty member.
+        for etc in ["stallo:x:990:\n", "stallo:x:990:alice,\n"] {
+            assert_eq!(group(etc, "", &[]), NOT_LISTED, "{etc}");
+        }
+    }
+
+    #[test]
+    fn instance_choice() {
+        assert!(single_instance(false));
+        assert!(!single_instance(true));
     }
 }
