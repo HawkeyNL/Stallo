@@ -1,9 +1,10 @@
 #!/bin/sh
 # Builds target/deb/stallo_<version>_amd64.deb from a release build.
 # Needs only cargo and dpkg-deb; no root.
+# $STALLO_DEB_VERSION overrides the version from Cargo.toml (edge builds).
 set -eu
 cd "$(dirname "$0")/.."
-version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+version=${STALLO_DEB_VERSION:-$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)}
 cargo build --release --locked
 rm -rf target/deb/root
 root=target/deb/root

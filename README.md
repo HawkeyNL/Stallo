@@ -106,6 +106,11 @@ table with its loader unit. Members of group `stallo` use the API socket
 Install steps, rollback and the lab gate are in
 [docs/production.md](docs/production.md).
 
+Every push to `main` (channel `edge`) and every release tag (channel
+`stable`) is published as a signed APT repository at
+`https://hawkeynl.github.io/Stallo/`. Setup and key handling are in
+[docs/apt-repo.md](docs/apt-repo.md).
+
 ## Viewing a VM's screen
 
 `stallo set <vm> --vnc on` gives the VM a VNC server from its next start,
