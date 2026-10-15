@@ -1,0 +1,27 @@
+# Ubuntu 26.04 LTS (Resolute Raccoon) server cloud image, amd64, qcow2, UEFI/GPT.
+id = "ubuntu-26.04"
+name = "Ubuntu 26.04 LTS server (cloud image)"
+release = "26.04"
+base_url = "https://cloud-images.ubuntu.com/resolute/current/"
+file = "resolute-server-cloudimg-amd64.img"
+keyring = "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg"
+# "UEC Image Automatic Signing Key <cdimage@ubuntu.com>", which signs
+# SHA256SUMS of the current Ubuntu cloud images (checked 2026-10-12).
+signing_key = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+
+# The guest agent is not in the cloud image, and offline guests have no apt.
+# These packages ship on the seed ISO and are installed with `dpkg -i`.
+#
+# Closure check (2026-10-12), qemu-guest-agent 1:10.2.1+ds-1ubuntu3.2:
+#   Depends: libc6, libglib2.0-0t64, libnuma1, libudev1, liburing2, ubuntu-virt
+#   ubuntu-virt            Depends: ubuntu-helper-virt-hwe
+#   ubuntu-helper-virt-hwe Depends: python3
+#   liburing2              Depends: libc6
+# Against resolute-server-cloudimg-amd64.manifest (sha256 61525d4c...e6ae4a):
+#   present: libc6, libglib2.0-0t64, libnuma1, libudev1, python3
+#   missing: qemu-guest-agent, liburing2, ubuntu-virt, ubuntu-helper-virt-hwe
+#
+# The packages are cached under <data>/images/debs/26.04/ and not refreshed
+# automatically. To pick up guest-agent updates, delete that directory and
+# run `stallo images pull ubuntu-26.04`; existing VMs keep what they have.
+debs = ["qemu-guest-agent", "liburing2", "ubuntu-virt", "ubuntu-helper-virt-hwe"]

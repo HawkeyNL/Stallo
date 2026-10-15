@@ -1,0 +1,66 @@
+# AppArmor profile for the QEMU processes of stallod (production mode).
+#
+# stallod switches every QEMU into this profile at exec
+# (/proc/self/attr/apparmor/exec, see src/confine.rs) and refuses to start
+# a VM if that fails. It is a second wall around QEMU next to the per-VM
+# Landlock ruleset and the seccomp filter: Stallo's files only, no network,
+# no capabilities, no other programs. It is one profile for all VMs: the
+# per-VM limits (own disk, own sockets) come from Landlock and seccomp.
+#
+# Load: apparmor_parser -r /etc/apparmor.d/stallo-qemu (the package does).
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile stallo-qemu flags=(enforce) {
+  include <abstractions/base>
+
+  # The binary, its modules, firmware and option ROMs.
+  /usr/bin/qemu-system-x86_64 mr,
+  /usr/lib/x86_64-linux-gnu/qemu/*.so mr,
+  /usr/share/qemu/** r,
+  /usr/share/seabios/** r,
+  /usr/share/OVMF/** rk,
+
+  # Host CPU and NUMA topology, memory settings.
+  @{sys}/devices/system/{cpu,node}/{,**} r,
+  @{PROC}/sys/vm/{,**} r,
+
+  /dev/kvm rw,
+
+  # VM disks, firmware variables, RAM snapshot images and the seed; the
+  # cached base images read-only. Landlock narrows this to one VM.
+  /var/lib/stallo/vms/*/disk.qcow2 rwk,
+  /var/lib/stallo/vms/*/vars.qcow2 rwk,
+  /var/lib/stallo/vms/*/states/*.qcow2 rwk,
+  /var/lib/stallo/vms/*/seed.iso rk,
+  /var/lib/stallo/images/*.qcow2 rk,
+
+  # QMP, QGA and VNC sockets; screendumps.
+  /run/stallo/vms/*/{qmp,qga}.sock rw,
+  /run/stallo/vms/*/screen.{png,ppm} rw,
+  /run/stallo/vnc/*/vnc.sock rw,
+  unix (create, bind, listen, accept, send, receive, getattr, getopt, setopt, shutdown) type=stream,
+
+  # QEMU kicks its own vCPU threads with signals. Under no_new_privs the
+  # kernel stacks this profile on the daemon's (unconfined) label, so its
+  # own label reads stallo-qemu//&unconfined.
+  signal (send, receive) peer=stallo-qemu//&unconfined,
+  signal (send, receive) peer=stallo-qemu,
+  # The daemon (unconfined) stops it.
+  signal (receive) peer=unconfined,
+
+  # `audit`: an attempt is logged, so the lab gate can see one.
+  audit deny network inet,
+  audit deny network inet6,
+  audit deny capability,
+  # Also takes away base's ptrace (read) rules: nothing confined may
+  # inspect QEMU (unconfined root still can).
+  audit deny ptrace,
+  audit deny mount,
+  # QEMU never connects (its seccomp filter refuses too) and only binds
+  # pathname sockets in its own directories.
+  audit deny unix (connect),
+  audit deny unix (bind) type=stream addr=@**,
+}
