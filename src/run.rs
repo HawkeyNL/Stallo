@@ -259,6 +259,87 @@ mod tests {
         assert!(bad.unwrap_err().to_string().contains("timeout"));
     }
 
+    /// `images rm` is refused while a VM uses the image: a stopped VM, a
+    /// run clone, or a directory without vm.toml whose disk backs onto it.
+    #[tokio::test]
+    async fn image_rm_refused_while_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        m.cleanup_leftovers().await.unwrap();
+        let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
+        assert!(err.to_string().contains("not pulled"), "{err}");
+        let images = m.paths.images_dir();
+        crate::paths::ensure_private_dir(&images).unwrap();
+        let base = crate::images::image_path(&m.paths, "ubuntu-26.04");
+        fs::write(&base, b"qcow2").unwrap();
+        crate::paths::ensure_private_dir(&crate::images::debs_dir(&m.paths, "ubuntu-26.04"))
+            .unwrap();
+        let mut other = vm("other", None);
+        other.image = "ubuntu-24.04".into();
+        for cfg in [vm("dev", None), vm("run-0a1b2c3d", Some("dev")), other] {
+            let dir = m.paths.vm_dir(&cfg.name);
+            fs::create_dir(&dir).unwrap();
+            cfg.save(&dir).unwrap();
+        }
+        let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("in use by dev, run-0a1b2c3d; remove those VMs first"),
+            "{err}"
+        );
+        for name in ["dev", "run-0a1b2c3d"] {
+            fs::remove_dir_all(m.paths.vm_dir(name)).unwrap();
+        }
+        // A half-made VM: only its disk says what it backs onto.
+        let half = m.paths.vm_dir("half");
+        fs::create_dir(&half).unwrap();
+        let ok = std::process::Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2", "-u", "-F", "qcow2", "-b"])
+            .arg(&base)
+            .arg(half.join(qemu::DISK))
+            .arg("1G")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
+        assert!(err.to_string().contains("in use by half"), "{err}");
+        fs::remove_dir_all(&half).unwrap();
+        m.remove_image("ubuntu-26.04").await.unwrap();
+        assert!(!base.exists());
+        assert!(!crate::images::debs_dir(&m.paths, "ubuntu-26.04").exists());
+        assert!(m.remove_image("ubuntu-26.04").await.is_err());
+        assert!(m.remove_image("../x").await.is_err());
+    }
+
+    /// A pull is refused before any download unless twice the image fits
+    /// above the disk floor; a cached image needs no space.
+    #[tokio::test]
+    async fn pull_needs_free_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let mut config = DaemonConfig::default();
+        // No disk has a 1 PiB floor free.
+        config.host.disk_floor_gib = 1 << 20;
+        let m = Manager::new(paths, config, Cgroups::at(root.join("cg")), Mode::Dev);
+        let err = m.pull("arch").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not enough disk space to download the image"),
+            "{err}"
+        );
+        assert!(!m.paths.images_dir().join(".partial-arch").exists());
+        fs::write(crate::images::image_path(&m.paths, "arch"), b"qcow2").unwrap();
+        m.pull("arch").await.unwrap();
+    }
+
     #[tokio::test]
     async fn clone_names_are_reserved() {
         let tmp = tempfile::tempdir().unwrap();

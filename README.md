@@ -74,13 +74,26 @@ Guest images (`stallo images` lists them):
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
 Ubuntu images are checked with the host's Ubuntu keyrings; other
-distributions' signing keys ship with Stallo in `catalog/keys/`. Arch signs
-the image itself rather than a checksum list; a signature older than 45
-days is refused. Debian's image has no signature at all: its SHA-512 is
-pinned in the catalog (`catalog/debian-13.toml`), while its guest-agent
-package comes from the signed Debian archive. The `internet` profile is
-refused for images it was not verified with (`internet` in the catalog
-entry): so far the Ubuntu ones.
+distributions' signing keys ship with Stallo in `catalog/keys/`. Ubuntu's
+`current/` and Arch's `latest/` move to each new build, so their signatures
+must be at most 45 days old: a stale or replaying mirror cannot hold back an
+old build for longer. Arch signs the image itself rather than a checksum
+list. Debian's image has no signature at all: its SHA-512 is pinned in the
+catalog (`catalog/debian-13.toml`), while its guest-agent package comes
+from the signed Debian archive. The `internet` profile is refused for
+images it was not verified with (`internet` in the catalog entry): so far
+the Ubuntu ones.
+
+A pull starts only if the image's filesystem keeps the disk floor
+(`disk_floor_gib`) free plus twice the image's largest size (less what an
+interrupted download already holds). A pulled image is kept as it is, and
+`stallo images` shows the date of the signature it was verified with. To
+get a newer build, or to free the space, delete it and pull again:
+
+```sh
+stallo images rm ubuntu-26.04   # refused while any VM was made from it
+stallo images pull ubuntu-26.04
+```
 
 What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 

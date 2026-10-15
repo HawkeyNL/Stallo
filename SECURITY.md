@@ -65,14 +65,24 @@ the port can still use up the connection slots: Tailscale ACLs are the
 real boundary. Anyone with the token can do what agents may do; keep the
 file private and rotate it by restarting with a new one.
 
+## Images
+
+A cached image is a VM disk's read-only base, so `stallo images rm` (humans
+only) is refused while any VM, stopped VMs and `stallo run` clones
+included, names it in `vm.toml` or has a disk whose qcow2 header names it
+as backing file; it never follows symlinks. A pull needs the disk floor
+plus twice the image's largest size free, so a download cannot push the
+host below the floor. Signatures on moving URLs (Ubuntu `current/`, Arch
+`latest/`) older than 45 days are refused.
+
 ## Agent policy
 
 Agents reach Stallo through `stallo mcp`, which marks its requests
 `via: mcp`. The daemon then refuses every tool on a VM whose agent
 control is off (the default; `stallo agent <vm> on` turns it on), refuses
 VM creation unless `agents_can_create = true` in `stallod.toml`, and
-never lets agents delete VMs, pull images, resume VMs or change agent
-control. Agents create VMs only from images a human has already pulled
+never lets agents delete VMs, pull or delete images, resume VMs or change
+agent control. Agents create VMs only from images a human has already pulled
 (`stallo images pull <id>`). Turning agent control off stops new agent
 calls; calls already running (an `exec` can run up to an hour) finish
 first.

@@ -327,7 +327,8 @@ rollbacks in reverse order.
    - Edit it with `sudoedit -u stallo /var/lib/stallo/stallod.toml`.
    - Then `sudo systemctl restart stallod`. **This stops all VMs.**
    - Rollback: delete the file and restart (the defaults apply).
-6. **Full removal**, only if you also want to delete all VMs and images:
+6. **Full removal**, only if you also want to delete all VMs and images
+   (one image alone: `stallo images rm <id>`, refused while a VM uses it):
    - `sudo apt purge stallo`
    - `sudo rm -r /var/lib/stallo`: **deletes every VM disk and snapshot**.
    - `sudo userdel stallo`, then `sudo groupdel stallo` if the group is

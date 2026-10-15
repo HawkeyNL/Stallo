@@ -25,7 +25,8 @@ use tokio::sync::watch;
 
 use crate::cgroup::{Cgroups, Limits};
 use crate::config::{
-    DaemonConfig, Mode, NetProfile, PortForward, VmConfig, new_uuid, validate_name,
+    DaemonConfig, Mode, NetProfile, PortForward, VmConfig, new_uuid, validate_image_id,
+    validate_name,
 };
 use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
@@ -155,8 +156,9 @@ pub struct Manager {
     running: Mutex<HashMap<String, Arc<Running>>>,
     /// Per-name lifecycle locks.
     ops: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Serialises image downloads.
-    pulls: tokio::sync::Mutex<()>,
+    /// Image downloads and removals take it exclusively, one at a time;
+    /// VM creation shares it while it builds a disk on an image.
+    images: tokio::sync::RwLock<()>,
     /// Serialises admission: checking what fits and starting it is atomic.
     admission: tokio::sync::Mutex<()>,
     /// VMs whose disk a `stallo run` clone uses; their lifecycle lock is
@@ -173,7 +175,7 @@ impl Manager {
             cgroups,
             running: Mutex::default(),
             ops: Mutex::default(),
-            pulls: tokio::sync::Mutex::default(),
+            images: tokio::sync::RwLock::default(),
             admission: tokio::sync::Mutex::default(),
             in_run: Mutex::default(),
         })
@@ -303,11 +305,61 @@ impl Manager {
         Ok(())
     }
 
-    /// Downloads and verifies an image unless it is cached.
+    /// Downloads and verifies an image unless it is cached. Refused unless
+    /// the download fits above the disk floor ([`host::check_pull_space`]).
     pub async fn pull(&self, id: &str) -> Result<()> {
         let entry = images::find(id)?;
-        let _guard = self.pulls.lock().await;
+        let _guard = self.images.write().await;
+        if !images::image_path(&self.paths, id).is_file() {
+            let dir = self.paths.images_dir();
+            ensure_private_dir(&dir)?;
+            host::check_pull_space(
+                host::disk_free(&dir)?,
+                self.config.host.disk_floor_gib,
+                entry.max_size,
+                images::resumable_bytes(&self.paths, &entry),
+            )?;
+        }
         images::pull(&self.paths, &entry).await
+    }
+
+    /// Deletes a cached image (`stallo images rm`). Refused while any VM,
+    /// stopped or a `stallo run` clone included, was made from it: by its
+    /// `vm.toml`, or by its disk's backing file (also for a VM directory
+    /// whose `vm.toml` is missing or broken).
+    pub async fn remove_image(&self, id: &str) -> Result<()> {
+        validate_image_id(id)?;
+        let _guard = self.images.write().await;
+        let file = format!("{id}.qcow2");
+        let mut users = vec![];
+        for entry in fs::read_dir(self.paths.vms_dir())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let (dir, name) = (entry.path(), entry.file_name());
+            let name = name.to_string_lossy();
+            let by_config = VmConfig::load(&dir).is_ok_and(|c| c.image == id);
+            // A disk is written by its QEMU: only its file name counts, and
+            // a disk that cannot be read refuses the removal.
+            let by_disk = images::backing_file(&dir.join(qemu::DISK))
+                .with_context(|| format!("cannot tell whether {name} uses image {id}"))?
+                .is_some_and(|b| Path::new(&b).file_name() == Some(file.as_ref()));
+            if by_config || by_disk {
+                users.push(name.into_owned());
+            }
+        }
+        users.sort();
+        ensure!(
+            users.is_empty(),
+            "image {id} is in use by {}; remove those VMs first (stallo rm)",
+            users.join(", ")
+        );
+        ensure!(
+            images::remove(&self.paths, id)?,
+            "image {id} is not pulled; see `stallo images`"
+        );
+        Ok(())
     }
 
     /// Creates the VM's directory, disk, firmware variables, password and
@@ -336,6 +388,9 @@ impl Manager {
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
         self.pull(&cfg.image).await?;
+        // Held until the VM's files exist, so `images rm` sees them; an
+        // image removed before this point fails the creation.
+        let _image = self.images.read().await;
 
         let _op = self.lock(&new.name).await?;
         let dir = self.paths.vm_dir(&new.name);

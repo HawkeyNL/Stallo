@@ -153,6 +153,7 @@ pub fn describe(r: &Request) -> Described<'_> {
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),
         Request::Pull { .. } => ("pull", None, vec![], None),
+        Request::ImageRm { .. } => ("image_rm", None, vec![], None),
     }
 }
 

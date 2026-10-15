@@ -586,11 +586,15 @@ async fn dispatch(
                     if e.firmware == images::Firmware::Uefi {
                         notes.push("no Secure Boot".into());
                     }
+                    let sig_date = size_bytes
+                        .and_then(|_| images::pulled(&m.paths, &e.id))
+                        .and_then(|p| p.sig_date);
                     ImageInfo {
                         cached,
                         os: Some(e.os),
                         trust: Some(e.trust),
                         size_bytes,
+                        sig_date,
                         notes,
                         id: e.id,
                         name: e.name,
@@ -600,6 +604,10 @@ async fn dispatch(
         ),
         Request::Pull { image } => {
             m.pull(&image).await?;
+            Value::Null
+        }
+        Request::ImageRm { image } => {
+            m.remove_image(&image).await?;
             Value::Null
         }
     })
