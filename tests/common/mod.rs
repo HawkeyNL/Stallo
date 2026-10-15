@@ -179,7 +179,8 @@ impl Daemon {
         fs::create_dir_all(&images).unwrap();
         fs::write(data.join("stallod.toml"), config).unwrap();
 
-        // Hard-link the cached image (free) and copy the debs (small).
+        // Hard-link the cached image (free) and copy the debs (small), if
+        // the image needs any.
         let id = image_id();
         let source = home.join(".local/share/stallo-dev/images");
         let image = source.join(format!("{id}.qcow2"));
@@ -190,10 +191,12 @@ impl Daemon {
         );
         fs::hard_link(&image, images.join(format!("{id}.qcow2"))).unwrap();
         let debs = images.join(format!("{id}.debs"));
-        fs::create_dir(&debs).unwrap();
-        for e in fs::read_dir(source.join(format!("{id}.debs"))).unwrap() {
-            let e = e.unwrap();
-            fs::copy(e.path(), debs.join(e.file_name())).unwrap();
+        if let Ok(cached) = fs::read_dir(source.join(format!("{id}.debs"))) {
+            fs::create_dir(&debs).unwrap();
+            for e in cached {
+                let e = e.unwrap();
+                fs::copy(e.path(), debs.join(e.file_name())).unwrap();
+            }
         }
 
         let unit = format!("stallo-it-{name}");

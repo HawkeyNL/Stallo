@@ -69,6 +69,9 @@ fn boot_exec_stop_rm() {
         d.ok(&["exec", "dev", "--admin", "--", "id", "-un"]).trim(),
         "root"
     );
+    // The guest user may use sudo with its password (seed.rs).
+    let sudo = d.ok(&["exec", "dev", "--admin", "--", "sudo", "-l", "-U", "agent"]);
+    assert!(sudo.contains("(ALL : ALL) ALL"), "{sudo}");
     let t = Instant::now();
     d.ok(&["exec", "dev", "--", "true"]);
     eprintln!("MEASURE exec true: {} ms", t.elapsed().as_millis());
