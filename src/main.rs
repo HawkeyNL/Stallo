@@ -841,7 +841,7 @@ fn images_table(images: &[ImageInfo]) -> String {
     for i in images {
         let state = if i.cached { "cached" } else { "not downloaded" };
         let size = i.size_bytes.map_or("-".into(), |b| mib(b >> 20));
-        let trust = serde_json::to_value(i.trust).unwrap();
+        let trust = serde_json::to_value(i.trust).unwrap_or_default();
         let notes = std::iter::once(i.name.as_str())
             .chain(i.notes.iter().map(String::as_str))
             .collect::<Vec<_>>()
@@ -851,7 +851,7 @@ fn images_table(images: &[ImageInfo]) -> String {
             i.id,
             state,
             size,
-            trust.as_str().unwrap_or("?")
+            trust.as_str().unwrap_or("-")
         ));
     }
     s
@@ -1086,6 +1086,14 @@ mod tests {
             images_table(&images),
             "ID               STATE               SIZE  TRUST        NOTES\n\
              ubuntu-26.04     not downloaded   825 MiB  signed-sums  Ubuntu; guest-agent packages not downloaded yet\n"
+        );
+        // What an older stallod sends.
+        let old = serde_json::json!([{"id": "ubuntu-26.04", "name": "Ubuntu", "cached": true}]);
+        let images: Vec<ImageInfo> = serde_json::from_value(old).unwrap();
+        let table = images_table(&images);
+        assert_eq!(
+            table.lines().nth(1),
+            Some("ubuntu-26.04     cached                 -  -            Ubuntu")
         );
     }
 

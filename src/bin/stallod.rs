@@ -578,8 +578,8 @@ async fn dispatch(
                     }
                     ImageInfo {
                         cached,
-                        os: e.os,
-                        trust: e.trust,
+                        os: Some(e.os),
+                        trust: Some(e.trust),
                         size_bytes,
                         notes,
                         id: e.id,

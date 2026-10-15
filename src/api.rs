@@ -306,11 +306,16 @@ pub struct ImageInfo {
     pub name: String,
     /// The image and its guest-agent packages are downloaded and verified.
     pub cached: bool,
-    pub os: crate::images::Os,
-    pub trust: crate::images::Trust,
+    // Optional: an older stallod does not send these.
+    #[serde(default)]
+    pub os: Option<crate::images::Os>,
+    #[serde(default)]
+    pub trust: Option<crate::images::Trust>,
     /// Bytes of the cached image file.
+    #[serde(default)]
     pub size_bytes: Option<u64>,
     /// Things to know before using the image.
+    #[serde(default)]
     pub notes: Vec<String>,
 }
 
