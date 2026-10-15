@@ -69,10 +69,13 @@ Guest images (`stallo images` lists them):
 | `ubuntu-26.04` (default) | Ubuntu 26.04 LTS server cloud image | |
 | `ubuntu-24.04` | Ubuntu 24.04 LTS server cloud image | |
 | `fedora-44` | Fedora 44 Cloud Base Generic (44-1.7) | The guest agent's SELinux domain is made permissive (see `catalog/fedora-44.toml`). |
+| `arch` | Arch Linux cloud image (arch-boxes) | No Secure Boot (its boot loader is not signed for it). Rolling: `latest/` moves every two weeks, and the first pull is kept. |
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
 Ubuntu images are checked with the host's Ubuntu keyrings; other
-distributions' signing keys ship with Stallo in `catalog/keys/`.
+distributions' signing keys ship with Stallo in `catalog/keys/`. Arch signs
+the image itself rather than a checksum list; a signature older than 90
+days is refused.
 
 What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 

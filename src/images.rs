@@ -4,8 +4,11 @@
 //! (detached or clearsigned) verifies against the catalog's keyring (`gpgv`)
 //! and comes from the pinned signing key, the image's SHA-256 (computed
 //! here) matches its line in the signed text, and `qemu-img info` shows a
-//! plain qcow2 with no backing file and no external data file. Cached images
-//! are read-only and never replaced, because VM disks are overlays on them.
+//! plain qcow2 with no backing file and no external data file. With
+//! `signed-image`, a detached signature over the image itself replaces the
+//! checksum list, and it must be at most [`MAX_SIG_AGE_DAYS`] old. Cached
+//! images are read-only and never replaced, because VM disks are overlays on
+//! them.
 //!
 //! Keyrings are host files (Ubuntu's, from its keyring packages) or
 //! vendored in `catalog/keys/` and compiled in.
@@ -229,9 +232,8 @@ impl CatalogEntry {
             );
         }
         ensure!(
-            (self.os, self.firmware, self.trust)
-                == (Os::Linux, Firmware::SecureBoot, Trust::SignedSums),
-            "{id}: not supported yet: only Linux images with Secure Boot and signed checksums"
+            self.os == Os::Linux && self.trust != Trust::Pinned,
+            "{id}: not supported yet: only Linux images with signatures"
         );
         Ok(())
     }
@@ -246,11 +248,28 @@ const CATALOG: &[&str] = &[
     include_str!("../catalog/ubuntu-26.04.toml"),
     include_str!("../catalog/ubuntu-24.04.toml"),
     include_str!("../catalog/fedora-44.toml"),
+    include_str!("../catalog/arch.toml"),
 ];
 
 /// OpenPGP keyrings (binary) that catalog entries name in `keyring`. A
 /// unit test pins the fingerprints in each.
-const KEYS: &[(&str, &[u8])] = &[("fedora.gpg", include_bytes!("../catalog/keys/fedora.gpg"))];
+const KEYS: &[(&str, &[u8])] = &[
+    ("fedora.gpg", include_bytes!("../catalog/keys/fedora.gpg")),
+    (
+        "arch-boxes.gpg",
+        include_bytes!("../catalog/keys/arch-boxes.gpg"),
+    ),
+];
+
+/// The oldest signature `signed-image` accepts. Its URLs move to each new
+/// build (Arch publishes one every two weeks), so an older signature means
+/// a stale or replaying mirror.
+///
+/// A detached signature does not name the file: within this window, a
+/// mirror could serve any image the same key signed (an older build, or
+/// another image type) under the catalog's URL. TLS to the catalog's host
+/// and this age limit are what bound that.
+pub const MAX_SIG_AGE_DAYS: u64 = 90;
 
 /// All catalog entries.
 pub fn catalog() -> Vec<CatalogEntry> {
@@ -356,9 +375,36 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     let root = paths.images_dir();
     let work = root.join(format!(".partial-{}", entry.id));
     ensure_private_dir(&work)?;
+    let image = match entry.trust {
+        Trust::SignedSums => fetch_signed_sums(paths, entry, &work).await?,
+        Trust::SignedImage => fetch_signed_image(paths, entry, &work).await?,
+        Trust::Pinned => bail!("{}: pinned images are not supported yet", entry.id),
+    };
+    if let Err(e) = check_image(&image).await {
+        // Otherwise the next pull would find the same file complete.
+        safe_remove(&root, &image)?;
+        return Err(e);
+    }
 
-    // `validate` guarantees these for the only trust it accepts so far.
-    let field = |f: &Option<String>| f.clone().context("incomplete catalog entry");
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o444))?;
+    fs::File::open(&image)?.sync_all()?;
+    // A hard link fails if the target exists: a cached base image is never
+    // replaced, because VM disks are overlays on it.
+    fs::hard_link(&image, image_path(paths, &entry.id))?;
+    fs::File::open(&root)?.sync_all()?;
+    safe_remove(&root, &work)?;
+    Ok(())
+}
+
+/// `validate` guarantees the fields each trust needs.
+fn field(f: &Option<String>) -> Result<String> {
+    f.clone().context("incomplete catalog entry")
+}
+
+/// Downloads the image into `work` and checks it against the signed
+/// checksum list; returns its path.
+async fn fetch_signed_sums(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<PathBuf> {
+    let root = paths.images_dir();
     let sums = work.join("SHA256SUMS");
     let sig = work.join("SHA256SUMS.gpg");
     let signed = work.join("SHA256SUMS.signed");
@@ -396,15 +442,80 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
             );
         }
     }
-    check_image(&image).await?;
+    Ok(image)
+}
 
-    fs::set_permissions(&image, fs::Permissions::from_mode(0o444))?;
-    fs::File::open(&image)?.sync_all()?;
-    // A hard link fails if the target exists: a cached base image is never
-    // replaced, because VM disks are overlays on it.
-    fs::hard_link(&image, image_path(paths, &entry.id))?;
-    fs::File::open(&root)?.sync_all()?;
-    safe_remove(&root, &work)?;
+/// Downloads the image into `work` and checks the detached signature over
+/// it; returns its path.
+///
+/// No hash is known before the download, so the partial file is named
+/// after the URL: a partial download from another catalog URL is never
+/// resumed into this one. A moving URL can still serve a newer build
+/// behind a partial download, and a mirror can be caught between image and
+/// signature while it publishes: either fails the check, which deletes
+/// both and tries once more from scratch. A failed download keeps the
+/// partial file for the next pull.
+async fn fetch_signed_image(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<PathBuf> {
+    let root = paths.images_dir();
+    let key = url_key(&entry.url);
+    let image = work.join(format!("{key}.part"));
+    let sig = work.join(format!("{key}.sig"));
+    let keyring = keyring_path(paths, &field(&entry.keyring)?)?;
+    let fingerprint = field(&entry.signing_key)?;
+    let mut retried = false;
+    loop {
+        safe_remove(&root, &sig)?;
+        download(&field(&entry.sig_url)?, &sig, 1 << 20, false).await?;
+        tracing::info!("downloading {}", entry.url);
+        // A complete file is not downloaded again (curl takes the server's
+        // "range not satisfiable" as done).
+        download(&entry.url, &image, entry.max_size, true).await?;
+        let checked = async {
+            let created = gpgv(&keyring, &fingerprint, &[&sig, &image], 600)
+                .await?
+                .context("gpgv gave no signature time in seconds")?;
+            check_sig_age(created, now_secs()?)
+        }
+        .await
+        .with_context(|| format!("signature check of {} failed", entry.url));
+        match checked {
+            Ok(()) => return Ok(image),
+            Err(e) => {
+                safe_remove(&root, &image)?;
+                safe_remove(&root, &sig)?;
+                if retried {
+                    return Err(e);
+                }
+                tracing::warn!("{e:#}; downloading once more");
+                retried = true;
+            }
+        }
+    }
+}
+
+/// Names partial downloads after their URL (SHA-256, hex).
+fn url_key(url: &str) -> String {
+    Sha256::digest(url.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn now_secs() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("the host clock is before 1970")?
+        .as_secs())
+}
+
+/// Refuses a signature made more than [`MAX_SIG_AGE_DAYS`] before `now`
+/// (both in seconds since the epoch).
+fn check_sig_age(created: u64, now: u64) -> Result<()> {
+    let days = now.saturating_sub(created) / 86_400;
+    ensure!(
+        days <= MAX_SIG_AGE_DAYS,
+        "the signature is {days} days old (at most {MAX_SIG_AGE_DAYS}): the mirror looks stale"
+    );
     Ok(())
 }
 
@@ -572,25 +683,36 @@ async fn signed_text(
     sig: Option<&Path>,
     out: &Path,
 ) -> Result<String> {
-    let mut cmd = Command::new("gpgv");
-    cmd.args(["--status-fd", "1", "--keyring"]).arg(keyring);
-    let text = match sig {
-        Some(sig) => {
-            cmd.arg(sig).arg(sums);
-            sums
-        }
-        None => {
-            cmd.arg("--output").arg(out).arg(sums);
-            out
-        }
+    let output = Path::new("--output");
+    let (args, text) = match sig {
+        Some(sig) => (vec![sig, sums], sums),
+        None => (vec![output, out, sums], out),
     };
-    let status = run_tool(&mut cmd, Duration::from_secs(30)).await?;
-    check_gpg_status(&String::from_utf8_lossy(&status), fingerprint)?;
+    gpgv(keyring, fingerprint, &args, 30).await?;
     Ok(fs::read_to_string(text)?)
 }
 
-fn check_gpg_status(status: &str, fingerprint: &str) -> Result<()> {
-    let mut valid = 0;
+/// Runs `gpgv` with `args` and checks its status (see
+/// [`check_gpg_status`]); returns the signature's creation time.
+async fn gpgv(
+    keyring: &Path,
+    fingerprint: &str,
+    args: &[&Path],
+    timeout: u64,
+) -> Result<Option<u64>> {
+    let mut cmd = Command::new("gpgv");
+    cmd.args(["--status-fd", "1", "--keyring"])
+        .arg(keyring)
+        .args(args);
+    let status = run_tool(&mut cmd, Duration::from_secs(timeout)).await?;
+    check_gpg_status(&String::from_utf8_lossy(&status), fingerprint)
+}
+
+/// Requires exactly one valid signature by `fingerprint` and nothing bad;
+/// returns its creation time (seconds since the epoch) if gpgv gave it in
+/// seconds.
+fn check_gpg_status(status: &str, fingerprint: &str) -> Result<Option<u64>> {
+    let mut valid = vec![];
     for line in status.lines() {
         let mut words = line.split_whitespace();
         if words.next() != Some("[GNUPG:]") {
@@ -604,17 +726,27 @@ fn check_gpg_status(status: &str, fingerprint: &str) -> Result<()> {
             ) => {
                 bail!("gpgv reported: {line}")
             }
-            // The last field of VALIDSIG is the primary key fingerprint.
-            Some("VALIDSIG") if words.last() == Some(fingerprint) => valid += 1,
-            Some("VALIDSIG") => bail!("signed by an unexpected key: {line}"),
+            // VALIDSIG <fpr> <date> <created> ... <primary fpr>: the last
+            // field is the primary key. `created` is in seconds or, from
+            // some GnuPG versions, ISO 8601 (then None).
+            Some("VALIDSIG") => {
+                let fields: Vec<&str> = words.collect();
+                ensure!(
+                    fields.last() == Some(&fingerprint),
+                    "signed by an unexpected key: {line}"
+                );
+                valid.push(fields.get(2).and_then(|t| t.parse().ok()));
+            }
             _ => {}
         }
     }
-    ensure!(
-        valid == 1,
-        "expected one valid signature by {fingerprint}, found {valid}"
-    );
-    Ok(())
+    match valid[..] {
+        [created] => Ok(created),
+        _ => bail!(
+            "expected one valid signature by {fingerprint}, found {}",
+            valid.len()
+        ),
+    }
 }
 
 /// Finds the SHA-256 of `file` in a checksum list: `<hex> *<name>` (GNU)
@@ -727,6 +859,13 @@ mod tests {
         assert_eq!(e.sig_url.as_deref(), Some(""));
         assert_eq!(e.sums_format, Some(SumsFormat::Bsd));
         assert_eq!(e.agent, Agent::Preinstalled);
+        let e = find("arch").unwrap();
+        assert_eq!(e.file(), "Arch-Linux-x86_64-cloudimg.qcow2");
+        assert_eq!(
+            (e.trust, e.firmware, e.agent),
+            (Trust::SignedImage, Firmware::Uefi, Agent::Preinstalled)
+        );
+        assert_eq!(e.sig_url.unwrap(), format!("{}.sig", e.url));
         assert!(find("debian-13").is_err());
         assert!(find("../x").is_err());
     }
@@ -844,6 +983,11 @@ mod tests {
             ("sums_format", None),
         ];
         assert!(err(&signed_image).contains("https"));
+        let mut signed_image = signed_image.to_vec();
+        signed_image[1] = ("sig_url", Some(r#""https://example.com/a.img.sig""#));
+        entry_with(&signed_image).unwrap();
+        signed_image[2] = ("sums_url", Some(r#""https://example.com/S""#));
+        assert!(err(&signed_image).contains("signed-image needs"));
         // Full fingerprints only.
         for bad in ["7DB87C81", "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81"] {
             let v = format!("{bad:?}");
@@ -852,9 +996,8 @@ mod tests {
         // Unknown fields and values are refused.
         assert!(entry_with(&[("release", Some(r#""26.04""#))]).is_err());
         assert!(entry_with(&[("os", Some(r#""macos""#))]).is_err());
-        for (k, v) in [("os", r#""windows""#), ("firmware", r#""uefi""#)] {
-            assert!(err(&[(k, Some(v))]).contains("not supported yet"), "{k}");
-        }
+        assert!(err(&[("os", Some(r#""windows""#))]).contains("not supported yet"));
+        entry_with(&[("firmware", Some(r#""uefi""#))]).unwrap();
     }
 
     /// Each vendored keyring holds exactly the primary keys that catalog
@@ -897,6 +1040,10 @@ mod tests {
         assert_eq!(
             find("fedora-44").unwrap().signing_key.as_deref(),
             Some("36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6")
+        );
+        assert_eq!(
+            find("arch").unwrap().signing_key.as_deref(),
+            Some("1B9A16984A4E8CB448712D2AE0B78BF4326C6F8F")
         );
     }
 
@@ -977,7 +1124,11 @@ mod tests {
             "[GNUPG:] NEWSIG\n[GNUPG:] GOODSIG 1A5D6C4C7DB87C81 UEC\n\
              [GNUPG:] VALIDSIG {fpr} 2026-09-29 1790640937 0 4 0 1 10 00 {fpr}\n"
         );
-        check_gpg_status(&good, fpr).unwrap();
+        assert_eq!(check_gpg_status(&good, fpr).unwrap(), Some(1790640937));
+        // A signature time that is not in seconds is not one
+        // (signed-image then refuses it).
+        let iso = good.replace(" 1790640937 ", " 20260929T061537 ");
+        assert_eq!(check_gpg_status(&iso, fpr).unwrap(), None);
         let other = good.replace(
             &format!("00 {fpr}"),
             "00 4A3CE3CD565D7EB5C810E2B97FF3F408476CF100",
@@ -996,6 +1147,17 @@ mod tests {
             let status = format!("{good}[GNUPG:] {bad}\n");
             assert!(check_gpg_status(&status, fpr).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn signature_age() {
+        let day = 86_400;
+        let now = 1_800_000_000;
+        check_sig_age(now, now).unwrap();
+        check_sig_age(now - 90 * day, now).unwrap();
+        assert!(check_sig_age(now - 91 * day, now).is_err());
+        // From the future (clock skew): not stale.
+        check_sig_age(now + day, now).unwrap();
     }
 
     /// Real gpgv against a throwaway key, detached and clearsigned: a good
@@ -1057,6 +1219,36 @@ mod tests {
         assert!(check(fpr.clone(), Some(sig.clone())).await.is_err());
         // A detached signature is not a clearsigned file.
         assert!(check(fpr.clone(), None).await.is_err());
+        // Over an image (signed-image): gives the signature time.
+        let image = dir.path().join("a.img");
+        fs::write(
+            &image,
+            (0..=255u8).cycle().take(1 << 20).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let image_sig = dir.path().join("a.img.sig");
+        let image_s = image.to_str().unwrap();
+        gpg(&[
+            "--detach-sign",
+            "--output",
+            image_sig.to_str().unwrap(),
+            image_s,
+        ]);
+        let created = gpgv(&keyring, &fpr, &[&image_sig, &image], 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(now_secs().unwrap().abs_diff(created) < 600, "{created}");
+        // The signature over the checksum list is not one over the image.
+        assert!(gpgv(&keyring, &fpr, &[&sig, &image], 30).await.is_err());
+        let mut tampered = fs::read(&image).unwrap();
+        tampered[1000] ^= 1;
+        fs::write(&image, tampered).unwrap();
+        assert!(
+            gpgv(&keyring, &fpr, &[&image_sig, &image], 30)
+                .await
+                .is_err()
+        );
 
         // Clearsigned: only the signed part counts.
         let (good, evil) = ("a".repeat(64), "e".repeat(64));
@@ -1139,6 +1331,34 @@ mod tests {
             signed_text(&keyring, &"0".repeat(40), &sums, None, &out)
                 .await
                 .is_err()
+        );
+    }
+
+    /// Pulls the Arch image for real (network, about 600 MB):
+    /// `cargo test -- --ignored signed_image_live`. A file larger than the
+    /// image already sits where the download goes, as after an upstream
+    /// rebuild: curl takes it as complete, the signature check fails, and
+    /// the one retry downloads the image from scratch.
+    #[tokio::test]
+    #[ignore = "downloads the Arch image"]
+    async fn signed_image_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        ensure_private_dir(&paths.images_dir()).unwrap();
+        let entry = find("arch").unwrap();
+        let work = paths.images_dir().join(".partial-arch");
+        ensure_private_dir(&work).unwrap();
+        let stale = fs::File::create(work.join(format!("{}.part", url_key(&entry.url)))).unwrap();
+        stale.set_len(entry.max_size).unwrap();
+        pull(&paths, &entry).await.unwrap();
+        let image = image_path(&paths, "arch");
+        let mode = fs::metadata(&image).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+        assert!(check_image(&image).await.unwrap().virtual_size > 0);
+        assert_eq!(
+            fs::read_dir(paths.images_dir()).unwrap().count(),
+            2,
+            "only the image and the keys are left"
         );
     }
 

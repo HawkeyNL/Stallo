@@ -1,0 +1,34 @@
+# Arch Linux cloud image (arch-boxes), amd64, qcow2, BIOS/UEFI GPT.
+# `latest/` moves to each new build (every two weeks); the first pull is
+# kept. To pick up a newer build, remove the cached image and pull again.
+id = "arch"
+name = "Arch Linux cloud image (rolling, latest build)"
+os = "linux"
+# GRUB is not signed for Secure Boot: OVMF runs with no keys enrolled.
+firmware = "uefi"
+url = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+max_size = 2_147_483_648
+
+# A detached signature over the image itself; arch-boxes publishes no
+# signed checksum list for the `latest/` names.
+trust = "signed-image"
+sig_url = "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2.sig"
+# Vendored in catalog/keys/arch-boxes.gpg: "arch-boxes
+# <arch-boxes@archlinux.org>", which the arch-boxes CI signs every release
+# with (signing subkey 656E4C5AC1CC3B86E539D97E343635A6859A9174, expires
+# 2027-05-28). The key is the one in the arch-boxes README on
+# gitlab.archlinux.org (byte for byte, also on its GitHub mirror), and the
+# fingerprint matches keyserver.ubuntu.com (2026-10-15). When the subkey
+# expires, pulls fail until a refreshed key is vendored.
+keyring = "arch-boxes.gpg"
+signing_key = "1B9A16984A4E8CB448712D2AE0B78BF4326C6F8F"
+
+# The image ships qemu-guest-agent (arch-boxes installs it in every image).
+agent = "preinstalled"
+
+# Not verified: the `internet` profile (dev mode is offline only). Here
+# cloud-init renders the network config for systemd-networkd, which names
+# the interface after the config's key rather than its match, and the image
+# boots with net.ifnames=0 (eth0). If DHCP does not come up, the first boot
+# also waits for clock synchronisation (systemd-time-wait-sync, masked only
+# for offline VMs) and the VM never reports ready.

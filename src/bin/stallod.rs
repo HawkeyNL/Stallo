@@ -580,6 +580,9 @@ async fn dispatch(
                     if size_bytes.is_some() && !cached {
                         notes.push("guest-agent packages not downloaded yet".into());
                     }
+                    if e.firmware == images::Firmware::Uefi {
+                        notes.push("no Secure Boot".into());
+                    }
                     ImageInfo {
                         cached,
                         os: Some(e.os),

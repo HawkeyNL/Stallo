@@ -70,6 +70,7 @@ fn boot_exec_stop_rm() {
         "root"
     );
     assert_sudo_with_password(&d);
+    assert_secure_boot(&d);
     let t = Instant::now();
     d.ok(&["exec", "dev", "--", "true"]);
     eprintln!("MEASURE exec true: {} ms", t.elapsed().as_millis());
@@ -176,20 +177,48 @@ fn assert_sudo_with_password(d: &Daemon) {
     );
 }
 
-/// systemd-networkd-wait-online never started in the guest: without a
-/// NIC it would hold the boot for 2 minutes (see qemu.rs and seed.rs).
-fn assert_no_wait_online(d: &Daemon) {
-    let started = d.ok(&[
+/// Secure Boot is on for `secure-boot` images and off for `uefi` ones (an
+/// empty variable store, see qemu.rs).
+fn assert_secure_boot(d: &Daemon) {
+    use stallo::images::Firmware;
+    // Four attribute bytes, then the value.
+    let on = d.ok(&[
         "exec",
         "dev",
         "--",
-        "systemctl",
-        "show",
-        "-P",
-        "ExecMainStartTimestampMonotonic",
-        "systemd-networkd-wait-online.service",
+        "od",
+        "-An",
+        "-tu1",
+        "-j4",
+        "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
     ]);
-    assert_eq!(started.trim(), "0", "wait-online ran");
+    let want = match stallo::images::find(&d.image).unwrap().firmware {
+        Firmware::SecureBoot => "1",
+        Firmware::Uefi => "0",
+    };
+    assert_eq!(on.trim(), want, "SecureBoot variable");
+}
+
+/// systemd-networkd-wait-online and systemd-time-wait-sync never started
+/// in the guest: without a NIC the first would hold the boot for 2 minutes
+/// and the second forever (see qemu.rs and seed.rs).
+fn assert_no_wait_online(d: &Daemon) {
+    for unit in [
+        "systemd-networkd-wait-online.service",
+        "systemd-time-wait-sync.service",
+    ] {
+        let started = d.ok(&[
+            "exec",
+            "dev",
+            "--",
+            "systemctl",
+            "show",
+            "-P",
+            "ExecMainStartTimestampMonotonic",
+            unit,
+        ]);
+        assert_eq!(started.trim(), "0", "{unit} ran");
+    }
 }
 
 /// Resident KiB of `pid`: (total, in mappings of at least `guest_kib`,

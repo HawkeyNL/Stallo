@@ -370,7 +370,7 @@ impl Manager {
             cfg.image
         );
         qemu::create_disk(&base, &dir.join(qemu::DISK), cfg.disk_gib).await?;
-        qemu::create_vars(&dir.join(qemu::VARS)).await?;
+        qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
         ensure_private_dir(&dir.join(qemu::STATES))?;
 
         let password = seed::generate_password()?;

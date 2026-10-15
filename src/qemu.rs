@@ -14,14 +14,18 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::process::Command;
 
 use crate::config::{NetProfile, VmConfig};
-use crate::images::Agent;
+use crate::images::{Agent, Firmware};
 use crate::run_tool;
 
 pub const QEMU: &str = "/usr/bin/qemu-system-x86_64";
-/// Secure Boot firmware and the matching variable store with Microsoft keys
-/// (Ubuntu's shim is signed by Microsoft).
+/// Secure Boot capable firmware for every VM. The variable store decides
+/// whether Secure Boot is on: with Microsoft's keys enrolled it is (Ubuntu's
+/// and Fedora's shims are signed by Microsoft); with no keys enrolled the
+/// firmware stays in setup mode and boots anything (`uefi` images). SMM and
+/// the secure flash are the same either way.
 pub const OVMF_CODE: &str = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd";
 pub const OVMF_VARS: &str = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd";
+pub const OVMF_VARS_NO_KEYS: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 
 /// Guest screen size; screenshots and pointer coordinates use it 1:1.
 pub const SCREEN: (u32, u32) = (1280, 800);
@@ -39,6 +43,10 @@ pub const VNC_SOCK: &str = "vnc.sock";
 pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
 
 const WAIT_ONLINE: &str = "systemd-networkd-wait-online.service";
+/// Waits for NTP before `time-sync.target`, with no timeout. Arch enables
+/// it, and its first boot orders cloud-init's final stage (and so the guest
+/// agent) after that target.
+const TIME_WAIT_SYNC: &str = "systemd-time-wait-sync.service";
 
 /// A drop-in for a preinstalled guest agent: it starts only after
 /// cloud-init's final stage. Otherwise it answers seconds before the seed
@@ -86,18 +94,22 @@ pub fn argv(
     });
     let network = match (vm.net, net_fd) {
         // No NIC means no link ever comes online, and Ubuntu's boot then
-        // waits 2 minutes for systemd-networkd-wait-online. An empty
-        // `systemd.extra-unit.*` credential masks it (systemd >= 256; for
-        // older systemd see the offline network-config in seed.rs).
-        (NetProfile::Offline, None) => [
+        // waits 2 minutes for systemd-networkd-wait-online; nor is the clock
+        // ever synchronised. An empty `systemd.extra-unit.*` credential
+        // masks a unit (systemd >= 256; for older systemd see the offline
+        // network-config in seed.rs).
+        (NetProfile::Offline, None) => vec![
             "-nic none".to_owned(),
             format!(
                 "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{WAIT_ONLINE}="
             ),
+            format!(
+                "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}="
+            ),
         ],
         // An already connected socket (see net.rs). `romfile=`: no iPXE
         // option ROM, so no network boot code in the firmware.
-        (NetProfile::Internet, Some(fd)) => [
+        (NetProfile::Internet, Some(fd)) => vec![
             format!("-netdev stream,id=net0,server=off,addr.type=fd,addr.str={fd}"),
             format!(
                 "-device virtio-net-pci,netdev=net0,mac={},romfile=",
@@ -191,13 +203,23 @@ pub async fn create_disk(base: &Path, disk: &Path, size_gib: u64) -> Result<()> 
     Ok(())
 }
 
+/// The firmware variable template for `firmware`.
+fn vars_template(firmware: Firmware) -> &'static str {
+    match firmware {
+        Firmware::SecureBoot => OVMF_VARS,
+        Firmware::Uefi => OVMF_VARS_NO_KEYS,
+    }
+}
+
 /// Copies the firmware variable template into a per-VM qcow2, so internal
-/// snapshots can include it.
-pub async fn create_vars(vars: &Path) -> Result<()> {
+/// snapshots can include it. Only the daemon reads the template; QEMU gets
+/// the copy.
+pub async fn create_vars(vars: &Path, firmware: Firmware) -> Result<()> {
     ensure!(!vars.exists(), "{} already exists", vars.display());
     run_tool(
         Command::new("qemu-img")
-            .args(["convert", "-q", "-f", "raw", "-O", "qcow2", OVMF_VARS])
+            .args(["convert", "-q", "-f", "raw", "-O", "qcow2"])
+            .arg(vars_template(firmware))
             .arg(vars),
         Duration::from_secs(30),
     )
@@ -263,7 +285,8 @@ mod tests {
 -device virtio-serial-pci \
 -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
 -nic none \
--smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-networkd-wait-online.service=";
+-smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-networkd-wait-online.service= \
+-smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-time-wait-sync.service=";
         assert_eq!(got.join(" "), want);
     }
 
@@ -364,8 +387,11 @@ mod tests {
             "-netdev stream,id=net0,server=off,addr.type=fd,addr.str=9 \
              -device virtio-net-pci,netdev=net0,mac=52:54:00:4f:1c:2b,romfile="
         );
-        assert_eq!(a[..a.len() - 4], offline[..offline.len() - 4]);
-        assert!(!a.iter().any(|x| x == "-nic" || x.contains(WAIT_ONLINE)));
+        assert_eq!(a[..a.len() - 4], offline[..offline.len() - 6]);
+        assert!(
+            !a.iter()
+                .any(|x| x == "-nic" || x.contains(WAIT_ONLINE) || x.contains(TIME_WAIT_SYNC))
+        );
         // The profile and the socket go together.
         assert!(
             argv(

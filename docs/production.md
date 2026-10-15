@@ -237,8 +237,9 @@ review fix, passed **all 147 checks** on a fresh lab VM.
 
 **Not verified:**
 
-- **The image download** (`curl` to cloud-images.ubuntu.com and
-  dl.fedoraproject.org) under the unit: the lab is offline.
+- **The image download** (`curl` to cloud-images.ubuntu.com,
+  dl.fedoraproject.org and geo.mirror.pkgbuild.com) under the unit: the
+  lab is offline.
   - DNS for it and the package pull goes through `127.0.0.53`, which
     the table allows for the daemon.
 - **The guest-agent package pull under the unit.** The packages come
