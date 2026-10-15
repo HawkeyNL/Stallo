@@ -135,7 +135,12 @@ pub fn default_socket() -> Result<PathBuf> {
     )
 }
 
-fn pick_socket(
+/// The choice behind [`default_socket`], without the I/O: `production` is
+/// the production socket if it exists and this user may reach it, `dev`
+/// the dev-mode socket path, `dev_up` whether that exists, and
+/// `prod_denied` whether the production socket is closed to this user
+/// (EACCES). The GUI uses it too, so both pick the same daemon.
+pub fn pick_socket(
     production: Option<PathBuf>,
     dev: Result<PathBuf>,
     dev_up: bool,

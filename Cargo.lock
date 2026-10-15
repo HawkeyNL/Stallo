@@ -1317,9 +1317,14 @@ dependencies = [
 name = "stallo-gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gtk4",
  "libadwaita",
+ "rustix",
+ "serde_json",
  "stallo",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

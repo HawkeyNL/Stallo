@@ -44,6 +44,6 @@ Priority: optional
 Depends: $depends
 Description: Desktop app for Stallo (preview)
  A GNOME app for the VMs that stallod runs. This early preview only
- opens an empty window.
+ connects to stallod and helps set up access to it.
 CONTROL
 dpkg-deb --root-owner-group -Zxz --build "$root" "target/deb/stallo-gui_${version}_amd64.deb"
