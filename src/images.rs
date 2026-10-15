@@ -272,7 +272,6 @@ pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
 /// images a human pulled.
 pub fn ensure_pulled(paths: &Paths, id: &str) -> Result<()> {
     let entry = find(id)?;
-    migrate_debs(paths, id)?;
     ensure!(
         is_cached(paths, &entry),
         "image {id} not pulled; a human runs `stallo images pull {id}`"
@@ -280,38 +279,55 @@ pub fn ensure_pulled(paths: &Paths, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Moves guest-agent packages that older versions cached per Ubuntu
-/// release (`debs/<release>/`) to `<id>.debs/`, so a host without
-/// network keeps working, and drops an old partial download.
-fn migrate_debs(paths: &Paths, id: &str) -> Result<()> {
+/// Guest-agent packages that older versions cached per Ubuntu release
+/// (`debs/<release>/`). They came from the host's apt sources, so they are
+/// only a fallback for a host that cannot fetch new ones.
+///
+/// With `keep`, moves them to `<id>.debs/` and returns whether it did;
+/// otherwise deletes them. Either way drops an old partial download.
+fn old_debs(paths: &Paths, id: &str, keep: bool) -> Result<bool> {
     let root = paths.images_dir();
     let Some(release) = id.strip_prefix("ubuntu-") else {
-        return Ok(());
+        return Ok(false);
     };
     if !root.is_dir() {
-        return Ok(());
-    }
-    let old = root.join("debs").join(release);
-    if old.is_dir() && !debs_dir(paths, id).exists() {
-        fs::rename(&old, debs_dir(paths, id))?;
-        fs::File::open(&root)?.sync_all()?;
-        // Goes only once it is empty.
-        let _ = fs::remove_dir(root.join("debs"));
+        return Ok(false);
     }
     safe_remove(&root, &root.join(format!(".partial-debs-{release}")))?;
-    Ok(())
+    let old = root.join("debs").join(release);
+    let moved = keep && old.is_dir() && !debs_dir(paths, id).exists();
+    if moved {
+        fs::rename(&old, debs_dir(paths, id))?;
+    } else {
+        safe_remove(&root, &old)?;
+    }
+    fs::File::open(&root)?.sync_all()?;
+    // Goes only once it is empty.
+    let _ = fs::remove_dir(root.join("debs"));
+    Ok(moved)
 }
 
 /// Downloads and verifies whatever of `entry` is not cached yet.
 pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     ensure_private_dir(&paths.images_dir())?;
-    migrate_debs(paths, &entry.id)?;
     if !image_path(paths, &entry.id).is_file() {
         pull_image(paths, entry).await?;
     }
     if !debs_dir(paths, &entry.id).is_dir() {
-        pull_debs(paths, entry).await?;
+        // An older cache is used only when fresh packages cannot be
+        // fetched (no network): it is no worse than before the upgrade.
+        if let Err(e) = pull_debs(paths, entry).await {
+            if !old_debs(paths, &entry.id, true)? {
+                return Err(e);
+            }
+            tracing::warn!(
+                "{}: using guest-agent packages cached by an older version: {e:#}",
+                entry.id
+            );
+            return Ok(());
+        }
     }
+    old_debs(paths, &entry.id, false)?;
     Ok(())
 }
 
@@ -917,32 +933,43 @@ mod tests {
         )));
     }
 
-    /// Packages cached by older versions move to `<id>.debs/`.
+    /// Packages cached by older versions are moved only as a fallback
+    /// (`keep`), and deleted otherwise.
     #[test]
-    fn old_debs_cache_moves() {
+    fn old_debs_cache() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
-        migrate_debs(&paths, "ubuntu-26.04").unwrap();
+        assert!(!old_debs(&paths, "ubuntu-26.04", true).unwrap());
 
         let images = paths.images_dir();
-        ensure_private_dir(&images.join("debs/26.04")).unwrap();
-        fs::write(images.join("debs/26.04/a_1_amd64.deb"), b"x").unwrap();
-        ensure_private_dir(&images.join(".partial-debs-26.04/x")).unwrap();
-        migrate_debs(&paths, "ubuntu-26.04").unwrap();
+        let old_cache = || {
+            ensure_private_dir(&images.join("debs/26.04")).unwrap();
+            fs::write(images.join("debs/26.04/a_1_amd64.deb"), b"x").unwrap();
+            ensure_private_dir(&images.join(".partial-debs-26.04/x")).unwrap();
+        };
+        // Fresh packages fetched: the old ones go.
+        old_cache();
+        assert!(!old_debs(&paths, "ubuntu-26.04", false).unwrap());
+        assert!(!images.join("debs").exists());
+        assert!(!images.join(".partial-debs-26.04").exists());
+
+        // No network: the old ones move into place.
+        old_cache();
+        assert!(old_debs(&paths, "ubuntu-26.04", true).unwrap());
         let new = debs_dir(&paths, "ubuntu-26.04");
         assert!(new.join("a_1_amd64.deb").is_file());
         assert!(!images.join("debs").exists());
         assert!(!images.join(".partial-debs-26.04").exists());
 
-        // A newer cache wins; the old one stays untouched.
-        ensure_private_dir(&images.join("debs/26.04")).unwrap();
-        migrate_debs(&paths, "ubuntu-26.04").unwrap();
-        assert!(images.join("debs/26.04").is_dir());
+        // An existing new cache is never replaced.
+        old_cache();
+        assert!(!old_debs(&paths, "ubuntu-26.04", true).unwrap());
+        assert!(!images.join("debs").exists());
         assert!(new.join("a_1_amd64.deb").is_file());
     }
 
-    /// Agents get a clear refusal for images that are not pulled; old
-    /// caches count once moved.
+    /// Agents get a clear refusal for images that are not pulled; an old
+    /// cache counts only after a human pull moved it.
     #[test]
     fn agents_need_pulled_images() {
         let dir = tempfile::tempdir().unwrap();
@@ -956,6 +983,8 @@ mod tests {
         let images = paths.images_dir();
         ensure_private_dir(&images.join("debs/26.04")).unwrap();
         fs::write(image_path(&paths, "ubuntu-26.04"), b"").unwrap();
+        assert!(ensure_pulled(&paths, "ubuntu-26.04").is_err());
+        ensure_private_dir(&debs_dir(&paths, "ubuntu-26.04")).unwrap();
         ensure_pulled(&paths, "ubuntu-26.04").unwrap();
     }
 
