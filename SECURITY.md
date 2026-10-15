@@ -72,8 +72,10 @@ Agents reach Stallo through `stallo mcp`, which marks its requests
 control is off (the default; `stallo agent <vm> on` turns it on), refuses
 VM creation unless `agents_can_create = true` in `stallod.toml`, and
 never lets agents delete VMs, pull images, resume VMs or change agent
-control. Turning agent control off stops new agent calls; calls already
-running (an `exec` can run up to an hour) finish first.
+control. Agents create VMs only from images a human has already pulled
+(`stallo images pull <id>`). Turning agent control off stops new agent
+calls; calls already running (an `exec` can run up to an hour) finish
+first.
 
 `via` is declared by the client. This is policy for well-behaved agents,
 not a boundary: any process that can reach the API socket (in dev mode,

@@ -493,7 +493,8 @@ mod tests {
     fn agent_gates() {
         let name = || "dev".to_owned();
         assert_eq!(agent_gate(&Request::List), Gate::Open);
-        // image_list reads only the catalog and cache; pulling stays human.
+        // image_list reads only the catalog and cache; pulling stays human,
+        // also through `new` (the daemon refuses images that are not cached).
         assert_eq!(agent_gate(&Request::Images), Gate::Open);
         assert_eq!(
             agent_gate(&Request::Pull {

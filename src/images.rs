@@ -268,6 +268,18 @@ pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
     image_path(paths, &entry.id).is_file() && debs_dir(paths, &entry.id).is_dir()
 }
 
+/// Refuses an image that is not cached: agents create VMs only from
+/// images a human pulled.
+pub fn ensure_pulled(paths: &Paths, id: &str) -> Result<()> {
+    let entry = find(id)?;
+    migrate_debs(paths, id)?;
+    ensure!(
+        is_cached(paths, &entry),
+        "image {id} not pulled; a human runs `stallo images pull {id}`"
+    );
+    Ok(())
+}
+
 /// Moves guest-agent packages that older versions cached per Ubuntu
 /// release (`debs/<release>/`) to `<id>.debs/`, so a host without
 /// network keeps working, and drops an old partial download.
@@ -927,6 +939,24 @@ mod tests {
         migrate_debs(&paths, "ubuntu-26.04").unwrap();
         assert!(images.join("debs/26.04").is_dir());
         assert!(new.join("a_1_amd64.deb").is_file());
+    }
+
+    /// Agents get a clear refusal for images that are not pulled; old
+    /// caches count once moved.
+    #[test]
+    fn agents_need_pulled_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let err = format!("{:#}", ensure_pulled(&paths, "ubuntu-26.04").unwrap_err());
+        assert!(
+            err.contains("not pulled; a human runs `stallo images pull ubuntu-26.04`"),
+            "{err}"
+        );
+        assert!(ensure_pulled(&paths, "debian-13").is_err());
+        let images = paths.images_dir();
+        ensure_private_dir(&images.join("debs/26.04")).unwrap();
+        fs::write(image_path(&paths, "ubuntu-26.04"), b"").unwrap();
+        ensure_pulled(&paths, "ubuntu-26.04").unwrap();
     }
 
     /// Fetches the guest-agent packages for real (network, about 20 MB of

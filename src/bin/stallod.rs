@@ -353,6 +353,10 @@ async fn dispatch(
             forwards,
             wait,
         } => {
+            // Pulls are for humans (Gate::Closed), also through `new`.
+            if via == Via::Mcp {
+                images::ensure_pulled(&m.paths, &image)?;
+            }
             let new = NewVm {
                 name: name.clone(),
                 image,

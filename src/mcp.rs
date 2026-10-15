@@ -421,7 +421,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Create an offline VM, start it and wait until it is ready. Only works if the host allows agents to create VMs."
+        description = "Create an offline VM, start it and wait until it is ready. Only works if the host allows agents to create VMs, and only from an image that is already downloaded (see image_list)."
     )]
     async fn vm_create(
         &self,
@@ -437,7 +437,7 @@ impl Server {
             forwards: vec![],
             wait: true,
         };
-        // An image download plus first boot.
+        // First boot. (Agents never trigger an image download.)
         self.text(request, Duration::from_secs(1200)).await
     }
 
