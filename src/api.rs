@@ -192,6 +192,10 @@ pub enum Request {
     Pull {
         image: String,
     },
+    /// Deletes a cached image no VM uses (humans only).
+    ImageRm {
+        image: String,
+    },
 }
 
 /// One response line: `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
@@ -314,6 +318,10 @@ pub struct ImageInfo {
     /// Bytes of the cached image file.
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    /// Date of the signature the cached image was verified with
+    /// (`YYYY-MM-DD`), if the pull recorded one.
+    #[serde(default)]
+    pub sig_date: Option<String>,
     /// Things to know before using the image.
     #[serde(default)]
     pub notes: Vec<String>,
@@ -341,6 +349,7 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         New { .. } => Gate::Create,
         Rm { .. }
         | Pull { .. }
+        | ImageRm { .. }
         | Resume { .. }
         | SetAgent { .. }
         | SetVnc { .. }
@@ -498,6 +507,12 @@ mod tests {
         assert_eq!(agent_gate(&Request::Images), Gate::Open);
         assert_eq!(
             agent_gate(&Request::Pull {
+                image: "ubuntu-26.04".into()
+            }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::ImageRm {
                 image: "ubuntu-26.04".into()
             }),
             Gate::Closed

@@ -1,6 +1,6 @@
 # Arch Linux cloud image (arch-boxes), amd64, qcow2, BIOS/UEFI GPT.
 # `latest/` moves to each new build (every two weeks); the first pull is
-# kept. To pick up a newer build, remove the cached image and pull again.
+# kept. To pick up a newer build: `stallo images rm arch`, then pull again.
 id = "arch"
 name = "Arch Linux cloud image (rolling, latest build)"
 os = "linux"

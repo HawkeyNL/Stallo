@@ -4,13 +4,14 @@
 //! (detached or clearsigned) verifies against the catalog's keyring (`gpgv`)
 //! and comes from the pinned signing key, the image's SHA-256 (computed
 //! here) matches its line in the signed text, and `qemu-img info` shows a
-//! plain qcow2 with no backing file and no external data file. With
-//! `signed-image`, a detached signature over the image itself replaces the
-//! checksum list, and it must be at most [`MAX_SIG_AGE_DAYS`] old. With
+//! plain qcow2 with no backing file and no external data file. A `moving`
+//! checksum list's signature must be at most [`MAX_SUMS_SIG_AGE_DAYS`] old.
+//! With `signed-image`, a detached signature over the image itself replaces
+//! the checksum list, and it must be at most [`MAX_SIG_AGE_DAYS`] old. With
 //! `pinned`, for upstreams that sign nothing, the image's SHA-512 is in the
 //! catalog itself, so an update needs a new Stallo release. Cached
 //! images are read-only and never replaced, because VM disks are overlays on
-//! them.
+//! them; `stallo images rm` deletes one that no VM uses.
 //!
 //! Keyrings are host files (Ubuntu's, from its keyring packages) or
 //! vendored in `catalog/keys/` and compiled in.
@@ -85,6 +86,12 @@ pub struct CatalogEntry {
     /// it, since the guest's network config may not match its NIC.
     #[serde(default)]
     pub internet: bool,
+    /// `url` and `sums_url` move to each new build (`current/`): the
+    /// signature on the checksum list must then be at most
+    /// [`MAX_SUMS_SIG_AGE_DAYS`] old. Release-pinned files never change, so
+    /// their old signatures stay valid. (`signed-image` always checks it.)
+    #[serde(default)]
+    pub moving: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +247,10 @@ impl CatalogEntry {
             );
         }
         ensure!(
+            !self.moving || self.trust == Trust::SignedSums,
+            "{id}: moving applies to signed-sums only (signed-image always checks the signature age)"
+        );
+        ensure!(
             self.os == Os::Linux,
             "{id}: not supported yet: only Linux images"
         );
@@ -295,6 +306,12 @@ const KEYS: &[(&str, &[u8])] = &[
 /// and this age limit are what bound that.
 pub const MAX_SIG_AGE_DAYS: u64 = 45;
 
+/// The oldest signature a `moving` checksum list accepts (Ubuntu's
+/// `current/`, rebuilt every week or few, but irregularly): an older one
+/// means a stale or replaying mirror, or an upstream that stopped
+/// rebuilding.
+pub const MAX_SUMS_SIG_AGE_DAYS: u64 = 90;
+
 /// All catalog entries.
 pub fn catalog() -> Vec<CatalogEntry> {
     CATALOG
@@ -324,6 +341,28 @@ pub fn image_path(paths: &Paths, id: &str) -> PathBuf {
 /// `<data>/images/<id>.debs/`.
 pub fn debs_dir(paths: &Paths, id: &str) -> PathBuf {
     paths.images_dir().join(format!("{id}.debs"))
+}
+
+/// `<data>/images/<id>.toml`: what the pull recorded (see [`Pulled`]).
+fn record_path(paths: &Paths, id: &str) -> PathBuf {
+    paths.images_dir().join(format!("{id}.toml"))
+}
+
+/// What a pull recorded next to the image. Informational: images pulled by
+/// older versions have none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pulled {
+    /// SHA-256 of the cached image file.
+    pub sha256: String,
+    /// The signature's date (`YYYY-MM-DD`, UTC), if the image was signed.
+    pub sig_date: Option<String>,
+    /// Seconds since the epoch.
+    pub pulled_at: u64,
+}
+
+/// The record of a pull of `id`, if there is a readable one.
+pub fn pulled(paths: &Paths, id: &str) -> Option<Pulled> {
+    toml::from_str(&fs::read_to_string(record_path(paths, id)).ok()?).ok()
 }
 
 /// Whether the image and its guest-agent packages (if any) are cached.
@@ -371,6 +410,92 @@ fn old_debs(paths: &Paths, id: &str, keep: bool) -> Result<bool> {
     Ok(moved)
 }
 
+/// Deletes the cached image `id`, its record, its guest-agent packages and
+/// what failed pulls left behind; returns whether there was anything.
+/// Symlinks are refused, never followed. The caller makes sure no VM disk
+/// backs onto the image and that no pull runs.
+pub fn remove(paths: &Paths, id: &str) -> Result<bool> {
+    validate_image_id(id)?;
+    let root = paths.images_dir();
+    if !root.is_dir() {
+        return Ok(false);
+    }
+    let mut found = false;
+    // The image first: without it nothing counts as cached.
+    for name in [
+        format!("{id}.qcow2"),
+        format!("{id}.toml"),
+        format!("{id}.debs"),
+        format!(".partial-{id}"),
+        format!(".partial-debs-{id}"),
+    ] {
+        let path = root.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            safe_remove(&root, &path)?;
+            found = true;
+        }
+    }
+    old_debs(paths, id, false)?;
+    fs::File::open(&root)?.sync_all()?;
+    Ok(found)
+}
+
+/// Bytes a pull of `entry` may resume: the largest partial image download
+/// (at most `max_size`). Other partial files may be from an older upstream
+/// build and are not resumed, but they already count as used space.
+pub fn resumable_bytes(paths: &Paths, entry: &CatalogEntry) -> u64 {
+    let work = paths.images_dir().join(format!(".partial-{}", entry.id));
+    let Ok(dir) = fs::read_dir(work) else {
+        return 0;
+    };
+    dir.filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".part")))
+        // DirEntry::metadata does not follow symlinks.
+        .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()))
+        .map(|m| m.len().min(entry.max_size))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The backing file name in the header of the qcow2 file `disk`, or `None`
+/// if it has none or does not exist. Read from the header directly: a VM's
+/// disk is written by its QEMU, so `qemu-img` never opens it.
+pub fn backing_file(disk: &Path) -> Result<Option<String>> {
+    use std::os::unix::fs::FileExt;
+    let f = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(disk)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", disk.display())),
+    };
+    let mut header = [0; 20];
+    f.read_exact_at(&mut header, 0)
+        .with_context(|| format!("{} has no qcow2 header", disk.display()))?;
+    ensure!(
+        header[..4] == *b"QFI\xfb",
+        "{} is not a qcow2 file",
+        disk.display()
+    );
+    let offset = u64::from_be_bytes(header[8..16].try_into()?);
+    let len = u32::from_be_bytes(header[16..20].try_into()?);
+    if offset == 0 {
+        return Ok(None);
+    }
+    // QEMU's limit for the name.
+    ensure!(
+        (1..=1023).contains(&len),
+        "{}: bad backing file name",
+        disk.display()
+    );
+    let mut name = vec![0; len as usize];
+    f.read_exact_at(&mut name, offset)
+        .with_context(|| format!("{}: bad backing file name", disk.display()))?;
+    Ok(Some(String::from_utf8_lossy(&name).into_owned()))
+}
+
 /// Downloads and verifies whatever of `entry` is not cached yet.
 pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     ensure_private_dir(&paths.images_dir())?;
@@ -399,12 +524,13 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     let root = paths.images_dir();
     let work = root.join(format!(".partial-{}", entry.id));
     ensure_private_dir(&work)?;
-    let image = match entry.trust {
+    let (image, validsig) = match entry.trust {
         Trust::SignedSums => fetch_signed_sums(paths, entry, &work).await?,
         Trust::SignedImage => fetch_signed_image(paths, entry, &work).await?,
         Trust::Pinned => {
             let expected = field(&entry.sha512)?;
-            fetch_hashed::<Sha512>(paths, entry, &work, &expected).await?
+            let image = fetch_hashed::<Sha512>(paths, entry, &work, &expected).await?;
+            (image, vec![])
         }
     };
     if let Err(e) = check_image(&image).await {
@@ -415,6 +541,15 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
 
     fs::set_permissions(&image, fs::Permissions::from_mode(0o444))?;
     fs::File::open(&image)?.sync_all()?;
+    let record = Pulled {
+        sha256: hash_file::<Sha256>(&image).await?,
+        sig_date: sig_date(&validsig),
+        pulled_at: now_secs()?,
+    };
+    let tmp = work.join("record.toml");
+    fs::write(&tmp, toml::to_string(&record)?)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, record_path(paths, &entry.id))?;
     // A hard link fails if the target exists: a cached base image is never
     // replaced, because VM disks are overlays on it.
     fs::hard_link(&image, image_path(paths, &entry.id))?;
@@ -423,14 +558,27 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     Ok(())
 }
 
+/// The date of a signature (VALIDSIG field 1, `YYYY-MM-DD`), if any.
+fn sig_date(validsig: &[String]) -> Option<String> {
+    validsig
+        .get(1)
+        .filter(|d| d.len() == 10 && d.bytes().all(|c| c.is_ascii_digit() || c == b'-'))
+        .cloned()
+}
+
 /// `validate` guarantees the fields each trust needs.
 fn field(f: &Option<String>) -> Result<String> {
     f.clone().context("incomplete catalog entry")
 }
 
 /// Downloads the image into `work` and checks it against the signed
-/// checksum list; returns its path.
-async fn fetch_signed_sums(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<PathBuf> {
+/// checksum list; returns its path and the signature's VALIDSIG fields. A
+/// `moving` list's signature must be recent (see [`check_sig_age`]).
+async fn fetch_signed_sums(
+    paths: &Paths,
+    entry: &CatalogEntry,
+    work: &Path,
+) -> Result<(PathBuf, Vec<String>)> {
     let root = paths.images_dir();
     let sums = work.join("SHA256SUMS");
     let sig = work.join("SHA256SUMS.gpg");
@@ -447,12 +595,18 @@ async fn fetch_signed_sums(paths: &Paths, entry: &CatalogEntry, work: &Path) -> 
         Some(sig.as_path())
     };
     let keyring = keyring_path(paths, &field(&entry.keyring)?)?;
-    let text = signed_text(&keyring, &field(&entry.signing_key)?, &sums, sig, &signed)
+    let (text, validsig) = signed_text(&keyring, &field(&entry.signing_key)?, &sums, sig, &signed)
         .await
         .context("signature check of the checksum list failed")?;
+    if entry.moving {
+        now_secs()
+            .and_then(|now| check_sig_age(&validsig, now, MAX_SUMS_SIG_AGE_DAYS))
+            .context("signature check of the checksum list failed")?;
+    }
     let format = entry.sums_format.context("incomplete catalog entry")?;
     let expected = expected_sha256(&text, entry.file(), format)?;
-    fetch_hashed::<Sha256>(paths, entry, work, &expected).await
+    let image = fetch_hashed::<Sha256>(paths, entry, work, &expected).await?;
+    Ok((image, validsig))
 }
 
 /// Downloads the image into `work` and checks it against `expected`, its
@@ -519,7 +673,7 @@ async fn check_hash<D: Digest + 'static>(root: &Path, file: &Path, expected: &st
 }
 
 /// Downloads the image into `work` and checks the detached signature over
-/// it; returns its path.
+/// it; returns its path and the signature's VALIDSIG fields.
 ///
 /// No hash is known before the download, so the partial file is named
 /// after the URL: a partial download from another catalog URL is never
@@ -530,7 +684,11 @@ async fn check_hash<D: Digest + 'static>(root: &Path, file: &Path, expected: &st
 /// ignores ranges). A failed fresh download keeps the partial file for the
 /// next pull to resume. A valid signature that is too old, or of the wrong
 /// kind, deletes both and fails at once: a retry would get the same.
-async fn fetch_signed_image(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<PathBuf> {
+async fn fetch_signed_image(
+    paths: &Paths,
+    entry: &CatalogEntry,
+    work: &Path,
+) -> Result<(PathBuf, Vec<String>)> {
     let root = paths.images_dir();
     let key = url_key(&entry.url);
     let image = work.join(format!("{key}.part"));
@@ -561,6 +719,7 @@ async fn fetch_signed_image(paths: &Paths, entry: &CatalogEntry, work: &Path) ->
         let checked = match gpgv(&keyring, &fingerprint, &[&sig, &image], 600).await {
             Ok(validsig) => now_secs()
                 .and_then(|now| check_image_sig(&validsig, now))
+                .map(|()| validsig)
                 .with_context(context),
             Err(e) if !retried => {
                 tracing::warn!("{:#}; downloading once more", e.context(context()));
@@ -574,7 +733,7 @@ async fn fetch_signed_image(paths: &Paths, entry: &CatalogEntry, work: &Path) ->
             safe_remove(&root, &image)?;
             safe_remove(&root, &sig)?;
         }
-        return checked.map(|()| image);
+        return checked.map(|validsig| (image, validsig));
     }
 }
 
@@ -595,9 +754,8 @@ fn now_secs() -> Result<u64> {
 
 /// Checks the VALIDSIG fields (see [`check_gpg_status`]) of a signature
 /// over an image: a binary document signature (class 00) with SHA-256 or
-/// SHA-512 (hash algorithms 8 and 10), made at most [`MAX_SIG_AGE_DAYS`]
-/// before `now` and not more than a day after it (clock skew). Times are
-/// seconds since the epoch.
+/// SHA-512 (hash algorithms 8 and 10), at most [`MAX_SIG_AGE_DAYS`] old
+/// ([`check_sig_age`]).
 fn check_image_sig(validsig: &[String], now: u64) -> Result<()> {
     let field = |i: usize| validsig.get(i).map_or("", String::as_str);
     ensure!(
@@ -606,6 +764,14 @@ fn check_image_sig(validsig: &[String], now: u64) -> Result<()> {
         field(8),
         field(7)
     );
+    check_sig_age(validsig, now, MAX_SIG_AGE_DAYS)
+}
+
+/// Checks that a signature (its VALIDSIG fields) was made at most
+/// `max_days` before `now` and not more than a day after it (clock skew).
+/// Times are seconds since the epoch.
+fn check_sig_age(validsig: &[String], now: u64, max_days: u64) -> Result<()> {
+    let field = |i: usize| validsig.get(i).map_or("", String::as_str);
     let created: u64 = field(2)
         .parse()
         .context("gpgv gave no signature time in seconds")?;
@@ -615,8 +781,8 @@ fn check_image_sig(validsig: &[String], now: u64) -> Result<()> {
     );
     let days = now.saturating_sub(created) / 86_400;
     ensure!(
-        days <= MAX_SIG_AGE_DAYS,
-        "the signature is {days} days old (at most {MAX_SIG_AGE_DAYS}): the mirror looks stale"
+        days <= max_days,
+        "the signature is {days} days old (at most {max_days}): the mirror looks stale, or upstream has not rebuilt in {days} days"
     );
     Ok(())
 }
@@ -783,7 +949,8 @@ fn keyring_path(paths: &Paths, keyring: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Runs `gpgv` on the checksum list `sums` and returns the signed text.
+/// Runs `gpgv` on the checksum list `sums` and returns the signed text and
+/// the VALIDSIG fields.
 /// With `sig`, that is a detached signature over all of `sums`. Without,
 /// `sums` is clearsigned and the text is what gpgv writes to `out` as
 /// signed, never the downloaded file: lines outside the signed part are
@@ -798,14 +965,14 @@ async fn signed_text(
     sums: &Path,
     sig: Option<&Path>,
     out: &Path,
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     let output = Path::new("--output");
     let (args, text) = match sig {
         Some(sig) => (vec![sig, sums], sums),
         None => (vec![output, out, sums], out),
     };
-    gpgv(keyring, fingerprint, &args, 30).await?;
-    Ok(fs::read_to_string(text)?)
+    let validsig = gpgv(keyring, fingerprint, &args, 30).await?;
+    Ok((fs::read_to_string(text)?, validsig))
 }
 
 /// Runs `gpgv` with `args` and checks its status (see
@@ -1024,6 +1191,7 @@ mod tests {
             ("sums_format", None),
             ("keyring", None),
             ("signing_key", None),
+            ("moving", None),
         ];
         entry_with(&pinned).unwrap();
         // pinned: sha512 required, keys refused.
@@ -1105,11 +1273,15 @@ mod tests {
             ("sig_url", Some(r#""""#)),
             ("sums_url", None),
             ("sums_format", None),
+            ("moving", None),
         ];
         assert!(err(&signed_image).contains("https"));
         let mut signed_image = signed_image.to_vec();
         signed_image[1] = ("sig_url", Some(r#""https://example.com/a.img.sig""#));
         entry_with(&signed_image).unwrap();
+        signed_image[4] = ("moving", Some("true"));
+        assert!(err(&signed_image).contains("moving applies"));
+        signed_image[4] = ("moving", None);
         signed_image[2] = ("sums_url", Some(r#""https://example.com/S""#));
         assert!(err(&signed_image).contains("signed-image needs"));
         // Full fingerprints only.
@@ -1122,6 +1294,10 @@ mod tests {
         assert!(entry_with(&[("os", Some(r#""macos""#))]).is_err());
         assert!(err(&[("os", Some(r#""windows""#))]).contains("not supported yet"));
         entry_with(&[("firmware", Some(r#""uefi""#))]).unwrap();
+        // `moving` is for signed-sums: signed-image always checks the age,
+        // and a pinned file cannot move.
+        entry_with(&[("moving", Some("true"))]).unwrap();
+        assert!(err(&[pinned.as_slice(), &[("moving", Some("true"))]].concat()).contains("moving"));
     }
 
     /// Only images verified with the internet profile take it.
@@ -1381,7 +1557,11 @@ mod tests {
         let (day, created) = (86_400, 1_792_066_023);
         check(&[], created).unwrap();
         check(&[], created + 45 * day).unwrap();
-        assert!(format!("{:#}", check(&[], created + 46 * day).unwrap_err()).contains("days old"));
+        let stale = format!("{:#}", check(&[], created + 46 * day).unwrap_err());
+        assert!(
+            stale.contains("46 days old (at most 45): the mirror looks stale, or upstream has not rebuilt in 46 days"),
+            "{stale}"
+        );
         // Up to a day of clock skew; later is refused.
         check(&[], created - day).unwrap();
         assert!(format!("{:#}", check(&[], created - day - 1).unwrap_err()).contains("future"));
@@ -1444,7 +1624,9 @@ mod tests {
             let (keyring, data, out) = (keyring.clone(), data.clone(), out.clone());
             async move {
                 let _ = fs::remove_file(&out);
-                signed_text(&keyring, &key, &data, sig.as_deref(), &out).await
+                signed_text(&keyring, &key, &data, sig.as_deref(), &out)
+                    .await
+                    .map(|(text, _)| text)
             }
         };
         let text = check(fpr.clone(), Some(sig.clone())).await.unwrap();
@@ -1586,7 +1768,10 @@ mod tests {
         );
         let out = dir.path().join("signed");
         let fpr = entry.signing_key.as_deref().unwrap();
-        let text = signed_text(&keyring, fpr, &sums, None, &out).await.unwrap();
+        let (text, validsig) = signed_text(&keyring, fpr, &sums, None, &out).await.unwrap();
+        // Release-pinned: not `moving`, so its age is not checked.
+        assert!(!entry.moving);
+        assert!(sig_date(&validsig).is_some());
         assert_eq!(
             expected_sha256(&text, entry.file(), SumsFormat::Bsd).unwrap(),
             "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f"
@@ -1623,9 +1808,12 @@ mod tests {
         assert!(check_image(&image).await.unwrap().virtual_size > 0);
         assert_eq!(
             fs::read_dir(paths.images_dir()).unwrap().count(),
-            2,
-            "only the image and the keys are left"
+            3,
+            "only the image, its record and the keys are left"
         );
+        let record = pulled(&paths, "arch").unwrap();
+        assert_eq!(record.sha256, hash_file::<Sha256>(&image).await.unwrap());
+        assert!(record.sig_date.is_some());
     }
 
     /// The private apt root, checked offline with apt itself: every path
@@ -1857,5 +2045,205 @@ mod tests {
 
         fs::write(p("raw.img"), vec![0u8; 1 << 20]).unwrap();
         assert!(check_image(&p("raw.img")).await.is_err());
+    }
+
+    /// Moving checksum lists (Ubuntu's `current/`) must be recently signed;
+    /// release-pinned ones need not be. From the VALIDSIG lines gpgv gave
+    /// for the real Ubuntu 26.04 and 24.04 lists (2026-10-15).
+    #[test]
+    fn moving_sums_signature_age() {
+        let fpr = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81";
+        let (day, now) = (86_400, 1_792_022_400); // 2026-10-15
+        for (line, created) in [
+            ("2026-09-29 1790640937 0 4 0 1 10 00", 1_790_640_937),
+            ("2026-09-26 1790446992 0 4 0 1 10 00", 1_790_446_992),
+        ] {
+            let status = format!("[GNUPG:] VALIDSIG {fpr} {line} {fpr}\n");
+            let mut fields = check_gpg_status(&status, fpr).unwrap();
+            assert_eq!(sig_date(&fields).as_deref(), Some(&line[..10]));
+            check_sig_age(&fields, now, MAX_SUMS_SIG_AGE_DAYS).unwrap();
+            check_sig_age(&fields, created + 90 * day, MAX_SUMS_SIG_AGE_DAYS).unwrap();
+            let stale =
+                check_sig_age(&fields, created + 91 * day, MAX_SUMS_SIG_AGE_DAYS).unwrap_err();
+            assert!(
+                format!("{stale:#}").contains("91 days old (at most 90)"),
+                "{stale:#}"
+            );
+            let future =
+                check_sig_age(&fields, created - day - 1, MAX_SUMS_SIG_AGE_DAYS).unwrap_err();
+            assert!(format!("{future:#}").contains("future"), "{future:#}");
+            // A text signature (class 01, as a clearsigned list has) passes
+            // the age check; only signed-image demands a binary one.
+            fields[8] = "01".into();
+            check_sig_age(&fields, now, MAX_SUMS_SIG_AGE_DAYS).unwrap();
+            assert!(check_image_sig(&fields, now).is_err());
+        }
+        for (id, moving) in [
+            ("ubuntu-26.04", true),
+            ("ubuntu-24.04", true),
+            ("fedora-44", false),
+            ("arch", false),
+            ("debian-13", false),
+        ] {
+            let e = find(id).unwrap();
+            assert_eq!(e.moving, moving, "{id}");
+            assert!(!moving || e.sums_url.as_deref().unwrap().contains("/current/"));
+        }
+    }
+
+    /// Fetches the checksum lists of every `moving` entry (a few KB each):
+    /// `cargo test -- --ignored moving_sums_live`. Their signatures verify
+    /// and are recent enough today.
+    #[tokio::test]
+    #[ignore = "downloads checksum lists"]
+    async fn moving_sums_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        for e in catalog().into_iter().filter(|e| e.moving) {
+            let (sums, sig, out) = (
+                dir.path().join(format!("{}.sums", e.id)),
+                dir.path().join(format!("{}.sig", e.id)),
+                dir.path().join(format!("{}.out", e.id)),
+            );
+            download(e.sums_url.as_deref().unwrap(), &sums, 1 << 20, false)
+                .await
+                .unwrap();
+            let sig = match e.sig_url.as_deref().unwrap() {
+                "" => None,
+                url => {
+                    download(url, &sig, 1 << 20, false).await.unwrap();
+                    Some(sig.as_path())
+                }
+            };
+            let keyring = keyring_path(&paths, e.keyring.as_deref().unwrap()).unwrap();
+            let (text, validsig) = signed_text(
+                &keyring,
+                e.signing_key.as_deref().unwrap(),
+                &sums,
+                sig,
+                &out,
+            )
+            .await
+            .unwrap();
+            check_sig_age(&validsig, now_secs().unwrap(), MAX_SUMS_SIG_AGE_DAYS).unwrap();
+            expected_sha256(&text, e.file(), e.sums_format.unwrap()).unwrap();
+            eprintln!("{}: signed {}", e.id, sig_date(&validsig).unwrap());
+        }
+    }
+
+    /// `images rm`: the image, its record, packages and leftovers go; other
+    /// images stay; a symlink is refused, not followed.
+    #[test]
+    fn remove_image_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(
+            fs::canonicalize(dir.path()).unwrap().join("data"),
+            dir.path().join("run"),
+        )
+        .unwrap();
+        assert!(!remove(&paths, "ubuntu-26.04").unwrap());
+        let images = paths.images_dir();
+        ensure_private_dir(&images).unwrap();
+        for id in ["ubuntu-26.04", "ubuntu-24.04"] {
+            fs::write(image_path(&paths, id), b"qcow2").unwrap();
+            fs::set_permissions(image_path(&paths, id), fs::Permissions::from_mode(0o444)).unwrap();
+            fs::write(record_path(&paths, id), b"sha256 = \"x\"\npulled_at = 1\n").unwrap();
+            ensure_private_dir(&debs_dir(&paths, id)).unwrap();
+            fs::write(debs_dir(&paths, id).join("a_1_amd64.deb"), b"x").unwrap();
+            ensure_private_dir(&images.join(format!(".partial-{id}"))).unwrap();
+            ensure_private_dir(&images.join(format!(".partial-debs-{id}"))).unwrap();
+        }
+        assert!(pulled(&paths, "ubuntu-26.04").is_some());
+        ensure_private_dir(&images.join("debs/26.04")).unwrap();
+        ensure_private_dir(&images.join("keys")).unwrap();
+        assert!(remove(&paths, "ubuntu-26.04").unwrap());
+        let mut left: Vec<_> = fs::read_dir(&images)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".partial-debs-ubuntu-24.04",
+                ".partial-ubuntu-24.04",
+                "keys",
+                "ubuntu-24.04.debs",
+                "ubuntu-24.04.qcow2",
+                "ubuntu-24.04.toml",
+            ]
+        );
+        assert!(!remove(&paths, "ubuntu-26.04").unwrap());
+        assert!(remove(&paths, "../x").is_err());
+        // A planted symlink: refused, and its target stays.
+        let target = dir.path().join("target");
+        fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, image_path(&paths, "arch")).unwrap();
+        assert!(remove(&paths, "arch").is_err());
+        assert!(target.is_file());
+    }
+
+    /// Admission credits only the largest partial image, up to max_size.
+    #[test]
+    fn resumable_partial_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let entry = find("arch").unwrap();
+        assert_eq!(resumable_bytes(&paths, &entry), 0);
+        let work = paths.images_dir().join(".partial-arch");
+        ensure_private_dir(&work).unwrap();
+        let sized = |name: &str, len: u64| {
+            fs::File::create(work.join(name))
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        };
+        sized("a.part", 100);
+        sized("b.part", 300);
+        sized("b.sig", 900);
+        assert_eq!(resumable_bytes(&paths, &entry), 300);
+        sized("c.part", entry.max_size + 1);
+        assert_eq!(resumable_bytes(&paths, &entry), entry.max_size);
+        fs::remove_file(work.join("c.part")).unwrap();
+        // A symlink to a large file does not count.
+        std::os::unix::fs::symlink(work.join("b.sig"), work.join("d.part")).unwrap();
+        assert_eq!(resumable_bytes(&paths, &entry), 300);
+    }
+
+    /// The backing file name, read from the qcow2 header.
+    #[test]
+    fn backing_file_from_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let create = |args: &[&str]| {
+            let ok = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        let base = p("ubuntu-26.04.qcow2");
+        create(&[base.to_str().unwrap(), "64M"]);
+        assert_eq!(backing_file(&base).unwrap(), None);
+        let disk = p("disk.qcow2");
+        create(&[
+            "-u",
+            "-F",
+            "qcow2",
+            "-b",
+            base.to_str().unwrap(),
+            disk.to_str().unwrap(),
+            "1G",
+        ]);
+        assert_eq!(backing_file(&disk).unwrap().as_deref(), base.to_str());
+        assert_eq!(backing_file(&p("none.qcow2")).unwrap(), None);
+        fs::write(p("raw.img"), vec![0u8; 4096]).unwrap();
+        assert!(backing_file(&p("raw.img")).is_err());
+        fs::write(p("short.img"), b"QFI").unwrap();
+        assert!(backing_file(&p("short.img")).is_err());
+        std::os::unix::fs::symlink(&disk, p("link.qcow2")).unwrap();
+        assert!(backing_file(&p("link.qcow2")).is_err());
     }
 }

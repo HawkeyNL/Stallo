@@ -164,7 +164,7 @@ enum Cmd {
         #[arg(long, value_name = "FILE", requires = "http")]
         token_file: Option<PathBuf>,
     },
-    /// List images, or download one.
+    /// List images, download one or delete one.
     Images {
         #[command(subcommand)]
         action: Option<ImagesCmd>,
@@ -182,6 +182,14 @@ enum McpCmd {
 enum ImagesCmd {
     /// Download and verify an image.
     Pull { id: String },
+    /// Delete a cached image (refused while a VM uses it). To get a newer
+    /// build of a moving image, delete it and pull it again.
+    Rm {
+        id: String,
+        /// Do not ask.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -513,9 +521,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", mcp_install(&exe, socket.as_deref(), &path)?);
         }
         Cmd::Images { action } => {
-            // A pull answers null; show the catalog afterwards either way.
-            if let Some(ImagesCmd::Pull { id }) = action {
-                call(Request::Pull { image: id }).await?;
+            // Pull and rm answer null; show the catalog afterwards.
+            match action {
+                Some(ImagesCmd::Pull { id }) => {
+                    call(Request::Pull { image: id }).await?;
+                }
+                Some(ImagesCmd::Rm { id, yes }) => {
+                    if !yes {
+                        confirm(&format!(
+                            "Delete image {id}? A later VM needs it pulled again."
+                        ))?;
+                    }
+                    call(Request::ImageRm { image: id }).await?;
+                }
+                None => {}
             }
             let v = call(Request::Images).await?;
             if json {
@@ -842,7 +861,9 @@ fn images_table(images: &[ImageInfo]) -> String {
         let state = if i.cached { "cached" } else { "not downloaded" };
         let size = i.size_bytes.map_or("-".into(), |b| mib(b >> 20));
         let trust = serde_json::to_value(i.trust).unwrap_or_default();
+        let signed = i.sig_date.as_ref().map(|d| format!("signed {d}"));
         let notes = std::iter::once(i.name.as_str())
+            .chain(signed.as_deref())
             .chain(i.notes.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join("; ");
@@ -1080,12 +1101,12 @@ mod tests {
     fn images_columns() {
         let v = serde_json::json!([{"id": "ubuntu-26.04", "name": "Ubuntu", "cached": false,
             "os": "linux", "trust": "signed-sums", "size_bytes": 865115136,
-            "notes": ["guest-agent packages not downloaded yet"]}]);
+            "sig_date": "2026-09-29", "notes": ["guest-agent packages not downloaded yet"]}]);
         let images: Vec<ImageInfo> = serde_json::from_value(v).unwrap();
         assert_eq!(
             images_table(&images),
             "ID               STATE               SIZE  TRUST        NOTES\n\
-             ubuntu-26.04     not downloaded   825 MiB  signed-sums  Ubuntu; guest-agent packages not downloaded yet\n"
+             ubuntu-26.04     not downloaded   825 MiB  signed-sums  Ubuntu; signed 2026-09-29; guest-agent packages not downloaded yet\n"
         );
         // What an older stallod sends.
         let old = serde_json::json!([{"id": "ubuntu-26.04", "name": "Ubuntu", "cached": true}]);

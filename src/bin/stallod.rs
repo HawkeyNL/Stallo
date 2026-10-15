@@ -273,6 +273,7 @@ async fn handle(
 ) -> (Response, Option<(std::fs::File, audit::Entry)>) {
     let started = Instant::now();
     let (op, vm, args, argv0) = audit::describe(&env.request);
+    let image = audit::image(&env.request);
     let log = vm
         .filter(|n| validate_name(n).is_ok() && m.paths.vm_dir(n).is_dir())
         .unwrap_or(audit::DAEMON)
@@ -317,6 +318,7 @@ async fn handle(
             pid: peer.pid(),
             via: env.via,
             op,
+            image,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 0,
@@ -353,10 +355,6 @@ async fn dispatch(
             forwards,
             wait,
         } => {
-            // Pulls are for humans (Gate::Closed), also through `new`.
-            if via == Via::Mcp {
-                images::ensure_pulled(&m.paths, &image)?;
-            }
             let new = NewVm {
                 name: name.clone(),
                 image,
@@ -366,6 +364,8 @@ async fn dispatch(
                 net,
                 forwards,
                 agent_control: via == Via::Mcp,
+                // Pulls are for humans (Gate::Closed), also through `new`.
+                may_pull: via == Via::Cli,
             };
             let started = Instant::now();
             m.create(&new).await?;
@@ -586,11 +586,15 @@ async fn dispatch(
                     if e.firmware == images::Firmware::Uefi {
                         notes.push("no Secure Boot".into());
                     }
+                    let sig_date = size_bytes
+                        .and_then(|_| images::pulled(&m.paths, &e.id))
+                        .and_then(|p| p.sig_date);
                     ImageInfo {
                         cached,
                         os: Some(e.os),
                         trust: Some(e.trust),
                         size_bytes,
+                        sig_date,
                         notes,
                         id: e.id,
                         name: e.name,
@@ -600,6 +604,10 @@ async fn dispatch(
         ),
         Request::Pull { image } => {
             m.pull(&image).await?;
+            Value::Null
+        }
+        Request::ImageRm { image } => {
+            m.remove_image(&image).await?;
             Value::Null
         }
     })
