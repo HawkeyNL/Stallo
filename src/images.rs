@@ -230,7 +230,10 @@ impl CatalogEntry {
     }
 }
 
-const CATALOG: &[&str] = &[include_str!("../catalog/ubuntu-26.04.toml")];
+const CATALOG: &[&str] = &[
+    include_str!("../catalog/ubuntu-26.04.toml"),
+    include_str!("../catalog/ubuntu-24.04.toml"),
+];
 
 /// All catalog entries.
 pub fn catalog() -> Vec<CatalogEntry> {
@@ -636,6 +639,9 @@ mod tests {
         assert_eq!(e.file(), "resolute-server-cloudimg-amd64.img");
         assert_eq!(e.trust, Trust::SignedSums);
         assert!(e.debs.contains(&"qemu-guest-agent".to_owned()));
+        let e = find("ubuntu-24.04").unwrap();
+        assert_eq!(e.file(), "noble-server-cloudimg-amd64.img");
+        assert_eq!(e.debs, ["qemu-guest-agent", "liburing2"]);
         assert!(find("debian-13").is_err());
         assert!(find("../x").is_err());
     }

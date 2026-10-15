@@ -45,7 +45,9 @@ fn running_snapshot_round_trip() {
         return;
     }
     let d = Daemon::start("snapshot", "");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     d.assert_safe("dev");
     let call = |r: Request| d.api(Via::Cli, r);
 
@@ -166,7 +168,9 @@ fn stopped_snapshots() {
         return;
     }
     let d = Daemon::start("snapshot-stopped", "");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     let call = |r: Request| d.api(Via::Cli, r);
     let snap = |tag: &str| {
         call(Request::Snapshot {
@@ -271,7 +275,9 @@ fn pause_times() {
 fn measure(mib: u64) {
     let d = Daemon::start_sized(&format!("pause-{mib}"), "", mib);
     let mem = format!("{mib}M");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", &mem, "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", &mem, "--disk", "20G",
+    ]);
     d.assert_safe("dev");
     let cg = d.vm_cgroup("dev");
     // Every job with the page cache it used: see `sampled`.

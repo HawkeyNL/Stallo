@@ -62,6 +62,10 @@ stallo exec dev -- uname -a
 stallo ls
 ```
 
+Guest images (`stallo images` lists them): `ubuntu-26.04` (the default) and
+`ubuntu-24.04`, both Ubuntu server cloud images. Use another one with
+`stallo new dev --image ubuntu-24.04` after pulling it.
+
 What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 
 ## How it fits together
@@ -101,6 +105,9 @@ and run the daemon as a transient `systemd-run --user` unit:
 ```sh
 STALLO_IT=1 cargo test -- --ignored --test-threads=1
 ```
+
+They use `ubuntu-26.04`; set `STALLO_IT_IMAGE_ID=ubuntu-24.04` (pulled in
+dev mode first) to run them on another catalog image.
 
 Add `--nocapture` to see the `MEASURE` lines (boot time, screenshot,
 click and exec latency, daemon memory); `tests/kvm_perf.rs` collects them.

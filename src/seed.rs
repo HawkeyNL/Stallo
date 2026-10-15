@@ -66,8 +66,15 @@ runcmd:
 "#
     );
     let network_config = match vm.net {
-        // No interfaces: the offline profile has no network device.
-        NetProfile::Offline => "version: 2\nethernets: {}\n",
+        // The offline profile has no network device, so the placeholder
+        // never matches. Being optional, it makes netplan skip
+        // systemd-networkd-wait-online, which would wait 2 minutes for a
+        // link. That covers systemd < 256 (Ubuntu 24.04), where the
+        // credential in qemu.rs is ignored; cloud-init reloads systemd
+        // before the wait starts, so it holds on first boot too.
+        NetProfile::Offline => {
+            "version: 2\nethernets:\n  none:\n    match: {name: \"stallo-none\"}\n    optional: true\n"
+        }
         // passt's DHCP. Matched by name, not MAC: a `stallo run` clone has
         // its own MAC but this disk's netplan file.
         NetProfile::Internet => {
@@ -204,7 +211,10 @@ mod tests {
             seed.user_data
                 .contains("dpkg -i /run/stallo-seed/debs/*.deb")
         );
-        assert_eq!(seed.network_config, "version: 2\nethernets: {}\n");
+        assert_eq!(
+            seed.network_config,
+            "version: 2\nethernets:\n  none:\n    match: {name: \"stallo-none\"}\n    optional: true\n"
+        );
         let inet = VmConfig {
             net: NetProfile::Internet,
             ..vm()
