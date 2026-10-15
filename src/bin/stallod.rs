@@ -273,6 +273,7 @@ async fn handle(
 ) -> (Response, Option<(std::fs::File, audit::Entry)>) {
     let started = Instant::now();
     let (op, vm, args, argv0) = audit::describe(&env.request);
+    let image = audit::image(&env.request);
     let log = vm
         .filter(|n| validate_name(n).is_ok() && m.paths.vm_dir(n).is_dir())
         .unwrap_or(audit::DAEMON)
@@ -317,6 +318,7 @@ async fn handle(
             pid: peer.pid(),
             via: env.via,
             op,
+            image,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 0,
@@ -353,10 +355,6 @@ async fn dispatch(
             forwards,
             wait,
         } => {
-            // Pulls are for humans (Gate::Closed), also through `new`.
-            if via == Via::Mcp {
-                images::ensure_pulled(&m.paths, &image)?;
-            }
             let new = NewVm {
                 name: name.clone(),
                 image,
@@ -366,6 +364,8 @@ async fn dispatch(
                 net,
                 forwards,
                 agent_control: via == Via::Mcp,
+                // Pulls are for humans (Gate::Closed), also through `new`.
+                may_pull: via == Via::Cli,
             };
             let started = Instant::now();
             m.create(&new).await?;

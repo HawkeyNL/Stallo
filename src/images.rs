@@ -5,9 +5,9 @@
 //! and comes from the pinned signing key, the image's SHA-256 (computed
 //! here) matches its line in the signed text, and `qemu-img info` shows a
 //! plain qcow2 with no backing file and no external data file. A `moving`
-//! checksum list's signature must be at most [`MAX_SIG_AGE_DAYS`] old. With
-//! `signed-image`, a detached signature over the image itself replaces the
-//! checksum list, and it must be as recent. With
+//! checksum list's signature must be at most [`MAX_SUMS_SIG_AGE_DAYS`] old.
+//! With `signed-image`, a detached signature over the image itself replaces
+//! the checksum list, and it must be at most [`MAX_SIG_AGE_DAYS`] old. With
 //! `pinned`, for upstreams that sign nothing, the image's SHA-512 is in the
 //! catalog itself, so an update needs a new Stallo release. Cached
 //! images are read-only and never replaced, because VM disks are overlays on
@@ -88,7 +88,7 @@ pub struct CatalogEntry {
     pub internet: bool,
     /// `url` and `sums_url` move to each new build (`current/`): the
     /// signature on the checksum list must then be at most
-    /// [`MAX_SIG_AGE_DAYS`] old. Release-pinned files never change, so
+    /// [`MAX_SUMS_SIG_AGE_DAYS`] old. Release-pinned files never change, so
     /// their old signatures stay valid. (`signed-image` always checks it.)
     #[serde(default)]
     pub moving: bool,
@@ -296,9 +296,8 @@ const KEYS: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// The oldest signature `signed-image` and `moving` checksum lists accept.
-/// Their URLs move to each new build (Arch publishes one every two weeks,
-/// Ubuntu's `current/` one every week or few), so an older signature means
+/// The oldest signature `signed-image` accepts. Its URLs move to each new
+/// build (Arch publishes one every two weeks), so an older signature means
 /// a stale or replaying mirror. 45 days leaves room for two missed builds.
 ///
 /// A detached signature does not name the file: within this window, a
@@ -306,6 +305,12 @@ const KEYS: &[(&str, &[u8])] = &[
 /// another image type) under the catalog's URL. TLS to the catalog's host
 /// and this age limit are what bound that.
 pub const MAX_SIG_AGE_DAYS: u64 = 45;
+
+/// The oldest signature a `moving` checksum list accepts (Ubuntu's
+/// `current/`, rebuilt every week or few, but irregularly): an older one
+/// means a stale or replaying mirror, or an upstream that stopped
+/// rebuilding.
+pub const MAX_SUMS_SIG_AGE_DAYS: u64 = 90;
 
 /// All catalog entries.
 pub fn catalog() -> Vec<CatalogEntry> {
@@ -595,7 +600,7 @@ async fn fetch_signed_sums(
         .context("signature check of the checksum list failed")?;
     if entry.moving {
         now_secs()
-            .and_then(|now| check_sig_age(&validsig, now))
+            .and_then(|now| check_sig_age(&validsig, now, MAX_SUMS_SIG_AGE_DAYS))
             .context("signature check of the checksum list failed")?;
     }
     let format = entry.sums_format.context("incomplete catalog entry")?;
@@ -749,7 +754,8 @@ fn now_secs() -> Result<u64> {
 
 /// Checks the VALIDSIG fields (see [`check_gpg_status`]) of a signature
 /// over an image: a binary document signature (class 00) with SHA-256 or
-/// SHA-512 (hash algorithms 8 and 10), and recent ([`check_sig_age`]).
+/// SHA-512 (hash algorithms 8 and 10), at most [`MAX_SIG_AGE_DAYS`] old
+/// ([`check_sig_age`]).
 fn check_image_sig(validsig: &[String], now: u64) -> Result<()> {
     let field = |i: usize| validsig.get(i).map_or("", String::as_str);
     ensure!(
@@ -758,13 +764,13 @@ fn check_image_sig(validsig: &[String], now: u64) -> Result<()> {
         field(8),
         field(7)
     );
-    check_sig_age(validsig, now)
+    check_sig_age(validsig, now, MAX_SIG_AGE_DAYS)
 }
 
 /// Checks that a signature (its VALIDSIG fields) was made at most
-/// [`MAX_SIG_AGE_DAYS`] before `now` and not more than a day after it
-/// (clock skew). Times are seconds since the epoch.
-fn check_sig_age(validsig: &[String], now: u64) -> Result<()> {
+/// `max_days` before `now` and not more than a day after it (clock skew).
+/// Times are seconds since the epoch.
+fn check_sig_age(validsig: &[String], now: u64, max_days: u64) -> Result<()> {
     let field = |i: usize| validsig.get(i).map_or("", String::as_str);
     let created: u64 = field(2)
         .parse()
@@ -775,8 +781,8 @@ fn check_sig_age(validsig: &[String], now: u64) -> Result<()> {
     );
     let days = now.saturating_sub(created) / 86_400;
     ensure!(
-        days <= MAX_SIG_AGE_DAYS,
-        "the signature is {days} days old (at most {MAX_SIG_AGE_DAYS}): the mirror looks stale"
+        days <= max_days,
+        "the signature is {days} days old (at most {max_days}): the mirror looks stale, or upstream has not rebuilt in {days} days"
     );
     Ok(())
 }
@@ -1551,7 +1557,11 @@ mod tests {
         let (day, created) = (86_400, 1_792_066_023);
         check(&[], created).unwrap();
         check(&[], created + 45 * day).unwrap();
-        assert!(format!("{:#}", check(&[], created + 46 * day).unwrap_err()).contains("days old"));
+        let stale = format!("{:#}", check(&[], created + 46 * day).unwrap_err());
+        assert!(
+            stale.contains("46 days old (at most 45): the mirror looks stale, or upstream has not rebuilt in 46 days"),
+            "{stale}"
+        );
         // Up to a day of clock skew; later is refused.
         check(&[], created - day).unwrap();
         assert!(format!("{:#}", check(&[], created - day - 1).unwrap_err()).contains("future"));
@@ -2051,16 +2061,21 @@ mod tests {
             let status = format!("[GNUPG:] VALIDSIG {fpr} {line} {fpr}\n");
             let mut fields = check_gpg_status(&status, fpr).unwrap();
             assert_eq!(sig_date(&fields).as_deref(), Some(&line[..10]));
-            check_sig_age(&fields, now).unwrap();
-            check_sig_age(&fields, created + 45 * day).unwrap();
-            let stale = check_sig_age(&fields, created + 46 * day).unwrap_err();
-            assert!(format!("{stale:#}").contains("days old"), "{stale:#}");
-            let future = check_sig_age(&fields, created - day - 1).unwrap_err();
+            check_sig_age(&fields, now, MAX_SUMS_SIG_AGE_DAYS).unwrap();
+            check_sig_age(&fields, created + 90 * day, MAX_SUMS_SIG_AGE_DAYS).unwrap();
+            let stale =
+                check_sig_age(&fields, created + 91 * day, MAX_SUMS_SIG_AGE_DAYS).unwrap_err();
+            assert!(
+                format!("{stale:#}").contains("91 days old (at most 90)"),
+                "{stale:#}"
+            );
+            let future =
+                check_sig_age(&fields, created - day - 1, MAX_SUMS_SIG_AGE_DAYS).unwrap_err();
             assert!(format!("{future:#}").contains("future"), "{future:#}");
             // A text signature (class 01, as a clearsigned list has) passes
             // the age check; only signed-image demands a binary one.
             fields[8] = "01".into();
-            check_sig_age(&fields, now).unwrap();
+            check_sig_age(&fields, now, MAX_SUMS_SIG_AGE_DAYS).unwrap();
             assert!(check_image_sig(&fields, now).is_err());
         }
         for (id, moving) in [
@@ -2110,7 +2125,7 @@ mod tests {
             )
             .await
             .unwrap();
-            check_sig_age(&validsig, now_secs().unwrap()).unwrap();
+            check_sig_age(&validsig, now_secs().unwrap(), MAX_SUMS_SIG_AGE_DAYS).unwrap();
             expected_sha256(&text, e.file(), e.sums_format.unwrap()).unwrap();
             eprintln!("{}: signed {}", e.id, sig_date(&validsig).unwrap());
         }

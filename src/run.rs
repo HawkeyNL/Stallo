@@ -340,6 +340,44 @@ mod tests {
         m.pull("arch").await.unwrap();
     }
 
+    /// An agent's `new` (no pulls) needs a pulled image, checked under the
+    /// images lock: nothing is downloaded and no VM directory is made.
+    #[tokio::test]
+    async fn agent_create_needs_a_pulled_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let mut config = DaemonConfig::default();
+        // Admission must pass on any test host's disk.
+        config.host.disk_floor_gib = 0;
+        let m = Manager::new(paths, config, Cgroups::at(root.join("cg")), Mode::Dev);
+        m.cleanup_leftovers().await.unwrap();
+        let new = crate::vm::NewVm {
+            name: "agent".into(),
+            image: "ubuntu-26.04".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_gib: 1,
+            net: NetProfile::Offline,
+            forwards: vec![],
+            agent_control: true,
+            may_pull: false,
+        };
+        let err = m.create(&new).await.unwrap_err();
+        assert!(
+            err.to_string().contains("image ubuntu-26.04 not pulled"),
+            "{err}"
+        );
+        assert!(!m.paths.vm_dir("agent").exists());
+        assert!(!m.paths.images_dir().join(".partial-ubuntu-26.04").exists());
+    }
+
     #[tokio::test]
     async fn clone_names_are_reserved() {
         let tmp = tempfile::tempdir().unwrap();
@@ -353,6 +391,7 @@ mod tests {
             net: NetProfile::Offline,
             forwards: vec![],
             agent_control: false,
+            may_pull: true,
         };
         let err = m.create(&new).await.unwrap_err();
         assert!(err.to_string().contains("kept for `stallo run`"), "{err}");
@@ -388,6 +427,7 @@ mod tests {
                 net: NetProfile::Internet,
                 forwards: vec![],
                 agent_control: false,
+                may_pull: true,
             };
             let err = m.create(&new).await.unwrap_err();
             assert_eq!(err.to_string(), why);
@@ -418,6 +458,7 @@ mod tests {
             net: NetProfile::Internet,
             forwards: vec![],
             agent_control: false,
+            may_pull: true,
         };
         let err = m.create(&new).await.unwrap_err();
         assert!(err.to_string().contains(why), "{err}");

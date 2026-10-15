@@ -15,7 +15,7 @@ sums_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
 sig_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg"
 sums_format = "gnu"
 # `current/` moves to each new build: the signature on SHA256SUMS must be
-# at most 45 days old, so a stale mirror cannot serve an old build. The
+# at most 90 days old, so a stale mirror cannot serve an old build. The
 # first pull is kept; `stallo images rm` and a new pull pick up a newer one.
 moving = true
 keyring = "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg"

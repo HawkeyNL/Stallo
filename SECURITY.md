@@ -72,8 +72,9 @@ only) is refused while any VM, stopped VMs and `stallo run` clones
 included, names it in `vm.toml` or has a disk whose qcow2 header names it
 as backing file; it never follows symlinks. A pull needs the disk floor
 plus twice the image's largest size free, so a download cannot push the
-host below the floor. Signatures on moving URLs (Ubuntu `current/`, Arch
-`latest/`) older than 45 days are refused.
+host below the floor. Signatures on moving URLs are refused when too old:
+over 90 days for Ubuntu's `current/` checksum lists, over 45 days for
+Arch's `latest/` image.
 
 ## Agent policy
 
@@ -110,9 +111,9 @@ add only trusted users, and agents only through `stallo mcp`.
 Every API call is logged, one JSON line each, in
 `<data>/audit/<vm>.jsonl` (or `_daemon.jsonl` for calls that name no
 existing VM): time, peer UID and PID, `via`, operation, argument sizes,
-`argv[0]` for exec, result size, duration and ok/error. Never typed text,
-file data, file paths, exec arguments after `argv[0]`, stdin or error
-messages. Logs rotate at 10 MiB (three kept) and outlive `stallo rm`. An
+`argv[0]` for exec, the image id for `pull` and `image_rm`, result size,
+duration and ok/error. Never typed text, file data, file paths, exec
+arguments after `argv[0]`, stdin or error messages. Logs rotate at 10 MiB (three kept) and outlive `stallo rm`. An
 agent call that cannot be logged is refused.
 
 Known limitation: in dev mode the daemon runs as the developer's own user, so

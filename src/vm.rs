@@ -109,6 +109,9 @@ pub struct NewVm {
     pub forwards: Vec<PortForward>,
     /// Agents may control it from the start (only for VMs agents create).
     pub agent_control: bool,
+    /// Download the image if it is not cached (humans only); otherwise
+    /// creation needs a pulled image.
+    pub may_pull: bool,
 }
 
 /// A running QEMU process.
@@ -157,7 +160,9 @@ pub struct Manager {
     /// Per-name lifecycle locks.
     ops: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Image downloads and removals take it exclusively, one at a time;
-    /// VM creation shares it while it builds a disk on an image.
+    /// VM creation shares it while it builds a disk on an image. Lock
+    /// order: a VM's lifecycle lock, then this one. Pulls and removals
+    /// take no VM lock.
     images: tokio::sync::RwLock<()>,
     /// Serialises admission: checking what fits and starting it is atomic.
     admission: tokio::sync::Mutex<()>,
@@ -387,12 +392,17 @@ impl Manager {
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
-        self.pull(&cfg.image).await?;
-        // Held until the VM's files exist, so `images rm` sees them; an
-        // image removed before this point fails the creation.
-        let _image = self.images.read().await;
+        if new.may_pull {
+            self.pull(&cfg.image).await?;
+        }
 
+        // Lock order: the VM's lock, then the images lock (see `images`),
+        // so a wait for a busy name never holds up pulls and removals.
         let _op = self.lock(&new.name).await?;
+        // Held until the VM's files exist, so `images rm` sees them. The
+        // image may have been removed since the pull: checked under it.
+        let _image = self.images.read().await;
+        images::ensure_pulled(&self.paths, &cfg.image)?;
         let dir = self.paths.vm_dir(&new.name);
         // Claims the name atomically: fails if the directory exists.
         fs::DirBuilder::new()
