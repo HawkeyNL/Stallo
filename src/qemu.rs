@@ -9,16 +9,23 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::process::Command;
 
 use crate::config::{NetProfile, VmConfig};
+use crate::images::{Agent, Firmware};
 use crate::run_tool;
 
 pub const QEMU: &str = "/usr/bin/qemu-system-x86_64";
-/// Secure Boot firmware and the matching variable store with Microsoft keys
-/// (Ubuntu's shim is signed by Microsoft).
+/// Secure Boot capable firmware for every VM. The variable store decides
+/// whether Secure Boot is on: with Microsoft's keys enrolled it is (Ubuntu's
+/// and Fedora's shims are signed by Microsoft); with no keys enrolled the
+/// firmware stays in setup mode and boots anything (`uefi` images). SMM and
+/// the secure flash are the same either way.
 pub const OVMF_CODE: &str = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd";
 pub const OVMF_VARS: &str = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd";
+pub const OVMF_VARS_NO_KEYS: &str = "/usr/share/OVMF/OVMF_VARS_4M.fd";
 
 /// Guest screen size; screenshots and pointer coordinates use it 1:1.
 pub const SCREEN: (u32, u32) = (1280, 800);
@@ -36,6 +43,18 @@ pub const VNC_SOCK: &str = "vnc.sock";
 pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
 
 const WAIT_ONLINE: &str = "systemd-networkd-wait-online.service";
+/// Waits for NTP before `time-sync.target`, with no timeout. Arch enables
+/// it, and its first boot orders cloud-init's final stage (and so the guest
+/// agent) after that target. Masked for every profile: the guest clock
+/// comes from the host, and NTP may be blocked or slow even with a network.
+const TIME_WAIT_SYNC: &str = "systemd-time-wait-sync.service";
+
+/// A drop-in for a preinstalled guest agent: it starts only after
+/// cloud-init's final stage. Otherwise it answers seconds before the seed
+/// has created the guest user and run its commands (seed.rs), and "ready"
+/// would come too early. Never for an agent the seed installs: its
+/// `systemctl start` inside the final stage would wait for itself.
+const QGA_AFTER_CLOUD_INIT: &str = "[Unit]\nAfter=cloud-final.service\n";
 
 /// The machine type is pinned rather than the moving `q35` alias, so a QEMU
 /// upgrade does not silently change the virtual hardware under saved VM
@@ -45,13 +64,15 @@ pub const MACHINE: &str = "pc-q35-10.2";
 /// Builds the QEMU argv (without the program) for `vm`. `net_fd` is QEMU's
 /// end of the passt socketpair: required for the `internet` profile, and
 /// refused for `offline`. `vnc` is the VNC socket: required when `vm.vnc`
-/// is on, and refused otherwise.
+/// is on, and refused otherwise. `agent` is how the image gets its guest
+/// agent.
 pub fn argv(
     vm: &VmConfig,
     vm_dir: &Path,
     rt_dir: &Path,
     net_fd: Option<RawFd>,
     vnc: Option<&Path>,
+    agent: Agent,
 ) -> Result<Vec<String>> {
     // Names and uuids end up inside option strings; never trust the caller.
     vm.validate()?;
@@ -64,11 +85,20 @@ pub fn argv(
     let vnc = vnc
         .map(|p| Ok::<_, anyhow::Error>(format!("-vnc unix:{}", opt_path(p)?)))
         .transpose()?;
+    // systemd >= 256 reads `systemd.unit-dropin.*` credentials. Base64
+    // has no spaces or commas.
+    let qga_order = (agent == Agent::Preinstalled).then(|| {
+        format!(
+            "-smbios type=11,value=io.systemd.credential.binary:systemd.unit-dropin.qemu-guest-agent.service={}",
+            BASE64.encode(QGA_AFTER_CLOUD_INIT)
+        )
+    });
     let network = match (vm.net, net_fd) {
         // No NIC means no link ever comes online, and Ubuntu's boot then
         // waits 2 minutes for systemd-networkd-wait-online. An empty
-        // `systemd.extra-unit.*` credential masks it (systemd >= 256).
-        (NetProfile::Offline, None) => [
+        // `systemd.extra-unit.*` credential masks a unit (systemd >= 256;
+        // for older systemd see the offline network-config in seed.rs).
+        (NetProfile::Offline, None) => vec![
             "-nic none".to_owned(),
             format!(
                 "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{WAIT_ONLINE}="
@@ -76,7 +106,7 @@ pub fn argv(
         ],
         // An already connected socket (see net.rs). `romfile=`: no iPXE
         // option ROM, so no network boot code in the firmware.
-        (NetProfile::Internet, Some(fd)) => [
+        (NetProfile::Internet, Some(fd)) => vec![
             format!("-netdev stream,id=net0,server=off,addr.type=fd,addr.str={fd}"),
             format!(
                 "-device virtio-net-pci,netdev=net0,mac={},romfile=",
@@ -85,6 +115,8 @@ pub fn argv(
         ],
         (net, fd) => bail!("network profile {net:?} with passt socket {fd:?}"),
     };
+    let time_sync =
+        format!("-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}=");
     let file = |dir: &Path, name: &str| opt_path(&dir.join(name));
     let (disk, vars, seed) = (
         file(vm_dir, DISK)?,
@@ -134,6 +166,8 @@ pub fn argv(
     Ok(args
         .iter()
         .chain(&network)
+        .chain([&time_sync])
+        .chain(&qga_order)
         .chain(&vnc)
         .flat_map(|a| a.split(' ').map(str::to_owned))
         .collect())
@@ -169,13 +203,23 @@ pub async fn create_disk(base: &Path, disk: &Path, size_gib: u64) -> Result<()> 
     Ok(())
 }
 
+/// The firmware variable template for `firmware`.
+fn vars_template(firmware: Firmware) -> &'static str {
+    match firmware {
+        Firmware::SecureBoot => OVMF_VARS,
+        Firmware::Uefi => OVMF_VARS_NO_KEYS,
+    }
+}
+
 /// Copies the firmware variable template into a per-VM qcow2, so internal
-/// snapshots can include it.
-pub async fn create_vars(vars: &Path) -> Result<()> {
+/// snapshots can include it. Only the daemon reads the template; QEMU gets
+/// the copy.
+pub async fn create_vars(vars: &Path, firmware: Firmware) -> Result<()> {
     ensure!(!vars.exists(), "{} already exists", vars.display());
     run_tool(
         Command::new("qemu-img")
-            .args(["convert", "-q", "-f", "raw", "-O", "qcow2", OVMF_VARS])
+            .args(["convert", "-q", "-f", "raw", "-O", "qcow2"])
+            .arg(vars_template(firmware))
             .arg(vars),
         Duration::from_secs(30),
     )
@@ -214,6 +258,7 @@ mod tests {
             Path::new("/r/vms/dev"),
             None,
             None,
+            Agent::Deb,
         )
         .unwrap();
         let want = "\
@@ -240,14 +285,23 @@ mod tests {
 -device virtio-serial-pci \
 -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
 -nic none \
--smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-networkd-wait-online.service=";
+-smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-networkd-wait-online.service= \
+-smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-time-wait-sync.service=";
         assert_eq!(got.join(" "), want);
     }
 
     /// S4: the security-relevant flags, checked one by one.
     #[test]
     fn security_flags() {
-        let a = argv(&vm(), Path::new("/d"), Path::new("/r"), None, None).unwrap();
+        let a = argv(
+            &vm(),
+            Path::new("/d"),
+            Path::new("/r"),
+            None,
+            None,
+            Agent::Deb,
+        )
+        .unwrap();
         let after = |flag: &str| {
             a.windows(2)
                 .filter(|w| w[0] == flag)
@@ -272,14 +326,32 @@ mod tests {
         assert_eq!(opt_path(Path::new("/a,b/c")).unwrap(), "/a,,b/c");
         assert!(opt_path(Path::new("/a b")).is_err());
         assert!(opt_path(Path::new("/a\nb")).is_err());
-        let a = argv(&vm(), Path::new("/x,y"), Path::new("/r"), None, None).unwrap();
+        let a = argv(
+            &vm(),
+            Path::new("/x,y"),
+            Path::new("/r"),
+            None,
+            None,
+            Agent::Deb,
+        )
+        .unwrap();
         assert!(a.iter().any(|x| x.contains("filename=/x,,y/disk.qcow2,")));
         for name in ["a,b", "a b", "a\nb"] {
             let bad = VmConfig {
                 name: name.into(),
                 ..vm()
             };
-            assert!(argv(&bad, Path::new("/d"), Path::new("/r"), None, None).is_err());
+            assert!(
+                argv(
+                    &bad,
+                    Path::new("/d"),
+                    Path::new("/r"),
+                    None,
+                    None,
+                    Agent::Deb
+                )
+                .is_err()
+            );
         }
     }
 
@@ -291,19 +363,80 @@ mod tests {
             net: NetProfile::Internet,
             ..vm()
         };
-        let a = argv(&inet, Path::new("/d"), Path::new("/r"), Some(9), None).unwrap();
-        let offline = argv(&vm(), Path::new("/d"), Path::new("/r"), None, None).unwrap();
-        let tail = &a[a.len() - 4..];
+        let a = argv(
+            &inet,
+            Path::new("/d"),
+            Path::new("/r"),
+            Some(9),
+            None,
+            Agent::Deb,
+        )
+        .unwrap();
+        let offline = argv(
+            &vm(),
+            Path::new("/d"),
+            Path::new("/r"),
+            None,
+            None,
+            Agent::Deb,
+        )
+        .unwrap();
+        let tail = &a[a.len() - 6..];
         assert_eq!(
             tail.join(" "),
             "-netdev stream,id=net0,server=off,addr.type=fd,addr.str=9 \
-             -device virtio-net-pci,netdev=net0,mac=52:54:00:4f:1c:2b,romfile="
+             -device virtio-net-pci,netdev=net0,mac=52:54:00:4f:1c:2b,romfile= \
+             -smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-time-wait-sync.service="
         );
-        assert_eq!(a[..a.len() - 4], offline[..offline.len() - 4]);
+        assert_eq!(a[..a.len() - 6], offline[..offline.len() - 6]);
+        assert_eq!(a[a.len() - 2..], offline[offline.len() - 2..]);
         assert!(!a.iter().any(|x| x == "-nic" || x.contains(WAIT_ONLINE)));
         // The profile and the socket go together.
-        assert!(argv(&inet, Path::new("/d"), Path::new("/r"), None, None).is_err());
-        assert!(argv(&vm(), Path::new("/d"), Path::new("/r"), Some(9), None).is_err());
+        assert!(
+            argv(
+                &inet,
+                Path::new("/d"),
+                Path::new("/r"),
+                None,
+                None,
+                Agent::Deb
+            )
+            .is_err()
+        );
+        assert!(
+            argv(
+                &vm(),
+                Path::new("/d"),
+                Path::new("/r"),
+                Some(9),
+                None,
+                Agent::Deb
+            )
+            .is_err()
+        );
+    }
+
+    /// A preinstalled guest agent waits for cloud-init, on either profile.
+    #[test]
+    fn preinstalled_agent_waits_for_cloud_init() {
+        let (d, r) = (Path::new("/d"), Path::new("/r"));
+        let deb = argv(&vm(), d, r, None, None, Agent::Deb).unwrap();
+        let pre = argv(&vm(), d, r, None, None, Agent::Preinstalled).unwrap();
+        assert_eq!(pre[..deb.len()], deb[..]);
+        // base64 of "[Unit]\nAfter=cloud-final.service\n".
+        assert_eq!(
+            pre[deb.len()..],
+            [
+                "-smbios",
+                "type=11,value=io.systemd.credential.binary:systemd.unit-dropin.qemu-guest-agent.service=W1VuaXRdCkFmdGVyPWNsb3VkLWZpbmFsLnNlcnZpY2UK"
+            ]
+        );
+        let inet = VmConfig {
+            net: NetProfile::Internet,
+            ..vm()
+        };
+        let a = argv(&inet, d, r, Some(9), None, Agent::Preinstalled).unwrap();
+        assert!(a.contains(&pre[pre.len() - 1]));
     }
 
     /// S4: VNC only on a Unix socket, only when the VM asks for it.
@@ -311,20 +444,57 @@ mod tests {
     fn vnc_on_unix_socket() {
         let on = VmConfig { vnc: true, ..vm() };
         let sock = Path::new("/r/vnc/dev/vnc.sock");
-        let a = argv(&on, Path::new("/d"), Path::new("/r"), None, Some(sock)).unwrap();
-        let offline = argv(&vm(), Path::new("/d"), Path::new("/r"), None, None).unwrap();
+        let a = argv(
+            &on,
+            Path::new("/d"),
+            Path::new("/r"),
+            None,
+            Some(sock),
+            Agent::Deb,
+        )
+        .unwrap();
+        let offline = argv(
+            &vm(),
+            Path::new("/d"),
+            Path::new("/r"),
+            None,
+            None,
+            Agent::Deb,
+        )
+        .unwrap();
         assert_eq!(a[a.len() - 2..], ["-vnc", "unix:/r/vnc/dev/vnc.sock"]);
         assert_eq!(a[..a.len() - 2], offline[..]);
         assert!(!a.iter().any(|x| x.contains("tcp:") || x.contains("host=")));
-        assert!(argv(&on, Path::new("/d"), Path::new("/r"), None, None).is_err());
-        assert!(argv(&vm(), Path::new("/d"), Path::new("/r"), None, Some(sock)).is_err());
         assert!(
             argv(
                 &on,
                 Path::new("/d"),
                 Path::new("/r"),
                 None,
-                Some(Path::new("/a b"))
+                None,
+                Agent::Deb
+            )
+            .is_err()
+        );
+        assert!(
+            argv(
+                &vm(),
+                Path::new("/d"),
+                Path::new("/r"),
+                None,
+                Some(sock),
+                Agent::Deb
+            )
+            .is_err()
+        );
+        assert!(
+            argv(
+                &on,
+                Path::new("/d"),
+                Path::new("/r"),
+                None,
+                Some(Path::new("/a b")),
+                Agent::Deb
             )
             .is_err()
         );

@@ -35,6 +35,9 @@ pub struct Entry {
     pub pid: Option<i32>,
     pub via: Via,
     pub op: &'static str,
+    /// The image `pull` and `image_rm` act on, if it is a valid image id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     /// Sizes in bytes (or counts) of the arguments that carry content.
     pub args: BTreeMap<&'static str, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +156,19 @@ pub fn describe(r: &Request) -> Described<'_> {
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),
         Request::Pull { .. } => ("pull", None, vec![], None),
+        Request::ImageRm { .. } => ("image_rm", None, vec![], None),
+    }
+}
+
+/// The image a request acts on (`pull`, `image_rm`), if its id is valid:
+/// anything else is untrusted text and stays out of the log.
+pub fn image(r: &Request) -> Option<String> {
+    match r {
+        Request::Pull { image } | Request::ImageRm { image } => {
+            crate::config::validate_image_id(image).ok()?;
+            Some(image.clone())
+        }
+        _ => None,
     }
 }
 
@@ -217,6 +233,7 @@ mod tests {
             pid: Some(42),
             via: Via::Mcp,
             op,
+            image: None,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 7,
@@ -297,6 +314,7 @@ mod tests {
             pid: None,
             via: Via::Cli,
             op,
+            image: None,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 0,
@@ -324,5 +342,40 @@ mod tests {
         fs::remove_file(&file).unwrap();
         std::os::unix::fs::symlink("/dev/null", &file).unwrap();
         assert!(open_at(dir.path(), "dev", 300).is_err());
+    }
+
+    /// `pull` and `image_rm` name their image; invalid ids are left out.
+    #[test]
+    fn image_ops_name_the_image() {
+        let pull = Request::Pull {
+            image: "ubuntu-26.04".into(),
+        };
+        let rm = Request::ImageRm {
+            image: "arch".into(),
+        };
+        assert_eq!(describe(&pull).0, "pull");
+        assert_eq!(describe(&rm).0, "image_rm");
+        assert_eq!(image(&pull).as_deref(), Some("ubuntu-26.04"));
+        assert_eq!(image(&rm).as_deref(), Some("arch"));
+        let bad = Request::ImageRm {
+            image: "../hunter2\n".into(),
+        };
+        assert_eq!(image(&bad), None);
+        assert_eq!(image(&Request::List), None);
+        let e = Entry {
+            time_ms: 1,
+            uid: 1000,
+            pid: None,
+            via: Via::Cli,
+            op: "image_rm",
+            image: image(&rm),
+            args: BTreeMap::new(),
+            argv0: None,
+            result_bytes: 0,
+            ms: 0,
+            ok: true,
+        };
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(line.contains(r#""op":"image_rm","image":"arch""#), "{line}");
     }
 }

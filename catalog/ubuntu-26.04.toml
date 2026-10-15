@@ -1,9 +1,22 @@
 # Ubuntu 26.04 LTS (Resolute Raccoon) server cloud image, amd64, qcow2, UEFI/GPT.
 id = "ubuntu-26.04"
 name = "Ubuntu 26.04 LTS server (cloud image)"
-release = "26.04"
-base_url = "https://cloud-images.ubuntu.com/resolute/current/"
-file = "resolute-server-cloudimg-amd64.img"
+os = "linux"
+firmware = "secure-boot"
+url = "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+max_size = 4_294_967_296
+
+# The internet profile was verified with this image (docs/network-verification.md).
+internet = true
+
+trust = "signed-sums"
+sums_url = "https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS"
+sig_url = "https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS.gpg"
+sums_format = "gnu"
+# `current/` moves to each new build: the signature on SHA256SUMS must be
+# at most 90 days old, so a stale mirror cannot serve an old build. The
+# first pull is kept; `stallo images rm` and a new pull pick up a newer one.
+moving = true
 keyring = "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg"
 # "UEC Image Automatic Signing Key <cdimage@ubuntu.com>", which signs
 # SHA256SUMS of the current Ubuntu cloud images (checked 2026-10-12).
@@ -21,7 +34,16 @@ signing_key = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
 #   present: libc6, libglib2.0-0t64, libnuma1, libudev1, python3
 #   missing: qemu-guest-agent, liburing2, ubuntu-virt, ubuntu-helper-virt-hwe
 #
-# The packages are cached under <data>/images/debs/26.04/ and not refreshed
-# automatically. To pick up guest-agent updates, delete that directory and
-# run `stallo images pull ubuntu-26.04`; existing VMs keep what they have.
+# apt fetches them in a private root from these sources only, trusting only
+# the Ubuntu archive keyring. They are cached under
+# <data>/images/ubuntu-26.04.debs/ and not refreshed automatically. To pick
+# up guest-agent updates, delete that directory and run
+# `stallo images pull ubuntu-26.04`; existing VMs keep what they have.
+agent = "deb"
 debs = ["qemu-guest-agent", "liburing2", "ubuntu-virt", "ubuntu-helper-virt-hwe"]
+deb_keyring = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+deb_sources = [
+    "https://archive.ubuntu.com/ubuntu resolute main universe",
+    "https://archive.ubuntu.com/ubuntu resolute-updates main universe",
+    "https://security.ubuntu.com/ubuntu resolute-security main universe",
+]

@@ -62,6 +62,39 @@ stallo exec dev -- uname -a
 stallo ls
 ```
 
+Guest images (`stallo images` lists them):
+
+| ID | Image | Notes |
+|---|---|---|
+| `ubuntu-26.04` (default) | Ubuntu 26.04 LTS server cloud image | |
+| `ubuntu-24.04` | Ubuntu 24.04 LTS server cloud image | |
+| `fedora-44` | Fedora 44 Cloud Base Generic (44-1.7) | The guest agent's SELinux domain is made permissive (see `catalog/fedora-44.toml`). Offline only for now. |
+| `arch` | Arch Linux cloud image (arch-boxes) | No Secure Boot (its boot loader is not signed for it). Rolling: `latest/` moves every two weeks, and the first pull is kept. Offline only for now. |
+| `debian-13` | Debian 13 generic cloud image (20261015-2632) | Pinned (upstream unsigned): Debian signs no checksums for its cloud images, so Stallo checks a SHA-512 built into it, and a newer build needs a Stallo release. So does a new Debian archive key: the archive keyring that checks the guest-agent package is vendored, and fetches fail until a release ships the new one. Offline only for now. |
+
+Use another one with `stallo new dev --image fedora-44` after pulling it.
+Ubuntu images are checked with the host's Ubuntu keyrings; other
+distributions' signing keys ship with Stallo in `catalog/keys/`. Ubuntu's
+`current/` and Arch's `latest/` move to each new build, so their signatures
+must be recent (Ubuntu's checksum list at most 90 days old, Arch's image at
+most 45): a stale or replaying mirror cannot hold back an old build for
+longer. Arch signs the image itself rather than a checksum list. Debian's image has no signature at all: its SHA-512 is pinned in the
+catalog (`catalog/debian-13.toml`), while its guest-agent package comes
+from the signed Debian archive. The `internet` profile is refused for
+images it was not verified with (`internet` in the catalog entry): so far
+the Ubuntu ones.
+
+A pull starts only if the image's filesystem keeps the disk floor
+(`disk_floor_gib`) free plus twice the image's largest size (less what an
+interrupted download already holds). A pulled image is kept as it is, and
+`stallo images` shows the date of the signature it was verified with. To
+get a newer build, or to free the space, delete it and pull again:
+
+```sh
+stallo images rm ubuntu-26.04   # refused while any VM was made from it
+stallo images pull ubuntu-26.04
+```
+
 What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 
 ## How it fits together
@@ -77,8 +110,8 @@ What the package installs, and how to remove it: [docs/production.md](docs/produ
 ## Requirements
 
 - Ubuntu 26.04 LTS on x86_64 with `/dev/kvm`; your user in group `kvm`.
-- `qemu-system-x86`, `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv` and
-  `ubuntu-cloudimage-keyring`.
+- `qemu-system-x86`, `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
+  `ubuntu-cloudimage-keyring` and `ubuntu-keyring`.
 - A Rust toolchain (pinned in `rust-toolchain.toml`).
 
 ## Development
@@ -101,6 +134,9 @@ and run the daemon as a transient `systemd-run --user` unit:
 ```sh
 STALLO_IT=1 cargo test -- --ignored --test-threads=1
 ```
+
+They use `ubuntu-26.04`; set `STALLO_IT_IMAGE_ID` (for example
+`fedora-44`, pulled in dev mode first) to run them on another catalog image.
 
 Add `--nocapture` to see the `MEASURE` lines (boot time, screenshot,
 click and exec latency, daemon memory); `tests/kvm_perf.rs` collects them.
@@ -228,8 +264,8 @@ stallo mcp --http 100.101.102.103:8765 --token-file ~/.config/stallo/mcp-token
 Tools: `vm_list`, `vm_info`, `vm_create` (only with `agents_can_create =
 true` in `stallod.toml`), `vm_start`, `vm_stop`, `vm_reset`, `screenshot`,
 `wait_for_screen`, `mouse_move`, `click`, `drag`, `scroll`, `type_text`,
-`key`, `exec`, `file_read`, `file_write`. There is no delete tool. Every
-call is logged in `<data>/audit/`; see SECURITY.md.
+`key`, `exec`, `file_read`, `file_write`, `image_list`. There is no
+delete tool. Every call is logged in `<data>/audit/`; see SECURITY.md.
 
 ## Licence
 
