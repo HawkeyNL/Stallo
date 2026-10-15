@@ -370,7 +370,7 @@ impl Manager {
             cfg.image
         );
         qemu::create_disk(&base, &dir.join(qemu::DISK), cfg.disk_gib).await?;
-        qemu::create_vars(&dir.join(qemu::VARS)).await?;
+        qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
         ensure_private_dir(&dir.join(qemu::STATES))?;
 
         let password = seed::generate_password()?;
@@ -495,6 +495,9 @@ impl Manager {
     /// internet profile needs production mode and a passing isolation
     /// probe (`net::check_isolation`).
     fn check_net(&self, cfg: &VmConfig) -> Result<()> {
+        if cfg.net != NetProfile::Offline {
+            images::find(&cfg.image)?.check_net(cfg.net)?;
+        }
         match (cfg.net, self.mode) {
             (NetProfile::Offline, _) => Ok(()),
             // The host's table matches the daemon's user; in dev mode that

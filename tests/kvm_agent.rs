@@ -208,7 +208,8 @@ fn agent_drives_the_console() {
         let reader = scope.spawn(|| {
             d.ok(&[
                 "exec", "dev", "--admin", "--", "sh", "-c",
-                "ev=$(awk '/Virtio Tablet/{f=1} f && /^H:/{for(i=1;i<=NF;i++) if($i ~ /^event/) print $i; exit}' /proc/bus/input/devices); \
+                // `H: Handlers=mouse0 event3`, or `Handlers=event3 mouse0`.
+                "ev=$(awk '/Virtio Tablet/{f=1} f && /^H:/{for(i=2;i<=NF;i++){sub(/^Handlers=/, \"\", $i); if($i ~ /^event/) print $i}; exit}' /proc/bus/input/devices); \
                  timeout 3 cat /dev/input/$ev | od -An -v -tx1 -w24; true",
             ])
         });

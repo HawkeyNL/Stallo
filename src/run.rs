@@ -290,6 +290,41 @@ mod tests {
         }
     }
 
+    /// Images not verified with the internet profile refuse it, in both
+    /// modes and before the isolation check.
+    #[tokio::test]
+    async fn internet_is_refused_for_unverified_images() {
+        let why = "arch: the internet profile is not supported for this image yet";
+        for mode in [Mode::Dev, Mode::Production] {
+            let tmp = tempfile::tempdir().unwrap();
+            let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+            let new = crate::vm::NewVm {
+                name: "web".into(),
+                image: "arch".into(),
+                vcpus: 1,
+                memory_mib: 512,
+                disk_gib: 10,
+                net: NetProfile::Internet,
+                forwards: vec![],
+                agent_control: false,
+            };
+            let err = m.create(&new).await.unwrap_err();
+            assert_eq!(err.to_string(), why);
+            assert!(!m.paths.vm_dir("web").exists());
+
+            let dir = m.paths.vm_dir("web");
+            fs::create_dir_all(&dir).unwrap();
+            let cfg = VmConfig {
+                net: NetProfile::Internet,
+                image: "arch".into(),
+                ..vm("web", None)
+            };
+            cfg.save(&dir).unwrap();
+            let err = m.start("web").await.err().unwrap();
+            assert_eq!(err.to_string(), why);
+        }
+    }
+
     async fn internet_is_refused_in(mode: Mode, why: &str) {
         let tmp = tempfile::tempdir().unwrap();
         let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);

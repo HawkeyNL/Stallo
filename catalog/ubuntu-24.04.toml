@@ -6,6 +6,10 @@ firmware = "secure-boot"
 url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 max_size = 4_294_967_296
 
+# The internet profile: netplan, as on 26.04, which was verified
+# (docs/network-verification.md); not booted with it on 24.04 itself.
+internet = true
+
 trust = "signed-sums"
 sums_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
 sig_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg"
