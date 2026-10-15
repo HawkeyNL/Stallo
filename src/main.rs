@@ -539,11 +539,28 @@ fn default_socket() -> Result<PathBuf> {
     let production = stallo::paths::Paths::production()?.api_socket();
     let dev = stallo::paths::Paths::dev().map(|p| p.api_socket());
     let dev_up = dev.as_ref().is_ok_and(|d| d.exists());
-    pick_socket(production.exists().then_some(production), dev, dev_up)
+    // `/run/stallo` is only open to group `stallo`: for anyone else the
+    // socket's metadata fails with EACCES instead of NotFound.
+    let prod_denied = std::fs::metadata(&production)
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    pick_socket(
+        production.exists().then_some(production),
+        dev,
+        dev_up,
+        prod_denied,
+    )
 }
 
-fn pick_socket(production: Option<PathBuf>, dev: Result<PathBuf>, dev_up: bool) -> Result<PathBuf> {
+fn pick_socket(
+    production: Option<PathBuf>,
+    dev: Result<PathBuf>,
+    dev_up: bool,
+    prod_denied: bool,
+) -> Result<PathBuf> {
     match (production, dev) {
+        (None, _) if prod_denied && !dev_up => bail!(
+            "stallod is installed, but you may not use it yet: add yourself to group `stallo` (sudo usermod -aG stallo \"$USER\"), then log out and in again"
+        ),
         (Some(p), Ok(d)) if dev_up => bail!(
             "both a production daemon ({}) and a dev-mode daemon ({}) are running; choose one with --socket or STALLO_SOCKET",
             p.display(),
@@ -941,7 +958,7 @@ mod tests {
             } else {
                 Err(anyhow::anyhow!("XDG_RUNTIME_DIR is not set"))
             };
-            super::pick_socket(prod.then(|| p.clone()), dev, up)
+            super::pick_socket(prod.then(|| p.clone()), dev, up, false)
         };
         assert_eq!(pick(true, true, false).unwrap(), p);
         assert_eq!(pick(true, false, false).unwrap(), p);
@@ -951,6 +968,12 @@ mod tests {
         // Both daemons up: no guessing.
         let err = pick(true, true, true).unwrap_err().to_string();
         assert!(err.contains("--socket"), "{err}");
+        // Production there but not open to this user: say so, unless a
+        // dev-mode daemon is up.
+        let denied = |dev_up| super::pick_socket(None, Ok(d.clone()), dev_up, true);
+        let err = denied(false).unwrap_err().to_string();
+        assert!(err.contains("group `stallo`"), "{err}");
+        assert_eq!(denied(true).unwrap(), d);
     }
 
     use super::*;
