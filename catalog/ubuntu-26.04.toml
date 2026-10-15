@@ -6,6 +6,9 @@ firmware = "secure-boot"
 url = "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
 max_size = 4_294_967_296
 
+# The internet profile was verified with this image (docs/network-verification.md).
+internet = true
+
 trust = "signed-sums"
 sums_url = "https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS"
 sig_url = "https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS.gpg"

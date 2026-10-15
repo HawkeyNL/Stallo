@@ -45,7 +45,8 @@ pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
 const WAIT_ONLINE: &str = "systemd-networkd-wait-online.service";
 /// Waits for NTP before `time-sync.target`, with no timeout. Arch enables
 /// it, and its first boot orders cloud-init's final stage (and so the guest
-/// agent) after that target.
+/// agent) after that target. Masked for every profile: the guest clock
+/// comes from the host, and NTP may be blocked or slow even with a network.
 const TIME_WAIT_SYNC: &str = "systemd-time-wait-sync.service";
 
 /// A drop-in for a preinstalled guest agent: it starts only after
@@ -94,17 +95,13 @@ pub fn argv(
     });
     let network = match (vm.net, net_fd) {
         // No NIC means no link ever comes online, and Ubuntu's boot then
-        // waits 2 minutes for systemd-networkd-wait-online; nor is the clock
-        // ever synchronised. An empty `systemd.extra-unit.*` credential
-        // masks a unit (systemd >= 256; for older systemd see the offline
-        // network-config in seed.rs).
+        // waits 2 minutes for systemd-networkd-wait-online. An empty
+        // `systemd.extra-unit.*` credential masks a unit (systemd >= 256;
+        // for older systemd see the offline network-config in seed.rs).
         (NetProfile::Offline, None) => vec![
             "-nic none".to_owned(),
             format!(
                 "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{WAIT_ONLINE}="
-            ),
-            format!(
-                "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}="
             ),
         ],
         // An already connected socket (see net.rs). `romfile=`: no iPXE
@@ -118,6 +115,8 @@ pub fn argv(
         ],
         (net, fd) => bail!("network profile {net:?} with passt socket {fd:?}"),
     };
+    let time_sync =
+        format!("-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}=");
     let file = |dir: &Path, name: &str| opt_path(&dir.join(name));
     let (disk, vars, seed) = (
         file(vm_dir, DISK)?,
@@ -167,6 +166,7 @@ pub fn argv(
     Ok(args
         .iter()
         .chain(&network)
+        .chain([&time_sync])
         .chain(&qga_order)
         .chain(&vnc)
         .flat_map(|a| a.split(' ').map(str::to_owned))
@@ -381,17 +381,16 @@ mod tests {
             Agent::Deb,
         )
         .unwrap();
-        let tail = &a[a.len() - 4..];
+        let tail = &a[a.len() - 6..];
         assert_eq!(
             tail.join(" "),
             "-netdev stream,id=net0,server=off,addr.type=fd,addr.str=9 \
-             -device virtio-net-pci,netdev=net0,mac=52:54:00:4f:1c:2b,romfile="
+             -device virtio-net-pci,netdev=net0,mac=52:54:00:4f:1c:2b,romfile= \
+             -smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-time-wait-sync.service="
         );
-        assert_eq!(a[..a.len() - 4], offline[..offline.len() - 6]);
-        assert!(
-            !a.iter()
-                .any(|x| x == "-nic" || x.contains(WAIT_ONLINE) || x.contains(TIME_WAIT_SYNC))
-        );
+        assert_eq!(a[..a.len() - 6], offline[..offline.len() - 6]);
+        assert_eq!(a[a.len() - 2..], offline[offline.len() - 2..]);
+        assert!(!a.iter().any(|x| x == "-nic" || x.contains(WAIT_ONLINE)));
         // The profile and the socket go together.
         assert!(
             argv(

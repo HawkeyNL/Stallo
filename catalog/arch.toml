@@ -26,9 +26,7 @@ signing_key = "1B9A16984A4E8CB448712D2AE0B78BF4326C6F8F"
 # The image ships qemu-guest-agent (arch-boxes installs it in every image).
 agent = "preinstalled"
 
-# Not verified: the `internet` profile (dev mode is offline only). Here
-# cloud-init renders the network config for systemd-networkd, which names
-# the interface after the config's key rather than its match, and the image
-# boots with net.ifnames=0 (eth0). If DHCP does not come up, the first boot
-# also waits for clock synchronisation (systemd-time-wait-sync, masked only
-# for offline VMs) and the VM never reports ready.
+# No `internet` profile (refused, see `internet` in images.rs): cloud-init
+# renders the network config for systemd-networkd here, which names the
+# interface after the config's key ("nic") rather than its match, and the
+# image boots with net.ifnames=0 (eth0), so DHCP would not come up.
