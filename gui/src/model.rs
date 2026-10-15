@@ -1,8 +1,15 @@
 //! Plain-Rust view-model: what the window should show, decided from facts
 //! gathered elsewhere (no GTK, no I/O), so every case is unit-testable.
 
+use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use stallo::api::{Request, VmDetails, VmInfo};
+use stallo::config::NetProfile;
+use stallo::host::HostInfo;
+use stallo::printable;
 
 /// How often the window probes again while it shows an onboarding page.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -74,8 +81,9 @@ pub enum Onboarding {
     },
     /// The daemon is there but the request failed (timeout, error reply).
     Unreachable(String),
+    /// The daemon on `socket` answered.
     Connected {
-        vms: usize,
+        socket: PathBuf,
     },
 }
 
@@ -129,7 +137,7 @@ pub fn onboarding(p: &Probe) -> Onboarding {
         Some(Err(CallError::NotRunning)) | None if p.explicit.is_some() => {
             Onboarding::SocketDown { socket }
         }
-        Some(Ok(vms)) => Onboarding::Connected { vms: *vms },
+        Some(Ok(_)) => Onboarding::Connected { socket },
         Some(Err(CallError::Denied)) => denied(),
         Some(Err(CallError::Timeout)) => Onboarding::Unreachable("no answer in time".into()),
         Some(Err(CallError::Failed(e))) => Onboarding::Unreachable(e.clone()),
@@ -191,6 +199,337 @@ impl View {
     pub fn polls(&self, visible: bool) -> bool {
         visible && (self.reconnecting || !matches!(self.page, Onboarding::Connected { .. }))
     }
+
+    /// Whether to poll the VM list and the host: while the window is
+    /// visible and connected. While reconnecting the probe takes over.
+    pub fn polls_vms(&self, visible: bool) -> bool {
+        visible && !self.reconnecting && matches!(self.page, Onboarding::Connected { .. })
+    }
+}
+
+impl fmt::Display for CallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CallError::NotRunning => f.write_str("Stallo is not running"),
+            CallError::Denied => f.write_str("permission denied"),
+            CallError::Timeout => f.write_str("no answer in time"),
+            // From the daemon (and maybe the guest): never trusted.
+            CallError::Failed(e) => f.write_str(&printable(e, 300)),
+        }
+    }
+}
+
+/// How often the VM list, the host and an open VM's details are asked for.
+pub const LIST_EVERY: Duration = Duration::from_secs(3);
+pub const HOST_EVERY: Duration = Duration::from_secs(15);
+pub const INFO_EVERY: Duration = Duration::from_secs(10);
+/// The wait after a failed poll.
+pub const BACKOFF: Duration = Duration::from_secs(30);
+/// How often the window checks which polls are due.
+// ponytail: a 1 s heartbeat, so a poll runs up to 1 s late; the daemon's
+// long-poll replaces list polling later.
+pub const TICK: Duration = Duration::from_secs(1);
+
+/// One repeated request: due every so often, never two at once.
+#[derive(Debug, Clone)]
+pub struct Poll {
+    every: Duration,
+    next: Option<Instant>,
+    busy: bool,
+}
+
+impl Poll {
+    pub fn new(every: Duration) -> Self {
+        Self {
+            every,
+            next: None,
+            busy: false,
+        }
+    }
+
+    /// Whether to send the request now; if so, it counts as sent.
+    pub fn due(&mut self, now: Instant) -> bool {
+        let due = !self.busy && self.next.is_none_or(|n| now >= n);
+        self.busy |= due;
+        due
+    }
+
+    /// The answer is back: wait `every`, or [`BACKOFF`] after an error.
+    pub fn done(&mut self, now: Instant, ok: bool) {
+        self.busy = false;
+        self.next = Some(now + if ok { self.every } else { BACKOFF });
+    }
+
+    /// Ask at the next tick, e.g. after an action.
+    pub fn soon(&mut self) {
+        self.next = None;
+    }
+}
+
+/// What a VM's state string means for the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Stopped,
+    Running,
+    /// Paused, or another QEMU state on the way somewhere.
+    Paused,
+    /// Paused by the disk watchdog; a human resumes it.
+    DiskFull,
+    /// `io-error`, a crash, or QMP does not answer (`unknown`).
+    Failed,
+}
+
+pub fn kind(state: &str) -> Kind {
+    // "running (no network)" once the network of a VM was cut.
+    match state.strip_suffix(" (no network)").unwrap_or(state) {
+        "stopped" => Kind::Stopped,
+        "running" => Kind::Running,
+        "paused (disk full)" => Kind::DiskFull,
+        "io-error" | "internal-error" | "guest-panicked" | "unknown" => Kind::Failed,
+        _ => Kind::Paused,
+    }
+}
+
+/// A VM in the sidebar. Strings are safe to show in plain labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowVm {
+    pub name: String,
+    pub state: String,
+    /// The libadwaita style class for the state, if any.
+    pub tone: Option<&'static str>,
+    pub control_icon: &'static str,
+    pub control_tip: &'static str,
+}
+
+pub fn row(vm: &VmInfo) -> RowVm {
+    let tone = match kind(&vm.state) {
+        Kind::Stopped => None,
+        Kind::Running => Some("success"),
+        Kind::Paused | Kind::DiskFull => Some("warning"),
+        Kind::Failed => Some("error"),
+    };
+    let (control_icon, control_tip) = if vm.agent_control {
+        ("security-high-symbolic", "Agent control on")
+    } else {
+        ("avatar-default-symbolic", "Agent control off")
+    };
+    RowVm {
+        name: printable(&vm.name, 64),
+        state: printable(&vm.state, 64),
+        tone,
+        control_icon,
+        control_tip,
+    }
+}
+
+/// A lifecycle action on one VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Start,
+    Stop,
+    ForceOff,
+    Reset,
+    Resume,
+}
+
+impl Op {
+    pub const ALL: [Op; 5] = [Op::Start, Op::Stop, Op::ForceOff, Op::Reset, Op::Resume];
+
+    pub fn request(self, name: &str) -> Request {
+        let name = name.to_owned();
+        match self {
+            // Not waiting for the guest agent: the window polls the state.
+            Op::Start => Request::Start { name, wait: false },
+            Op::Stop => Request::Stop { name, force: false },
+            Op::ForceOff => Request::Stop { name, force: true },
+            Op::Reset => Request::Reset { name },
+            Op::Resume => Request::Resume { name },
+        }
+    }
+
+    /// The time limit; a graceful stop alone may take 80 s in the daemon.
+    pub fn limit(self) -> Duration {
+        Duration::from_secs(150)
+    }
+
+    /// The action name in the window (`vm.<name>`).
+    pub fn action(self) -> &'static str {
+        match self {
+            Op::Start => "start",
+            Op::Stop => "stop",
+            Op::ForceOff => "force-off",
+            Op::Reset => "reset",
+            Op::Resume => "resume",
+        }
+    }
+
+    /// The toast when it fails.
+    pub fn failed(self, vm: &str, e: &CallError) -> String {
+        let what = match self {
+            Op::Start => "start",
+            Op::Stop => "stop",
+            Op::ForceOff => "force off",
+            Op::Reset => "reset",
+            Op::Resume => "resume",
+        };
+        format!("Could not {what} {}: {e}", printable(vm, 64))
+    }
+}
+
+/// Which actions a VM offers now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ActionSet {
+    pub start: bool,
+    pub stop: bool,
+    pub force_off: bool,
+    pub reset: bool,
+    pub resume: bool,
+    /// Resume is only shown for a VM the disk watchdog paused.
+    pub show_resume: bool,
+}
+
+impl ActionSet {
+    pub fn allows(&self, op: Op) -> bool {
+        match op {
+            Op::Start => self.start,
+            Op::Stop => self.stop,
+            Op::ForceOff => self.force_off,
+            Op::Reset => self.reset,
+            Op::Resume => self.resume,
+        }
+    }
+}
+
+/// The actions for `vm`; none while one of its actions runs (`pending`).
+pub fn actions(vm: &VmInfo, pending: bool) -> ActionSet {
+    let k = kind(&vm.state);
+    let live = k != Kind::Stopped;
+    let set = ActionSet {
+        start: k == Kind::Stopped,
+        // A stop of a paused or stuck VM skips the power button.
+        stop: live,
+        force_off: live,
+        reset: k == Kind::Running,
+        resume: k == Kind::DiskFull,
+        show_resume: k == Kind::DiskFull,
+    };
+    if pending {
+        ActionSet {
+            show_resume: set.show_resume,
+            ..ActionSet::default()
+        }
+    } else {
+        set
+    }
+}
+
+/// Whether to ask for an open VM's details: while its page is visible and
+/// it runs, and once for a stopped VM (disk use).
+pub fn wants_info(page_visible: bool, kind: Kind, have: bool) -> bool {
+    page_visible && (kind == Kind::Running || !have)
+}
+
+const MIB_PER_GIB: f64 = 1024.0;
+const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
+/// Addresses shown at most; a guest reports what it likes.
+const MAX_ADDRESSES: usize = 16;
+
+/// A VM's overview: groups of (title, value) rows, always the same shape.
+pub type Facts = Vec<(&'static str, Vec<(&'static str, String)>)>;
+
+pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
+    let k = kind(&vm.state);
+    let memory = if vm.memory_mib.is_multiple_of(1024) {
+        format!("{} GiB", vm.memory_mib / 1024)
+    } else {
+        format!("{} MiB", vm.memory_mib)
+    };
+    let used = details.map_or("Unknown".to_owned(), |d| {
+        format!("{:.1} GiB", d.disk_used_bytes as f64 / BYTES_PER_GIB)
+    });
+    let net = match vm.net {
+        NetProfile::Offline => "Offline",
+        NetProfile::Internet => "Internet",
+    };
+    let forwards = if vm.forwards.is_empty() {
+        "None".to_owned()
+    } else {
+        vm.forwards
+            .iter()
+            .map(|f| format!("{} → {}", SocketAddr::new(f.bind, f.host), f.guest))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let addresses = match details.map(|d| &d.addresses) {
+        _ if k == Kind::Stopped => "None".to_owned(),
+        None => "Unknown".to_owned(),
+        Some(None) => "The guest agent does not answer".to_owned(),
+        Some(Some(a)) if a.is_empty() => "None".to_owned(),
+        Some(Some(a)) => a
+            .iter()
+            .take(MAX_ADDRESSES)
+            .map(|(iface, addr)| format!("{}  {}", printable(iface, 32), printable(addr, 64)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    vec![
+        (
+            "Resources",
+            vec![
+                ("State", printable(&vm.state, 64)),
+                ("Processors", vm.vcpus.to_string()),
+                ("Memory", memory),
+                ("Disk Size", format!("{} GiB", vm.disk_gib)),
+                ("Disk Used", used),
+            ],
+        ),
+        (
+            "Network",
+            vec![
+                ("Profile", net.to_owned()),
+                ("Port Forwards", forwards),
+                ("Addresses", addresses),
+            ],
+        ),
+    ]
+}
+
+/// The host budget meter in the sidebar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Meter {
+    /// Memory limits of running VMs as a share of their budget, 0 to 1.
+    pub memory_fraction: f64,
+    pub memory: String,
+    pub disk: String,
+    /// Free disk space is below the floor: the watchdog pauses VMs.
+    pub disk_low: bool,
+}
+
+pub fn meter(h: &HostInfo) -> Meter {
+    let fraction = match h.memory_budget_mib {
+        0 if h.memory_used_mib > 0 => 1.0,
+        0 => 0.0,
+        b => (h.memory_used_mib as f64 / b as f64).min(1.0),
+    };
+    let disk_low = stallo::host::below_floor(h.disk_free_bytes, h.disk_floor_gib);
+    let free = h.disk_free_bytes as f64 / BYTES_PER_GIB;
+    Meter {
+        memory_fraction: fraction,
+        memory: format!(
+            "VM memory: {:.1} of {:.1} GiB",
+            h.memory_used_mib as f64 / MIB_PER_GIB,
+            h.memory_budget_mib as f64 / MIB_PER_GIB
+        ),
+        disk: if disk_low {
+            format!(
+                "Disk: {free:.1} GiB free, below the {} GiB floor",
+                h.disk_floor_gib
+            )
+        } else {
+            format!("Disk: {free:.1} GiB free, floor {} GiB", h.disk_floor_gib)
+        },
+        disk_low,
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +555,12 @@ mod tests {
         let mut p = probe();
         f(&mut p);
         onboarding(&p)
+    }
+
+    fn connected() -> Onboarding {
+        Onboarding::Connected {
+            socket: "/s/api.sock".into(),
+        }
     }
 
     const NOT_LISTED: Group = Group {
@@ -301,7 +646,12 @@ mod tests {
             ..p
         };
         assert_eq!(socket(&explicit), Some("/x/api.sock".into()));
-        assert_eq!(onboarding(&explicit), Onboarding::Connected { vms: 2 });
+        assert_eq!(
+            onboarding(&explicit),
+            Onboarding::Connected {
+                socket: "/x/api.sock".into()
+            }
+        );
         // A dev daemon while production is closed to us: use dev mode.
         let dev = Probe {
             production: Production::Denied,
@@ -311,7 +661,12 @@ mod tests {
             ..probe()
         };
         assert_eq!(socket(&dev), probe().dev);
-        assert_eq!(onboarding(&dev), Onboarding::Connected { vms: 0 });
+        assert_eq!(
+            onboarding(&dev),
+            Onboarding::Connected {
+                socket: probe().dev.unwrap()
+            }
+        );
         // Production only.
         let prod = Probe {
             production: Production::Up,
@@ -330,7 +685,9 @@ mod tests {
     fn connected_and_unreachable() {
         assert_eq!(
             state(|p| p.list = Some(Ok(3))),
-            Onboarding::Connected { vms: 3 }
+            Onboarding::Connected {
+                socket: probe().dev.unwrap()
+            }
         );
         assert!(matches!(
             state(|p| p.list = Some(Err(CallError::Timeout))),
@@ -369,23 +726,23 @@ mod tests {
         assert!(onboarding.polls(true));
         assert!(!onboarding.polls(false), "hidden");
 
-        let (connected, back) = onboarding.next(Onboarding::Connected { vms: 1 });
+        let (up, back) = onboarding.next(connected());
         assert!(!back);
-        assert!(!connected.polls(true), "connected: no polling");
+        assert!(!up.polls(true), "connected: no polling");
 
         // Lost: keep the page, show the banner, poll until it is back.
-        let (lost, back) = connected.next(Onboarding::DaemonStopped);
+        let (lost, back) = up.next(Onboarding::DaemonStopped);
         assert!(!back);
-        assert_eq!(lost.page, Onboarding::Connected { vms: 1 });
+        assert_eq!(lost.page, connected());
         assert!(lost.reconnecting);
         assert!(lost.polls(true));
         assert!(!lost.polls(false));
         let (lost, _) = lost.next(Onboarding::Unreachable("x".into()));
         assert!(lost.reconnecting);
 
-        let (again, back) = lost.next(Onboarding::Connected { vms: 2 });
+        let (again, back) = lost.next(connected());
         assert!(back, "toast on recovery");
-        assert_eq!(again.page, Onboarding::Connected { vms: 2 });
+        assert_eq!(again.page, connected());
         assert!(!again.polls(true));
 
         // Any other state while connected is shown as a page.
@@ -407,11 +764,11 @@ mod tests {
         };
         assert_eq!(onboarding(&p), down);
         // Lost while connected: the banner, as for the system service.
-        let connected = View {
-            page: Onboarding::Connected { vms: 1 },
+        let up = View {
+            page: connected(),
             reconnecting: false,
         };
-        assert!(connected.next(down).0.reconnecting);
+        assert!(up.next(down).0.reconnecting);
     }
 
     /// The GUI picks the same socket as the CLI, and shows a page that
@@ -444,7 +801,7 @@ mod tests {
                         p.list = cli.as_ref().map(|_| Ok(1));
                         let page = onboarding(&p);
                         assert_eq!(
-                            page == Onboarding::Connected { vms: 1 },
+                            matches!(page, Onboarding::Connected { .. }),
                             cli.is_some(),
                             "{p:?} {page:?}"
                         );
@@ -466,5 +823,315 @@ mod tests {
     fn instance_choice() {
         assert!(single_instance(false));
         assert!(!single_instance(true));
+    }
+    fn vm(state: &str) -> VmInfo {
+        VmInfo {
+            name: "dev".into(),
+            state: state.into(),
+            vcpus: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            net: NetProfile::Offline,
+            forwards: vec![],
+            agent_control: false,
+            vnc: false,
+        }
+    }
+
+    #[test]
+    fn kinds() {
+        for (state, k) in [
+            ("stopped", Kind::Stopped),
+            ("running", Kind::Running),
+            ("running (no network)", Kind::Running),
+            ("paused", Kind::Paused),
+            ("paused (no network)", Kind::Paused),
+            ("save-vm", Kind::Paused),
+            ("paused (disk full)", Kind::DiskFull),
+            ("io-error", Kind::Failed),
+            ("guest-panicked", Kind::Failed),
+            ("unknown", Kind::Failed),
+            ("", Kind::Paused),
+        ] {
+            assert_eq!(kind(state), k, "{state}");
+        }
+    }
+
+    #[test]
+    fn rows() {
+        let r = row(&vm("running"));
+        assert_eq!(r.name, "dev");
+        assert_eq!(r.tone, Some("success"));
+        assert_eq!(r.control_icon, "avatar-default-symbolic");
+        assert_eq!(r.control_tip, "Agent control off");
+        let on = VmInfo {
+            agent_control: true,
+            ..vm("stopped")
+        };
+        let r = row(&on);
+        assert_eq!(r.tone, None);
+        assert_eq!(r.control_icon, "security-high-symbolic");
+        assert_eq!(row(&vm("paused (disk full)")).tone, Some("warning"));
+        assert_eq!(row(&vm("io-error")).tone, Some("error"));
+        // Daemon text is cleaned and capped before it reaches a label.
+        let odd = VmInfo {
+            name: "a\u{202E}b\n".into(),
+            ..vm(&"x".repeat(500))
+        };
+        let r = row(&odd);
+        assert_eq!(r.name, "ab");
+        assert_eq!(r.state.len(), 64);
+    }
+
+    #[test]
+    fn action_matrix() {
+        let set = |start, stop, reset, resume| ActionSet {
+            start,
+            stop,
+            force_off: stop,
+            reset,
+            resume,
+            show_resume: resume,
+        };
+        for (state, want) in [
+            ("stopped", set(true, false, false, false)),
+            ("running", set(false, true, true, false)),
+            ("running (no network)", set(false, true, true, false)),
+            ("paused", set(false, true, false, false)),
+            ("paused (disk full)", set(false, true, false, true)),
+            ("io-error", set(false, true, false, false)),
+            ("unknown", set(false, true, false, false)),
+        ] {
+            assert_eq!(actions(&vm(state), false), want, "{state}");
+            // While an action runs: nothing, but Resume stays in place.
+            let busy = actions(&vm(state), true);
+            assert!(Op::ALL.iter().all(|&op| !busy.allows(op)), "{state}");
+            assert_eq!(busy.show_resume, want.show_resume, "{state}");
+            for op in Op::ALL {
+                let field = match op {
+                    Op::Start => want.start,
+                    Op::Stop => want.stop,
+                    Op::ForceOff => want.force_off,
+                    Op::Reset => want.reset,
+                    Op::Resume => want.resume,
+                };
+                assert_eq!(want.allows(op), field);
+            }
+        }
+    }
+
+    #[test]
+    fn ops() {
+        let wire = |op: Op| serde_json::to_string(&op.request("dev")).unwrap();
+        assert_eq!(
+            wire(Op::Start),
+            r#"{"op":"start","name":"dev","wait":false}"#
+        );
+        assert_eq!(
+            wire(Op::Stop),
+            r#"{"op":"stop","name":"dev","force":false}"#
+        );
+        assert_eq!(
+            wire(Op::ForceOff),
+            r#"{"op":"stop","name":"dev","force":true}"#
+        );
+        assert_eq!(wire(Op::Reset), r#"{"op":"reset","name":"dev"}"#);
+        assert_eq!(wire(Op::Resume), r#"{"op":"resume","name":"dev"}"#);
+        for op in Op::ALL {
+            assert_eq!(op.limit(), Duration::from_secs(150));
+        }
+        assert_eq!(
+            Op::ForceOff.failed("dev", &CallError::Failed("no\u{1b}[31m way".into())),
+            "Could not force off dev: no[31m way"
+        );
+        assert_eq!(
+            Op::Start.failed("dev", &CallError::Timeout),
+            "Could not start dev: no answer in time"
+        );
+    }
+
+    #[test]
+    fn polls() {
+        let t0 = Instant::now();
+        let mut p = Poll::new(LIST_EVERY);
+        assert!(p.due(t0), "first tick asks at once");
+        assert!(!p.due(t0 + BACKOFF), "never two at once");
+        p.done(t0, true);
+        assert!(!p.due(t0 + LIST_EVERY - Duration::from_millis(1)));
+        assert!(p.due(t0 + LIST_EVERY));
+        p.done(t0, false);
+        assert!(!p.due(t0 + LIST_EVERY), "backs off after an error");
+        assert!(p.due(t0 + BACKOFF));
+        p.done(t0, true);
+        p.soon();
+        assert!(p.due(t0), "soon: at the next tick");
+        let mut host = Poll::new(HOST_EVERY);
+        assert!(host.due(t0));
+        host.done(t0, true);
+        assert!(!host.due(t0 + LIST_EVERY));
+        assert!(host.due(t0 + HOST_EVERY));
+
+        // List and host polling: only while visible and connected.
+        let view = View {
+            page: connected(),
+            reconnecting: false,
+        };
+        assert!(view.polls_vms(true));
+        assert!(!view.polls_vms(false));
+        let lost = View {
+            reconnecting: true,
+            ..view.clone()
+        };
+        assert!(!lost.polls_vms(true), "the probe takes over");
+        let page = View {
+            page: Onboarding::DaemonStopped,
+            reconnecting: false,
+        };
+        assert!(!page.polls_vms(true));
+
+        // Details: while visible and running, once when stopped.
+        assert!(wants_info(true, Kind::Running, true));
+        assert!(!wants_info(false, Kind::Running, false));
+        assert!(wants_info(true, Kind::Stopped, false));
+        assert!(!wants_info(true, Kind::Stopped, true));
+        assert!(!wants_info(true, Kind::Paused, true));
+    }
+
+    #[test]
+    fn overview() {
+        let values = |f: Facts| -> Vec<String> {
+            f.into_iter()
+                .flat_map(|(_, rows)| rows.into_iter().map(|(_, v)| v))
+                .collect()
+        };
+        let titles = |f: &Facts| -> Vec<&str> {
+            f.iter()
+                .flat_map(|(_, rows)| rows.iter().map(|(t, _)| *t))
+                .collect()
+        };
+        let stopped = facts(&vm("stopped"), None);
+        let shape = titles(&stopped);
+        assert_eq!(
+            values(stopped),
+            [
+                "stopped", "2", "2 GiB", "20 GiB", "Unknown", "Offline", "None", "None"
+            ]
+        );
+
+        let web = VmInfo {
+            memory_mib: 1536,
+            net: NetProfile::Internet,
+            forwards: vec![
+                stallo::config::PortForward {
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host: 8080,
+                    guest: 80,
+                },
+                stallo::config::PortForward {
+                    bind: "::1".parse().unwrap(),
+                    host: 2222,
+                    guest: 22,
+                },
+            ],
+            ..vm("running")
+        };
+        let details = |addresses| VmDetails {
+            vm: web.clone(),
+            addresses,
+            disk_used_bytes: 3 << 29,
+            vnc_socket: None,
+        };
+        let f = facts(
+            &web,
+            Some(&details(Some(vec![
+                ("eth0".into(), "10.0.2.15/24".into()),
+                ("e\u{202E}vil\n".into(), "fe80::1/64\u{1b}".into()),
+            ]))),
+        );
+        assert_eq!(titles(&f), shape, "same rows every time");
+        assert_eq!(
+            values(f),
+            [
+                "running",
+                "2",
+                "1536 MiB",
+                "20 GiB",
+                "1.5 GiB",
+                "Internet",
+                "127.0.0.1:8080 → 80\n[::1]:2222 → 22",
+                "eth0  10.0.2.15/24\nevil  fe80::1/64",
+            ]
+        );
+        let addresses =
+            |d: Option<VmDetails>, state| values(facts(&vm(state), d.as_ref()))[7].clone();
+        assert_eq!(addresses(None, "running"), "Unknown");
+        assert_eq!(
+            addresses(Some(details(None)), "running"),
+            "The guest agent does not answer"
+        );
+        assert_eq!(addresses(Some(details(Some(vec![]))), "running"), "None");
+        // Old addresses of a VM that stopped since are not shown.
+        let old = Some(vec![("eth0".into(), "10.0.2.15/24".into())]);
+        assert_eq!(addresses(Some(details(old)), "stopped"), "None");
+        // A guest cannot flood the page.
+        let many = (0..100)
+            .map(|i| ("eth0".into(), format!("10.0.0.{i}/8")))
+            .collect();
+        assert_eq!(
+            addresses(Some(details(Some(many))), "running")
+                .lines()
+                .count(),
+            MAX_ADDRESSES
+        );
+    }
+
+    #[test]
+    fn host_meter() {
+        let host = HostInfo {
+            cores: 8,
+            vcpus_allotted: 2,
+            memory_total_mib: 32768,
+            memory_available_mib: 20000,
+            memory_budget_mib: 24576,
+            memory_used_mib: 6144,
+            disk_free_bytes: 100 << 30,
+            disk_floor_gib: 20,
+            running_vms: 1,
+        };
+        let m = meter(&host);
+        assert_eq!(m.memory_fraction, 0.25);
+        assert_eq!(m.memory, "VM memory: 6.0 of 24.0 GiB");
+        assert_eq!(m.disk, "Disk: 100.0 GiB free, floor 20 GiB");
+        assert!(!m.disk_low);
+        let low = meter(&HostInfo {
+            disk_free_bytes: 10 << 30,
+            memory_used_mib: 30000,
+            ..host.clone()
+        });
+        assert!(low.disk_low);
+        assert_eq!(low.disk, "Disk: 10.0 GiB free, below the 20 GiB floor");
+        assert_eq!(low.memory_fraction, 1.0, "capped");
+        let no_budget = |used| {
+            meter(&HostInfo {
+                memory_budget_mib: 0,
+                memory_used_mib: used,
+                ..host.clone()
+            })
+            .memory_fraction
+        };
+        assert_eq!(no_budget(0), 0.0);
+        assert_eq!(no_budget(1), 1.0);
+    }
+
+    #[test]
+    fn call_errors_read_plainly() {
+        assert_eq!(CallError::NotRunning.to_string(), "Stallo is not running");
+        assert_eq!(CallError::Denied.to_string(), "permission denied");
+        assert_eq!(
+            CallError::Failed("a\u{202E}b".repeat(200))
+                .to_string()
+                .len(),
+            300
+        );
     }
 }

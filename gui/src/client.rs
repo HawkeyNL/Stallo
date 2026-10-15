@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use stallo::api::{Envelope, Request, Via};
+use stallo::api::{Envelope, Request, Via, VmDetails, VmInfo};
+use stallo::host::HostInfo;
 use stallo::paths::Paths;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::model::{self, CallError, Probe, Production};
+use crate::model::{self, CallError, Op, Probe, Production};
 
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,12 +91,35 @@ async fn call_in(
     }
 }
 
-/// The number of VMs (`list`).
-pub async fn list(socket: &Path, limit: Duration) -> Result<usize, CallError> {
-    let data = call(socket, Request::List, limit).await?;
-    data.as_array()
-        .map(Vec::len)
-        .ok_or_else(|| CallError::Failed("unexpected answer to list".into()))
+/// Sends a read request and parses the answer.
+async fn get<T: serde::de::DeserializeOwned>(
+    socket: &Path,
+    request: Request,
+    limit: Duration,
+) -> Result<T, CallError> {
+    let data = call(socket, request, limit).await?;
+    serde_json::from_value(data)
+        .map_err(|e| CallError::Failed(format!("unexpected answer from stallod: {e}")))
+}
+
+/// The VMs (`list`).
+pub async fn list(socket: &Path, limit: Duration) -> Result<Vec<VmInfo>, CallError> {
+    get(socket, Request::List, limit).await
+}
+
+/// Host resources and the VM budget (`host`).
+pub async fn host(socket: &Path) -> Result<HostInfo, CallError> {
+    get(socket, Request::Host, READ_TIMEOUT).await
+}
+
+/// One VM with its addresses and disk use (`info`).
+pub async fn info(socket: &Path, name: String) -> Result<VmDetails, CallError> {
+    get(socket, Request::Info { name }, READ_TIMEOUT).await
+}
+
+/// Starts, stops, resets or resumes a VM.
+pub async fn act(socket: &Path, op: Op, name: &str) -> Result<(), CallError> {
+    call(socket, op.request(name), op.limit()).await.map(drop)
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -104,7 +128,7 @@ pub async fn probe() -> Probe {
         .await
         .expect("the host probe panicked");
     if let Some(socket) = model::socket(&p) {
-        p.list = Some(list(&socket, READ_TIMEOUT).await);
+        p.list = Some(list(&socket, READ_TIMEOUT).await.map(|vms| vms.len()));
     }
     p
 }
@@ -154,24 +178,34 @@ mod tests {
 
     fn list_at(socket: &Path, limit: Duration) -> Result<usize, CallError> {
         let socket = socket.to_owned();
-        run(async move { list(&socket, limit).await })
+        run(async move { list(&socket, limit).await.map(|v| v.len()) })
     }
 
-    /// A one-connection fake daemon that reads the request line and then
-    /// does `reply`.
-    fn daemon(reply: impl FnOnce(UnixStream) + Send + 'static) -> (tempfile::TempDir, PathBuf) {
+    /// A one-connection fake daemon that checks the request line and then
+    /// does `reply`. The test fails if the request is not `expect`.
+    fn serve(
+        expect: &'static str,
+        reply: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("api.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        std::thread::spawn(move || {
+        let fake = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut line = String::new();
             BufReader::new(&stream).read_line(&mut line).unwrap();
-            assert_eq!(line, "{\"via\":\"cli\",\"request\":{\"op\":\"list\"}}\n");
+            assert_eq!(line, format!("{{\"via\":\"cli\",\"request\":{expect}}}\n"));
             reply(stream);
         });
+        (dir, socket, fake)
+    }
+
+    fn daemon(reply: impl FnOnce(UnixStream) + Send + 'static) -> (tempfile::TempDir, PathBuf) {
+        let (dir, socket, _) = serve(r#"{"op":"list"}"#, reply);
         (dir, socket)
     }
+
+    const VM: &str = r#"{"name":"dev","state":"running","vcpus":2,"memory_mib":2048,"disk_gib":20,"net":"internet","forwards":[{"bind":"127.0.0.1","host":8080,"guest":80}],"agent_control":true}"#;
 
     fn answer(text: &'static str) -> impl FnOnce(UnixStream) + Send {
         move |mut s| s.write_all(text.as_bytes()).unwrap()
@@ -179,10 +213,75 @@ mod tests {
 
     #[test]
     fn lists() {
-        let (_d, s) = daemon(answer(
-            "{\"ok\":true,\"data\":[{\"name\":\"a\"},{\"name\":\"b\"}]}\n",
-        ));
-        assert_eq!(list_at(&s, READ_TIMEOUT), Ok(2));
+        let reply = format!("{{\"ok\":true,\"data\":[{VM},{VM}]}}\n");
+        let (_d, s) = daemon(move |mut s| s.write_all(reply.as_bytes()).unwrap());
+        let vms = run(async move { list(&s, READ_TIMEOUT).await }).unwrap();
+        assert_eq!(vms.len(), 2);
+        assert_eq!(vms[0].name, "dev");
+        assert!(vms[0].agent_control && !vms[0].vnc);
+        assert_eq!(vms[0].forwards[0].guest, 80);
+        // Not a VM list: an error, not a guess.
+        let (_d, s) = daemon(answer("{\"ok\":true,\"data\":[{\"name\":\"a\"}]}\n"));
+        match list_at(&s, READ_TIMEOUT) {
+            Err(CallError::Failed(e)) => assert!(e.contains("unexpected answer"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_and_info() {
+        let (_d, s, fake) = serve(
+            r#"{"op":"host"}"#,
+            answer(concat!(
+                r#"{"ok":true,"data":{"cores":8,"vcpus_allotted":2,"memory_total_mib":32000,"#,
+                r#""memory_available_mib":20000,"memory_budget_mib":24000,"memory_used_mib":3000,"#,
+                r#""disk_free_bytes":1000,"disk_floor_gib":20,"running_vms":1}}"#,
+                "\n"
+            )),
+        );
+        let host = run(async move { host(&s).await }).unwrap();
+        fake.join().unwrap();
+        assert_eq!((host.memory_used_mib, host.disk_floor_gib), (3000, 20));
+
+        let reply = format!(
+            "{{\"ok\":true,\"data\":{},\"addresses\":[[\"eth0\",\"10.0.2.15/24\"]],\"disk_used_bytes\":42}}}}\n",
+            &VM[..VM.len() - 1]
+        );
+        let (_d, s, fake) = serve(r#"{"op":"info","name":"dev"}"#, move |mut s| {
+            s.write_all(reply.as_bytes()).unwrap()
+        });
+        let d = run(async move { info(&s, "dev".into()).await }).unwrap();
+        fake.join().unwrap();
+        assert_eq!(d.vm.name, "dev");
+        assert_eq!(d.disk_used_bytes, 42);
+        assert_eq!(
+            d.addresses,
+            Some(vec![("eth0".to_owned(), "10.0.2.15/24".to_owned())])
+        );
+    }
+
+    #[test]
+    fn actions() {
+        for (op, line) in [
+            (Op::Start, r#"{"op":"start","name":"dev","wait":false}"#),
+            (Op::Stop, r#"{"op":"stop","name":"dev","force":false}"#),
+            (Op::ForceOff, r#"{"op":"stop","name":"dev","force":true}"#),
+            (Op::Reset, r#"{"op":"reset","name":"dev"}"#),
+            (Op::Resume, r#"{"op":"resume","name":"dev"}"#),
+        ] {
+            let (_d, s, fake) = serve(line, answer("{\"ok\":true}\n"));
+            let done = run(async move { act(&s, op, "dev").await });
+            fake.join().unwrap();
+            assert_eq!(done, Ok(()), "{op:?}");
+        }
+        let (_d, s, _) = serve(
+            r#"{"op":"resume","name":"dev"}"#,
+            answer("{\"ok\":false,\"error\":\"dev is not paused\"}\n"),
+        );
+        assert_eq!(
+            run(async move { act(&s, Op::Resume, "dev").await }),
+            Err(CallError::Failed("dev is not paused".into()))
+        );
     }
 
     #[test]
