@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -28,21 +28,174 @@ use crate::config::validate_image_id;
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::run_tool;
 
-/// One catalog entry (`catalog/<id>.toml`, compiled in).
+/// One catalog entry (`catalog/<id>.toml`, compiled in). The format is
+/// flat: which fields apply depends on `trust` and `agent`, and
+/// [`CatalogEntry::validate`] checks the combinations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
     pub id: String,
     pub name: String,
-    /// Ubuntu release of the guest, e.g. `26.04`.
-    pub release: String,
-    pub base_url: String,
-    pub file: String,
-    pub keyring: String,
-    /// Fingerprint of the primary key that must sign `SHA256SUMS`.
-    pub signing_key: String,
-    /// Packages the guest needs for the guest agent but lacks.
+    pub os: Os,
+    pub firmware: Firmware,
+    /// The qcow2 image (HTTPS).
+    pub url: String,
+    /// Largest image download accepted, in bytes.
+    pub max_size: u64,
+    pub trust: Trust,
+    /// The checksum list (`signed-sums`).
+    pub sums_url: Option<String>,
+    /// The detached signature over the checksum list or the image.
+    pub sig_url: Option<String>,
+    pub sums_format: Option<SumsFormat>,
+    /// The OpenPGP keyring that holds `signing_key`.
+    pub keyring: Option<String>,
+    /// Fingerprint of the primary key that must sign.
+    pub signing_key: Option<String>,
+    /// SHA-512 of the image (`pinned`).
+    pub sha512: Option<String>,
+    pub agent: Agent,
+    /// Packages the guest needs for the guest agent but lacks (`deb`).
+    #[serde(default)]
     pub debs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Os {
+    Linux,
+    Windows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Firmware {
+    /// OVMF with Secure Boot and Microsoft's keys enrolled.
+    SecureBoot,
+    /// OVMF without Secure Boot, for images with an unsigned boot chain.
+    Uefi,
+}
+
+/// How an image is verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Trust {
+    /// A checksum list with a detached OpenPGP signature.
+    SignedSums,
+    /// A detached OpenPGP signature over the image itself.
+    SignedImage,
+    /// A SHA-512 in the catalog, for upstreams that sign nothing.
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SumsFormat {
+    /// `<hex> *<name>` lines (`sha256sum`).
+    Gnu,
+    /// `SHA256 (<name>) = <hex>` lines.
+    Bsd,
+}
+
+/// How the guest gets its guest agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Agent {
+    /// The image ships it.
+    Preinstalled,
+    /// `.deb` packages on the seed ISO.
+    Deb,
+}
+
+impl CatalogEntry {
+    /// Checks the field combinations, then refuses what this version cannot
+    /// handle yet.
+    pub fn validate(&self) -> Result<()> {
+        validate_image_id(&self.id)?;
+        let id = &self.id;
+        let https = |u: &str| u.starts_with("https://") && !u.contains(char::is_whitespace);
+        ensure!(
+            https(&self.url) && !self.url.ends_with('/'),
+            "{id}: url must be an https:// file URL"
+        );
+        for u in [&self.sums_url, &self.sig_url].into_iter().flatten() {
+            ensure!(https(u), "{id}: {u:?} is not an https:// URL");
+        }
+        if let Some(k) = &self.signing_key {
+            ensure!(
+                k.len() == 40 && k.bytes().all(|c| matches!(c, b'0'..=b'9' | b'A'..=b'F')),
+                "{id}: signing_key must be a fingerprint of 40 upper-case hex digits"
+            );
+        }
+        let keys = self.keyring.is_some() && self.signing_key.is_some();
+        match self.trust {
+            Trust::SignedSums => ensure!(
+                keys && self.sums_url.is_some()
+                    && self.sig_url.is_some()
+                    && self.sums_format.is_some()
+                    && self.sha512.is_none(),
+                "{id}: signed-sums needs sums_url, sig_url, sums_format, keyring and signing_key, and no sha512"
+            ),
+            Trust::SignedImage => ensure!(
+                keys && self.sig_url.is_some()
+                    && self.sums_url.is_none()
+                    && self.sums_format.is_none()
+                    && self.sha512.is_none(),
+                "{id}: signed-image needs sig_url, keyring and signing_key, and no sums or sha512"
+            ),
+            Trust::Pinned => ensure!(
+                self.sha512.as_deref().is_some_and(|h| {
+                    h.len() == 128 && h.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+                }) && self.keyring.is_none()
+                    && self.signing_key.is_none()
+                    && self.sums_url.is_none()
+                    && self.sig_url.is_none()
+                    && self.sums_format.is_none(),
+                "{id}: pinned needs a sha512 of 128 lower-case hex digits and no keys, sums or signature"
+            ),
+        }
+        match self.agent {
+            Agent::Deb => ensure!(!self.debs.is_empty(), "{id}: agent \"deb\" needs debs"),
+            Agent::Preinstalled => {
+                ensure!(
+                    self.debs.is_empty(),
+                    "{id}: a preinstalled agent takes no debs"
+                )
+            }
+        }
+        // Package names become apt arguments: no options.
+        for d in &self.debs {
+            ensure!(
+                d.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && d.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || b"+-.".contains(&c)
+                    }),
+                "{id}: invalid package name {d:?}"
+            );
+        }
+        ensure!(
+            (
+                self.os,
+                self.firmware,
+                self.trust,
+                self.sums_format,
+                self.agent
+            ) == (
+                Os::Linux,
+                Firmware::SecureBoot,
+                Trust::SignedSums,
+                Some(SumsFormat::Gnu),
+                Agent::Deb
+            ),
+            "{id}: not supported yet: only Linux images with Secure Boot, signed GNU checksums and the guest agent as .debs"
+        );
+        Ok(())
+    }
+
+    /// The image's file name, as listed in the checksums.
+    fn file(&self) -> &str {
+        self.url.rsplit('/').next().unwrap_or_default()
+    }
 }
 
 const CATALOG: &[&str] = &[include_str!("../catalog/ubuntu-26.04.toml")];
@@ -51,7 +204,11 @@ const CATALOG: &[&str] = &[include_str!("../catalog/ubuntu-26.04.toml")];
 pub fn catalog() -> Vec<CatalogEntry> {
     CATALOG
         .iter()
-        .map(|text| toml::from_str(text).expect("built-in catalog is valid"))
+        .map(|text| {
+            let entry: CatalogEntry = toml::from_str(text).expect("built-in catalog parses");
+            entry.validate().expect("built-in catalog is valid");
+            entry
+        })
         .collect()
 }
 
@@ -69,14 +226,19 @@ pub fn image_path(paths: &Paths, id: &str) -> PathBuf {
     paths.images_dir().join(format!("{id}.qcow2"))
 }
 
-/// `<data>/images/debs/<release>/`.
-pub fn debs_dir(paths: &Paths, release: &str) -> PathBuf {
-    paths.images_dir().join("debs").join(release)
+/// `<data>/images/debs/<release>/`, e.g. `26.04` for `ubuntu-26.04`.
+pub fn debs_dir(paths: &Paths, id: &str) -> PathBuf {
+    paths.images_dir().join("debs").join(release(id))
+}
+
+/// The Ubuntu release in an `ubuntu-<release>` id.
+fn release(id: &str) -> &str {
+    id.trim_start_matches("ubuntu-")
 }
 
 /// Whether the image and its guest-agent packages are cached.
 pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
-    image_path(paths, &entry.id).is_file() && debs_dir(paths, &entry.release).is_dir()
+    image_path(paths, &entry.id).is_file() && debs_dir(paths, &entry.id).is_dir()
 }
 
 /// Downloads and verifies whatever of `entry` is not cached yet.
@@ -85,7 +247,7 @@ pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     if !image_path(paths, &entry.id).is_file() {
         pull_image(paths, entry).await?;
     }
-    if !debs_dir(paths, &entry.release).is_dir() {
+    if !debs_dir(paths, &entry.id).is_dir() {
         pull_debs(paths, entry).await?;
     }
     Ok(())
@@ -96,32 +258,36 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     let work = root.join(format!(".partial-{}", entry.id));
     ensure_private_dir(&work)?;
 
+    // `validate` guarantees these for the only trust it accepts so far.
+    let field = |f: &Option<String>| f.clone().context("incomplete catalog entry");
     let sums = work.join("SHA256SUMS");
     let sig = work.join("SHA256SUMS.gpg");
-    for f in [&sums, &sig] {
+    for (url, f) in [
+        (field(&entry.sums_url)?, &sums),
+        (field(&entry.sig_url)?, &sig),
+    ] {
         safe_remove(&root, f)?;
-        let name = f.file_name().unwrap().to_str().unwrap();
-        download(&format!("{}{name}", entry.base_url), f, "1M", false).await?;
+        download(&url, f, 1 << 20, false).await?;
     }
-    verify_signature(&entry.keyring, &entry.signing_key, &sig, &sums)
+    let (keyring, key) = (field(&entry.keyring)?, field(&entry.signing_key)?);
+    verify_signature(&keyring, &key, &sig, &sums)
         .await
         .context("signature check of SHA256SUMS failed")?;
-    let expected = expected_sha256(&fs::read_to_string(&sums)?, &entry.file)?;
+    let expected = expected_sha256(&fs::read_to_string(&sums)?, entry.file())?;
 
     // Resume a partial download; skip it if a complete file is already
     // there. The name carries the expected hash, so a partial download of
     // an older upstream image is never resumed into a newer one.
     let image = work.join(format!("{expected}.part"));
     if !image.exists() || sha256_file(&image).await? != expected {
-        tracing::info!("downloading {}{}", entry.base_url, entry.file);
-        let url = format!("{}{}", entry.base_url, entry.file);
-        download(&url, &image, "4G", true).await?;
+        tracing::info!("downloading {}", entry.url);
+        download(&entry.url, &image, entry.max_size, true).await?;
         let actual = sha256_file(&image).await?;
         if actual != expected {
             safe_remove(&root, &image)?;
             bail!(
                 "SHA-256 mismatch for {}: got {actual}, want {expected}",
-                entry.file
+                entry.file()
             );
         }
     }
@@ -141,16 +307,16 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
 /// indexes; no root is needed. This only fits because guest and host run
 /// the same Ubuntu release.
 async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
+    let release = release(&entry.id);
     let host = host_release(&fs::read_to_string("/etc/os-release")?);
     ensure!(
-        host.as_deref() == Some(entry.release.as_str()),
-        "guest-agent packages for Ubuntu {} can only be fetched on an Ubuntu {} host",
-        entry.release,
-        entry.release
+        host.as_deref() == Some(release),
+        "guest-agent packages for {} can only be fetched on an Ubuntu {release} host",
+        entry.id,
     );
     let root = paths.images_dir();
-    let final_dir = debs_dir(paths, &entry.release);
-    let work = root.join(format!(".partial-debs-{}", entry.release));
+    let final_dir = debs_dir(paths, &entry.id);
+    let work = root.join(format!(".partial-debs-{release}"));
     safe_remove(&root, &work)?;
     ensure_private_dir(&work)?;
     // The guest image is amd64, whatever the host architecture.
@@ -181,13 +347,18 @@ async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
 
 /// Fetches `url` over HTTPS only (redirects included), with a size cap and
 /// stall detection.
-async fn download(url: &str, dest: &Path, max_size: &str, resume: bool) -> Result<()> {
+async fn download(url: &str, dest: &Path, max_size: u64, resume: bool) -> Result<()> {
     let mut cmd = Command::new("curl");
     // `-q` must come first: it stops curl from reading ~/.curlrc.
     cmd.args(["-q", "--proto", "=https", "--tlsv1.2", "--fail"])
         .args(["--silent", "--show-error", "--location", "--retry", "3"])
         .args(["--connect-timeout", "30", "--speed-limit", "10240"])
-        .args(["--speed-time", "60", "--max-filesize", max_size]);
+        .args([
+            "--speed-time",
+            "60",
+            "--max-filesize",
+            &max_size.to_string(),
+        ]);
     if resume {
         cmd.args(["--continue-at", "-"]);
     }
@@ -341,11 +512,83 @@ mod tests {
     #[test]
     fn catalog_parses() {
         let e = find("ubuntu-26.04").unwrap();
-        assert_eq!(e.release, "26.04");
-        assert!(e.base_url.starts_with("https://") && e.base_url.ends_with('/'));
+        assert_eq!(e.file(), "resolute-server-cloudimg-amd64.img");
+        assert_eq!(e.trust, Trust::SignedSums);
         assert!(e.debs.contains(&"qemu-guest-agent".to_owned()));
         assert!(find("debian-13").is_err());
         assert!(find("../x").is_err());
+    }
+
+    /// The built-in entry with `edit` applied to its TOML lines.
+    fn entry_with(edit: &[(&str, Option<&str>)]) -> Result<CatalogEntry> {
+        let mut lines: Vec<String> = CATALOG[0]
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        for &(key, value) in edit {
+            lines.retain(|l| !l.starts_with(&format!("{key} =")));
+            if let Some(v) = value {
+                lines.push(format!("{key} = {v}"));
+            }
+        }
+        let entry: CatalogEntry = toml::from_str(&lines.join("\n"))?;
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    #[test]
+    fn catalog_invariants() {
+        entry_with(&[]).unwrap();
+        let err = |edit: &[(&str, Option<&str>)]| format!("{:#}", entry_with(edit).unwrap_err());
+        let sha = format!("{:?}", "a".repeat(128));
+        let pinned = [
+            ("trust", Some(r#""pinned""#)),
+            ("sha512", Some(sha.as_str())),
+            ("sums_url", None),
+            ("sig_url", None),
+            ("sums_format", None),
+            ("keyring", None),
+            ("signing_key", None),
+        ];
+        // Valid but not handled yet.
+        assert!(err(&pinned).contains("not supported yet"));
+        // pinned: sha512 required, keys refused.
+        assert!(err(&pinned[..1]).contains("pinned needs"));
+        let mut keyed = pinned.to_vec();
+        keyed[6] = (
+            "signing_key",
+            Some(r#""D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81""#),
+        );
+        assert!(err(&keyed).contains("pinned needs"));
+        let mut short = pinned.to_vec();
+        short[1] = ("sha512", Some(r#""abc""#));
+        assert!(err(&short).contains("pinned needs"));
+        // signed-sums: every part present.
+        assert!(err(&[("sig_url", None)]).contains("signed-sums needs"));
+        assert!(err(&[("sha512", Some(r#""a""#))]).contains("signed-sums needs"));
+        // deb: packages required, and no options among them.
+        assert!(err(&[("debs", Some("[]"))]).contains("needs debs"));
+        assert!(err(&[("debs", Some(r#"["-o"]"#))]).contains("package name"));
+        assert!(err(&[("agent", Some(r#""preinstalled""#))]).contains("no debs"));
+        // HTTPS only.
+        assert!(err(&[("url", Some(r#""http://example.com/a.img""#))]).contains("https"));
+        assert!(err(&[("sums_url", Some(r#""ftp://example.com/S""#))]).contains("https"));
+        // Full fingerprints only.
+        for bad in ["7DB87C81", "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81"] {
+            let v = format!("{bad:?}");
+            assert!(err(&[("signing_key", Some(&v))]).contains("40 upper-case"));
+        }
+        // Unknown fields and values are refused.
+        assert!(entry_with(&[("release", Some(r#""26.04""#))]).is_err());
+        assert!(entry_with(&[("os", Some(r#""macos""#))]).is_err());
+        for (k, v) in [
+            ("os", r#""windows""#),
+            ("firmware", r#""uefi""#),
+            ("sums_format", r#""bsd""#),
+        ] {
+            assert!(err(&[(k, Some(v))]).contains("not supported yet"), "{k}");
+        }
     }
 
     #[test]

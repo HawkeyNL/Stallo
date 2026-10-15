@@ -1,9 +1,15 @@
 # Ubuntu 26.04 LTS (Resolute Raccoon) server cloud image, amd64, qcow2, UEFI/GPT.
 id = "ubuntu-26.04"
 name = "Ubuntu 26.04 LTS server (cloud image)"
-release = "26.04"
-base_url = "https://cloud-images.ubuntu.com/resolute/current/"
-file = "resolute-server-cloudimg-amd64.img"
+os = "linux"
+firmware = "secure-boot"
+url = "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+max_size = 4_294_967_296
+
+trust = "signed-sums"
+sums_url = "https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS"
+sig_url = "https://cloud-images.ubuntu.com/resolute/current/SHA256SUMS.gpg"
+sums_format = "gnu"
 keyring = "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg"
 # "UEC Image Automatic Signing Key <cdimage@ubuntu.com>", which signs
 # SHA256SUMS of the current Ubuntu cloud images (checked 2026-10-12).
@@ -24,4 +30,5 @@ signing_key = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
 # The packages are cached under <data>/images/debs/26.04/ and not refreshed
 # automatically. To pick up guest-agent updates, delete that directory and
 # run `stallo images pull ubuntu-26.04`; existing VMs keep what they have.
+agent = "deb"
 debs = ["qemu-guest-agent", "liburing2", "ubuntu-virt", "ubuntu-helper-virt-hwe"]

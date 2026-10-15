@@ -384,7 +384,7 @@ impl Manager {
         let rendered = seed::render(cfg, &seed::hash_password(&password).await?)?;
         seed::build_iso(
             &rendered,
-            &images::debs_dir(&self.paths, &entry.release),
+            &images::debs_dir(&self.paths, &entry.id),
             &self.paths.data,
             &dir.join("seed"),
             &dir.join(qemu::SEED),

@@ -228,8 +228,8 @@ stallo mcp --http 100.101.102.103:8765 --token-file ~/.config/stallo/mcp-token
 Tools: `vm_list`, `vm_info`, `vm_create` (only with `agents_can_create =
 true` in `stallod.toml`), `vm_start`, `vm_stop`, `vm_reset`, `screenshot`,
 `wait_for_screen`, `mouse_move`, `click`, `drag`, `scroll`, `type_text`,
-`key`, `exec`, `file_read`, `file_write`. There is no delete tool. Every
-call is logged in `<data>/audit/`; see SECURITY.md.
+`key`, `exec`, `file_read`, `file_write`, `image_list`. There is no
+delete tool. Every call is logged in `<data>/audit/`; see SECURITY.md.
 
 ## Licence
 

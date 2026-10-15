@@ -304,7 +304,14 @@ pub const FILE_WRITE_CHUNK: usize = 512 << 10;
 pub struct ImageInfo {
     pub id: String,
     pub name: String,
+    /// The image and its guest-agent packages are downloaded and verified.
     pub cached: bool,
+    pub os: crate::images::Os,
+    pub trust: crate::images::Trust,
+    /// Bytes of the cached image file.
+    pub size_bytes: Option<u64>,
+    /// Things to know before using the image.
+    pub notes: Vec<String>,
 }
 
 /// What an agent (`via: mcp`) may do with a request.
@@ -481,6 +488,14 @@ mod tests {
     fn agent_gates() {
         let name = || "dev".to_owned();
         assert_eq!(agent_gate(&Request::List), Gate::Open);
+        // image_list reads only the catalog and cache; pulling stays human.
+        assert_eq!(agent_gate(&Request::Images), Gate::Open);
+        assert_eq!(
+            agent_gate(&Request::Pull {
+                image: "ubuntu-26.04".into()
+            }),
+            Gate::Closed
+        );
         assert_eq!(
             agent_gate(&Request::SetAgent {
                 name: name(),
