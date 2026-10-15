@@ -2,8 +2,7 @@
 //! overview with its lifecycle actions. All text from the daemon goes
 //! through the view-model (`stallo::printable`) into plain labels.
 
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
@@ -15,7 +14,7 @@ use stallo::api::{VmDetails, VmInfo};
 
 use crate::Ui;
 use crate::client;
-use crate::model::{self, Op, Poll};
+use crate::model::{self, Op, Pending, Poll};
 
 /// The pill around a VM's state in the sidebar.
 pub const CSS: &str = ".state-pill { border-radius: 999px; padding: 1px 8px; background-color: alpha(currentColor, 0.12); }";
@@ -32,8 +31,10 @@ pub struct Vms {
     /// Shown in the content pane while no VM is selected.
     none: adw::NavigationPage,
     detail: RefCell<Option<Rc<Detail>>>,
-    /// VMs with an action in flight: one at a time per VM.
-    pending: RefCell<HashSet<String>>,
+    /// VMs with an action in flight or just done: one at a time per VM.
+    pending: RefCell<Pending>,
+    /// The daemon answers (no reconnect banner).
+    online: Cell<bool>,
     memory_bar: gtk::LevelBar,
     memory: gtk::Label,
     disk: gtk::Label,
@@ -59,6 +60,8 @@ struct Detail {
     /// In [`Op::ALL`] order.
     actions: Vec<gio::SimpleAction>,
     resume: gtk::Button,
+    stop: adw::SplitButton,
+    force_off: gtk::Button,
     values: Vec<adw::ActionRow>,
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
@@ -169,6 +172,7 @@ impl Vms {
             none,
             detail: RefCell::default(),
             pending: RefCell::default(),
+            online: Cell::new(true),
             memory_bar,
             memory,
             disk,
@@ -180,25 +184,39 @@ impl Vms {
         // Selecting (keyboard, focus, screen readers) shows a VM beside the
         // list; activating (click, Enter) also brings it forward when the
         // view is collapsed, even if it was selected already.
-        let v = vms.clone();
+        // Weak: widgets of this page must not keep it alive once the
+        // window shows another page.
+        let v = Rc::downgrade(&vms);
         vms.list.connect_row_selected(move |_, row| {
-            if let Some(row) = row {
+            if let (Some(v), Some(row)) = (v.upgrade(), row) {
                 v.open(row.index(), false);
             }
         });
-        let v = vms.clone();
-        vms.list
-            .connect_row_activated(move |_, row| v.open(row.index(), true));
+        let v = Rc::downgrade(&vms);
+        vms.list.connect_row_activated(move |_, row| {
+            if let Some(v) = v.upgrade() {
+                v.open(row.index(), true);
+            }
+        });
         vms
+    }
+
+    /// While the daemon is out of reach no action can be sent.
+    pub fn set_online(&self, on: bool) {
+        if self.online.replace(on) != on {
+            self.refresh_open();
+        }
     }
 
     /// Polls while `on`: when the window is visible and connected.
     pub fn set_active(self: &Rc<Self>, on: bool) {
         let mut timer = self.timer.borrow_mut();
         if on && timer.is_none() {
-            let v = self.clone();
+            let v = Rc::downgrade(self);
             *timer = Some(glib::timeout_add_local(model::TICK, move || {
-                v.tick();
+                if let Some(v) = v.upgrade() {
+                    v.tick();
+                }
                 glib::ControlFlow::Continue
             }));
             drop(timer);
@@ -220,13 +238,17 @@ impl Vms {
         if self.list_poll.borrow_mut().due(now) {
             let (v, socket) = (self.clone(), self.socket.clone());
             glib::spawn_future_local(async move {
+                let sent = Instant::now();
                 let got =
                     client::spawn(async move { client::list(&socket, client::READ_TIMEOUT).await })
                         .await;
                 let ok = matches!(got, Ok(Ok(_)));
                 v.list_poll.borrow_mut().done(Instant::now(), ok);
                 match got {
-                    Ok(Ok(vms)) => v.show(vms),
+                    Ok(Ok(vms)) => {
+                        v.pending.borrow_mut().listed(sent);
+                        v.show(vms);
+                    }
                     // The probe decides: banner and reconnect, or a page.
                     _ => v.ui.probe(),
                 }
@@ -323,8 +345,12 @@ impl Vms {
         if current.is_none_or(|d| d.name != vm.name) {
             let detail = Detail::new(&vm);
             for (action, op) in detail.actions.iter().zip(Op::ALL) {
-                let (v, name) = (self.clone(), vm.name.clone());
-                action.connect_activate(move |_, _| v.run(op, &name));
+                let (v, name) = (Rc::downgrade(self), vm.name.clone());
+                action.connect_activate(move |_, _| {
+                    if let Some(v) = v.upgrade() {
+                        v.ask(op, &name);
+                    }
+                });
             }
             self.split.set_content(Some(&detail.page));
             self.refresh(&detail);
@@ -339,8 +365,8 @@ impl Vms {
     /// Updates the open VM's page from what is known now.
     fn refresh(&self, detail: &Detail) {
         if let Some(vm) = self.vm(&detail.name) {
-            let pending = self.pending.borrow().contains(&detail.name);
-            detail.update(&vm, pending);
+            let blocked = !self.online.get() || self.pending.borrow().blocks(&detail.name);
+            detail.update(&vm, blocked);
         }
     }
 
@@ -350,9 +376,37 @@ impl Vms {
         }
     }
 
+    /// Runs an action, after a confirmation if it may lose data.
+    fn ask(self: &Rc<Self>, op: Op, name: &str) {
+        let Some(vm) = self.vm(name) else {
+            return;
+        };
+        let Some(c) = model::confirm(op, &vm) else {
+            return self.run(op, name);
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading(&c.heading)
+            .heading_use_markup(false)
+            .body(&c.body)
+            .body_use_markup(false)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("confirm", c.button);
+        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let (v, name) = (Rc::downgrade(self), name.to_owned());
+        dialog.connect_response(Some("confirm"), move |_, _| {
+            if let Some(v) = v.upgrade() {
+                v.run(op, &name);
+            }
+        });
+        dialog.present(Some(&self.root));
+    }
+
     /// Runs a lifecycle action; one per VM at a time.
     fn run(self: &Rc<Self>, op: Op, name: &str) {
-        if !self.pending.borrow_mut().insert(name.to_owned()) {
+        if !self.online.get() || !self.pending.borrow_mut().start(name) {
             return;
         }
         self.refresh_open();
@@ -360,7 +414,8 @@ impl Vms {
         glib::spawn_future_local(async move {
             let vm = name.clone();
             let got = client::spawn(async move { client::act(&socket, op, &vm).await }).await;
-            v.pending.borrow_mut().remove(&name);
+            // Its buttons stay off until a list asked for from now on.
+            v.pending.borrow_mut().finish(&name, Instant::now());
             if let Ok(Err(e)) = got {
                 v.ui.toast(&op.failed(&name, &e));
             }
@@ -465,15 +520,23 @@ impl Detail {
             .menu_model(&menu)
             .dropdown_tooltip("More Ways to Stop")
             .build();
+        // For a VM that does not run, in place of Stop.
         let resume = gtk::Button::builder()
             .label("Resume")
             .action_name("vm.resume")
-            .tooltip_text("Paused because the host disk was nearly full")
             .css_classes(["suggested-action"])
+            .visible(false)
+            .build();
+        let force_off = gtk::Button::builder()
+            .label("Force Off")
+            .action_name("vm.force-off")
+            .tooltip_text("The VM does not run, so it cannot shut down cleanly")
+            .css_classes(["destructive-action"])
             .visible(false)
             .build();
         let header = adw::HeaderBar::new();
         header.pack_end(&stop);
+        header.pack_end(&force_off);
         header.pack_end(&start);
         header.pack_end(&resume);
 
@@ -503,18 +566,22 @@ impl Detail {
             page,
             actions,
             resume,
+            stop,
+            force_off,
             values,
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
         })
     }
 
-    fn update(&self, vm: &VmInfo, pending: bool) {
-        let set = model::actions(vm, pending);
+    fn update(&self, vm: &VmInfo, blocked: bool) {
+        let set = model::actions(vm, blocked);
         for (action, op) in self.actions.iter().zip(Op::ALL) {
             action.set_enabled(set.allows(op));
         }
-        self.resume.set_visible(set.show_resume);
+        self.resume.set_visible(set.halted);
+        self.force_off.set_visible(set.halted);
+        self.stop.set_visible(!set.halted);
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {

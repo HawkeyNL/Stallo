@@ -19,8 +19,13 @@ use crate::model::{self, CallError, Op, Probe, Production};
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide.
-const MAX_IN_FLIGHT: usize = 8;
+/// Requests in flight at once, app-wide: 8, in two pools. Actions may
+/// take up to 150 s each, so they have their own slots and reads (polls,
+/// the probe) never wait behind them.
+const READ_SLOTS: usize = 4;
+const ACTION_SLOTS: usize = 4;
+static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
+static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
 
 fn runtime() -> &'static Handle {
     static RT: OnceLock<Handle> = OnceLock::new();
@@ -48,15 +53,6 @@ where
 }
 
 /// Sends one request; `limit` covers waiting for a slot and the answer.
-pub async fn call(
-    socket: &Path,
-    request: Request,
-    limit: Duration,
-) -> Result<serde_json::Value, CallError> {
-    static SLOTS: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
-    call_in(&SLOTS, socket, request, limit).await
-}
-
 async fn call_in(
     slots: &Semaphore,
     socket: &Path,
@@ -97,7 +93,7 @@ async fn get<T: serde::de::DeserializeOwned>(
     request: Request,
     limit: Duration,
 ) -> Result<T, CallError> {
-    let data = call(socket, request, limit).await?;
+    let data = call_in(&READS, socket, request, limit).await?;
     serde_json::from_value(data)
         .map_err(|e| CallError::Failed(format!("unexpected answer from stallod: {e}")))
 }
@@ -119,7 +115,9 @@ pub async fn info(socket: &Path, name: String) -> Result<VmDetails, CallError> {
 
 /// Starts, stops, resets or resumes a VM.
 pub async fn act(socket: &Path, op: Op, name: &str) -> Result<(), CallError> {
-    call(socket, op.request(name), op.limit()).await.map(drop)
+    call_in(&ACTIONS, socket, op.request(name), op.limit())
+        .await
+        .map(drop)
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -346,17 +344,39 @@ mod tests {
     #[test]
     fn waiting_for_a_slot_counts() {
         let (_d, s) = daemon(answer("{\"ok\":true,\"data\":[]}\n"));
-        let slots = std::sync::Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+        let slots = std::sync::Arc::new(Semaphore::new(READ_SLOTS));
         let held = runtime()
-            .block_on(slots.clone().acquire_many_owned(MAX_IN_FLIGHT as u32))
+            .block_on(slots.clone().acquire_many_owned(READ_SLOTS as u32))
             .unwrap();
         let call = |slots: std::sync::Arc<Semaphore>, s: PathBuf| {
             run(async move { call_in(&slots, &s, Request::List, Duration::from_millis(200)).await })
         };
-        // The ninth request never gets a slot, so it never connects.
+        // With every slot taken, the next request never gets one, so it never connects.
         assert_eq!(call(slots.clone(), s.clone()), Err(CallError::Timeout));
         drop(held);
         assert_eq!(call(slots, s), Ok(serde_json::json!([])));
+    }
+
+    #[test]
+    fn reads_pass_busy_actions() {
+        // Every action slot taken, e.g. by slow stops.
+        let held = runtime()
+            .block_on(ACTIONS.acquire_many(ACTION_SLOTS as u32))
+            .unwrap();
+        let (_d, s) = daemon(answer("{\"ok\":true,\"data\":[]}\n"));
+        assert_eq!(list_at(&s, READ_TIMEOUT), Ok(0));
+        let (_d, s, _) = serve(r#"{"op":"reset","name":"dev"}"#, answer("{\"ok\":true}\n"));
+        let wait = run(async move {
+            call_in(
+                &ACTIONS,
+                &s,
+                Op::Reset.request("dev"),
+                Duration::from_millis(200),
+            )
+            .await
+        });
+        assert_eq!(wait, Err(CallError::Timeout), "actions still queue");
+        drop(held);
     }
 
     #[test]

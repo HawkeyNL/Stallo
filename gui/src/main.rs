@@ -173,6 +173,16 @@ impl Ui {
         if old.as_ref().map(|v| &v.page) != Some(&view.page) {
             if let Some(vms) = self.vms.take() {
                 vms.set_active(false);
+                // Nothing but requests in flight may keep the old page,
+                // and none outlives its time limit.
+                #[cfg(debug_assertions)]
+                {
+                    let old = Rc::downgrade(&vms);
+                    glib::timeout_add_local_once(
+                        model::Op::Start.limit() + client::READ_TIMEOUT,
+                        move || assert!(old.upgrade().is_none(), "a replaced page leaked"),
+                    );
+                }
             }
             self.header
                 .set_visible(!matches!(view.page, Onboarding::Connected { .. }));
@@ -191,6 +201,7 @@ impl Ui {
         let visible = self.window.is_mapped() && !self.window.is_suspended();
         let state = self.state.borrow().clone();
         if let Some(vms) = self.vms.borrow().as_ref() {
+            vms.set_online(state.as_ref().is_some_and(|v| !v.reconnecting));
             vms.set_active(state.as_ref().is_some_and(|v| v.polls_vms(visible)));
         }
         let want = state.as_ref().map_or(visible, |v| v.polls(visible));

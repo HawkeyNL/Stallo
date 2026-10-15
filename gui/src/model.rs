@@ -1,6 +1,7 @@
 //! Plain-Rust view-model: what the window should show, decided from facts
 //! gathered elsewhere (no GTK, no I/O), so every case is unit-testable.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -236,6 +237,8 @@ pub struct Poll {
     every: Duration,
     next: Option<Instant>,
     busy: bool,
+    /// Asked for again while busy: the answer in flight may be too old.
+    stale: bool,
 }
 
 impl Poll {
@@ -244,6 +247,7 @@ impl Poll {
             every,
             next: None,
             busy: false,
+            stale: false,
         }
     }
 
@@ -255,14 +259,26 @@ impl Poll {
     }
 
     /// The answer is back: wait `every`, or [`BACKOFF`] after an error.
+    /// A stale answer asks again at the next tick (errors still back off).
     pub fn done(&mut self, now: Instant, ok: bool) {
+        let again = ok && self.stale;
         self.busy = false;
-        self.next = Some(now + if ok { self.every } else { BACKOFF });
+        self.stale = false;
+        self.next = match (again, ok) {
+            (true, _) => None,
+            (false, true) => Some(now + self.every),
+            (false, false) => Some(now + BACKOFF),
+        };
     }
 
-    /// Ask at the next tick, e.g. after an action.
+    /// Ask at the next tick, e.g. after an action; if a request is out,
+    /// once more after it.
     pub fn soon(&mut self) {
-        self.next = None;
+        if self.busy {
+            self.stale = true;
+        } else {
+            self.next = None;
+        }
     }
 }
 
@@ -384,8 +400,10 @@ pub struct ActionSet {
     pub force_off: bool,
     pub reset: bool,
     pub resume: bool,
-    /// Resume is only shown for a VM the disk watchdog paused.
-    pub show_resume: bool,
+    /// The VM exists as a process but does not run (paused, disk full,
+    /// io-error...): Resume and Force Off take the place of Stop, which
+    /// could not shut the guest down cleanly anyway.
+    pub halted: bool,
 }
 
 impl ActionSet {
@@ -400,26 +418,87 @@ impl ActionSet {
     }
 }
 
-/// The actions for `vm`; none while one of its actions runs (`pending`).
-pub fn actions(vm: &VmInfo, pending: bool) -> ActionSet {
+/// The actions for `vm`; none while `blocked`: one of its actions runs or
+/// just ran, or the daemon is out of reach.
+pub fn actions(vm: &VmInfo, blocked: bool) -> ActionSet {
     let k = kind(&vm.state);
-    let live = k != Kind::Stopped;
+    let running = k == Kind::Running;
+    // The daemon stops a VM that does not run with a hard QMP quit.
+    let halted = !running && k != Kind::Stopped;
     let set = ActionSet {
         start: k == Kind::Stopped,
-        // A stop of a paused or stuck VM skips the power button.
-        stop: live,
-        force_off: live,
-        reset: k == Kind::Running,
-        resume: k == Kind::DiskFull,
-        show_resume: k == Kind::DiskFull,
+        stop: running,
+        force_off: running || halted,
+        reset: running,
+        resume: halted,
+        halted,
     };
-    if pending {
+    if blocked {
         ActionSet {
-            show_resume: set.show_resume,
+            halted,
             ..ActionSet::default()
         }
     } else {
         set
+    }
+}
+
+/// What to ask before an action that may lose data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirm {
+    pub heading: String,
+    pub body: String,
+    pub button: &'static str,
+}
+
+/// The question before Force Off or Reset; `None` for other actions.
+pub fn confirm(op: Op, vm: &VmInfo) -> Option<Confirm> {
+    let button = match op {
+        Op::ForceOff => "Force Off",
+        Op::Reset => "Reset",
+        _ => return None,
+    };
+    let mut body = String::new();
+    if op == Op::ForceOff && kind(&vm.state) != Kind::Running {
+        body.push_str("The VM does not run, so it cannot shut down cleanly. ");
+    }
+    body.push_str("Unsaved work in the VM is lost and its file systems may need repair.");
+    Some(Confirm {
+        heading: format!("{button} {}?", printable(&vm.name, 64)),
+        body,
+        button,
+    })
+}
+
+/// VMs whose buttons stay off: while an action runs, and after it until
+/// a VM list that was asked for after it ended arrives (no second Start
+/// on a state from before the first).
+#[derive(Debug, Default)]
+pub struct Pending(HashMap<String, Option<Instant>>);
+
+impl Pending {
+    /// Claims `vm` for an action; false if it has one already.
+    pub fn start(&mut self, vm: &str) -> bool {
+        if self.0.contains_key(vm) {
+            return false;
+        }
+        self.0.insert(vm.to_owned(), None);
+        true
+    }
+
+    pub fn finish(&mut self, vm: &str, now: Instant) {
+        if let Some(end) = self.0.get_mut(vm) {
+            *end = Some(now);
+        }
+    }
+
+    /// A VM list arrived that was asked for at `sent`.
+    pub fn listed(&mut self, sent: Instant) {
+        self.0.retain(|_, end| end.is_none_or(|end| end > sent));
+    }
+
+    pub fn blocks(&self, vm: &str) -> bool {
+        self.0.contains_key(vm)
     }
 }
 
@@ -885,28 +964,46 @@ mod tests {
 
     #[test]
     fn action_matrix() {
-        let set = |start, stop, reset, resume| ActionSet {
-            start,
-            stop,
-            force_off: stop,
-            reset,
-            resume,
-            show_resume: resume,
+        const STOPPED: ActionSet = ActionSet {
+            start: true,
+            stop: false,
+            force_off: false,
+            reset: false,
+            resume: false,
+            halted: false,
+        };
+        const RUNNING: ActionSet = ActionSet {
+            start: false,
+            stop: true,
+            force_off: true,
+            reset: true,
+            resume: false,
+            halted: false,
+        };
+        // No plain Stop: the daemon would quit QEMU without a shutdown.
+        const HALTED: ActionSet = ActionSet {
+            start: false,
+            stop: false,
+            force_off: true,
+            reset: false,
+            resume: true,
+            halted: true,
         };
         for (state, want) in [
-            ("stopped", set(true, false, false, false)),
-            ("running", set(false, true, true, false)),
-            ("running (no network)", set(false, true, true, false)),
-            ("paused", set(false, true, false, false)),
-            ("paused (disk full)", set(false, true, false, true)),
-            ("io-error", set(false, true, false, false)),
-            ("unknown", set(false, true, false, false)),
+            ("stopped", STOPPED),
+            ("running", RUNNING),
+            ("running (no network)", RUNNING),
+            ("paused", HALTED),
+            ("paused (no network)", HALTED),
+            ("paused (disk full)", HALTED),
+            ("io-error", HALTED),
+            ("unknown", HALTED),
         ] {
             assert_eq!(actions(&vm(state), false), want, "{state}");
-            // While an action runs: nothing, but Resume stays in place.
+            // Blocked: nothing, but the layout stays.
             let busy = actions(&vm(state), true);
             assert!(Op::ALL.iter().all(|&op| !busy.allows(op)), "{state}");
-            assert_eq!(busy.show_resume, want.show_resume, "{state}");
+            assert_eq!(busy.halted, want.halted, "{state}");
             for op in Op::ALL {
                 let field = match op {
                     Op::Start => want.start,
@@ -951,6 +1048,54 @@ mod tests {
     }
 
     #[test]
+    fn confirmations() {
+        let running = vm("running");
+        let c = confirm(Op::ForceOff, &running).unwrap();
+        assert_eq!(c.heading, "Force Off dev?");
+        assert_eq!(
+            c.body,
+            "Unsaved work in the VM is lost and its file systems may need repair."
+        );
+        assert_eq!(c.button, "Force Off");
+        let c = confirm(Op::Reset, &running).unwrap();
+        assert_eq!((c.heading.as_str(), c.button), ("Reset dev?", "Reset"));
+        let paused = confirm(Op::ForceOff, &vm("paused (disk full)")).unwrap();
+        assert!(
+            paused
+                .body
+                .starts_with("The VM does not run, so it cannot shut down cleanly.")
+        );
+        for op in [Op::Start, Op::Stop, Op::Resume] {
+            assert_eq!(confirm(op, &running), None);
+        }
+        let odd = VmInfo {
+            name: "a\u{202E}b".into(),
+            ..running
+        };
+        assert_eq!(confirm(Op::Reset, &odd).unwrap().heading, "Reset ab?");
+    }
+
+    #[test]
+    fn pending_until_a_fresh_list() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut p = Pending::default();
+        assert!(!p.blocks("dev"));
+        assert!(p.start("dev"));
+        assert!(!p.start("dev"), "one action per VM");
+        assert!(p.start("web"));
+        p.listed(t0 + s);
+        assert!(p.blocks("dev"), "still running");
+        p.finish("dev", t0 + 2 * s);
+        p.listed(t0 + s);
+        assert!(p.blocks("dev"), "that list was asked for before the end");
+        p.listed(t0 + 2 * s);
+        assert!(!p.blocks("dev"));
+        assert!(p.blocks("web"));
+        assert!(p.start("dev"));
+    }
+
+    #[test]
     fn polls() {
         let t0 = Instant::now();
         let mut p = Poll::new(LIST_EVERY);
@@ -965,6 +1110,19 @@ mod tests {
         p.done(t0, true);
         p.soon();
         assert!(p.due(t0), "soon: at the next tick");
+        // Asked for while a request is out: once more right after it.
+        p.soon();
+        assert!(!p.due(t0), "still one at a time");
+        p.done(t0, true);
+        assert!(p.due(t0), "the answer may predate the change");
+        p.done(t0, true);
+        assert!(!p.due(t0), "and then the normal pace");
+        p.soon();
+        p.soon();
+        assert!(p.due(t0));
+        p.soon();
+        p.done(t0, false);
+        assert!(!p.due(t0 + LIST_EVERY), "errors still back off");
         let mut host = Poll::new(HOST_EVERY);
         assert!(host.due(t0));
         host.done(t0, true);
