@@ -1,0 +1,59 @@
+# Debian 13 (trixie) `generic` cloud image, amd64, qcow2, BIOS/UEFI GPT.
+# One dated build is pinned: a newer build needs a Stallo release.
+#
+# `generic`, not `genericcloud`: the cloud kernel (linux-image-cloud-amd64)
+# is built without DRM (`# CONFIG_DRM is not set` in the kernel team's
+# config.cloud, 6.12.111-1): no driver for the bochs display that
+# screenshots and the console use, only the firmware's EFI framebuffer.
+# `generic` runs the standard kernel (CONFIG_DRM_BOCHS=m).
+id = "debian-13"
+name = "Debian 13 (trixie) generic cloud image (20261015-2632)"
+os = "linux"
+# Debian's shim is signed by Microsoft.
+firmware = "secure-boot"
+url = "https://cloud.debian.org/images/cloud/trixie/20261015-2632/debian-13-generic-amd64-20261015-2632.qcow2"
+max_size = 2_147_483_648
+
+# Debian signs no checksum list for its cloud images; it publishes
+# SHA512SUMS over HTTPS only. This SHA-512 was checked (2026-10-15)
+# against SHA512SUMS of the build on cloud.debian.org and on
+# cdimage.debian.org, and against a download of the image.
+trust = "pinned"
+sha512 = "d4721b56d60472370f3ff088a85ca36f298b360d3131af421a009bb8ea03c4d80eb67915bb57a69f6057e56c5bd48e69d3a47fbc5b8efacc5434a9c756b345d3"
+
+# The guest agent is not in the image, and offline guests have no apt.
+# These packages ship on the seed ISO and are installed with `dpkg -i`.
+#
+# Closure check (2026-10-15), qemu-guest-agent 1:10.0.13+ds-0+deb13u1:
+#   Depends: libc6, libglib2.0-0t64, libnuma1, libudev1, liburing2
+#   Pre-Depends: init-system-helpers
+# Against debian-13-generic-amd64-20261015-2632.json (sha512
+# 38036d4518e9104f...9e098f91): all present; missing: qemu-guest-agent.
+#
+# apt fetches it in a private root from these sources only, trusting only
+# catalog/keys/debian-archive-trixie.gpg: "Debian Archive Automatic Signing
+# Key (13/trixie)" 04B54C3CDCA79751B16BC6B5225629DF75B188BD and "Debian
+# Security Archive Automatic Signing Key (13/trixie)"
+# 5E04A1E3223A19A20706E20F9904613D4CCE68C6, which sign these suites. The
+# file is the two keys from the debian-archive-keyring 2025.1 package
+# (usr/share/keyrings/debian-archive-trixie-{,security-}automatic.pgp),
+# byte for byte the same as ftp-master.debian.org/keys/archive-key-13.asc
+# and archive-key-13-security.asc; the fingerprints match
+# ftp-master.debian.org/keys.html and keyserver.ubuntu.com (2026-10-15).
+# Like the image hash, the keyring changes only with a Stallo release:
+# Debian signs with its current and previous archive keys, so once a newer
+# key replaces the 13/trixie one, package fetches fail (closed) until a
+# release vendors the new keyring.
+# The package is cached under <data>/images/debian-13.debs/ and not refreshed
+# automatically. To pick up guest-agent updates, delete that directory
+# and run `stallo images pull debian-13`; existing VMs keep what they have.
+agent = "deb"
+debs = ["qemu-guest-agent"]
+deb_keyring = "debian-archive-trixie.gpg"
+deb_sources = [
+    "https://deb.debian.org/debian trixie main",
+    "https://deb.debian.org/debian trixie-updates main",
+    "https://security.debian.org/debian-security trixie-security main",
+]
+
+# No `internet` profile yet: not verified with this image.
