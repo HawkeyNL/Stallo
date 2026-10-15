@@ -1321,6 +1321,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "rustix",
+ "serde",
  "serde_json",
  "stallo",
  "tempfile",

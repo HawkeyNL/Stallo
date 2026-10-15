@@ -1,8 +1,10 @@
-//! stallo-gui: the desktop app for Stallo. For now it finds the daemon and
-//! walks the user through anything that stops it from connecting.
+//! stallo-gui: the desktop app for Stallo. It finds the daemon, walks the
+//! user through anything that stops it from connecting, and then lists the
+//! VMs and starts and stops them.
 
 mod client;
 mod model;
+mod vms;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -71,6 +73,8 @@ fn main() -> glib::ExitCode {
 struct Ui {
     window: adw::ApplicationWindow,
     view: adw::ToolbarView,
+    /// Hidden while connected: the split view brings its own.
+    header: adw::HeaderBar,
     banner: adw::Banner,
     toasts: adw::ToastOverlay,
     /// `None` until the first probe is back.
@@ -78,6 +82,8 @@ struct Ui {
     /// A probe is in flight; do not start another.
     busy: Cell<bool>,
     timer: RefCell<Option<glib::SourceId>>,
+    /// The connected page, while it is shown.
+    vms: RefCell<Option<Rc<vms::Vms>>>,
 }
 
 impl Ui {
@@ -88,7 +94,8 @@ impl Ui {
             .child(&adw::Spinner::new())
             .build();
         let view = adw::ToolbarView::builder().content(&connecting).build();
-        view.add_top_bar(&adw::HeaderBar::new());
+        let header = adw::HeaderBar::new();
+        view.add_top_bar(&header);
         view.add_top_bar(&banner);
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&view));
@@ -99,14 +106,23 @@ impl Ui {
             .default_height(600)
             .content(&toasts)
             .build();
+        let css = gtk::CssProvider::new();
+        css.load_from_string(vms::CSS);
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&window),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
         let ui = Rc::new(Self {
             window,
             view,
+            header,
             banner,
             toasts,
             state: RefCell::new(None),
             busy: Cell::new(false),
             timer: RefCell::new(None),
+            vms: RefCell::new(None),
         });
         // ponytail: these closures keep `ui` alive for the process lifetime;
         // fine with one window. Use weak refs if there are ever several.
@@ -116,11 +132,13 @@ impl Ui {
                 u.probe();
             }
         });
-        for prop in ["visible", "is-suspended"] {
-            let u = ui.clone();
-            ui.window
-                .connect_notify_local(Some(prop), move |_, _| u.reschedule());
-        }
+        let u = ui.clone();
+        ui.window
+            .connect_notify_local(Some("is-suspended"), move |_, _| u.reschedule());
+        let u = ui.clone();
+        ui.window.connect_map(move |_| u.reschedule());
+        let u = ui.clone();
+        ui.window.connect_unmap(move |_| u.reschedule());
         ui.window.present();
         ui.probe();
         ui
@@ -153,6 +171,21 @@ impl Ui {
             ),
         };
         if old.as_ref().map(|v| &v.page) != Some(&view.page) {
+            if let Some(vms) = self.vms.take() {
+                vms.set_active(false);
+                // Nothing but requests in flight may keep the old page,
+                // and none outlives its time limit.
+                #[cfg(debug_assertions)]
+                {
+                    let old = Rc::downgrade(&vms);
+                    glib::timeout_add_local_once(
+                        model::Op::Start.limit() + client::READ_TIMEOUT,
+                        move || assert!(old.upgrade().is_none(), "a replaced page leaked"),
+                    );
+                }
+            }
+            self.header
+                .set_visible(!matches!(view.page, Onboarding::Connected { .. }));
             self.view.set_content(Some(&self.page(&view.page)));
         }
         self.banner.set_revealed(view.reconnecting);
@@ -163,14 +196,15 @@ impl Ui {
         self.reschedule();
     }
 
-    /// Starts or stops the [`model::POLL`] timer.
+    /// Starts or stops the [`model::POLL`] timer and the VM polls.
     fn reschedule(self: &Rc<Self>) {
-        let visible = self.window.is_visible() && !self.window.is_suspended();
-        let want = self
-            .state
-            .borrow()
-            .as_ref()
-            .map_or(visible, |v| v.polls(visible));
+        let visible = self.window.is_mapped() && !self.window.is_suspended();
+        let state = self.state.borrow().clone();
+        if let Some(vms) = self.vms.borrow().as_ref() {
+            vms.set_online(state.as_ref().is_some_and(|v| !v.reconnecting));
+            vms.set_active(state.as_ref().is_some_and(|v| v.polls_vms(visible)));
+        }
+        let want = state.as_ref().map_or(visible, |v| v.polls(visible));
         let mut timer = self.timer.borrow_mut();
         if want && timer.is_none() {
             let ui = self.clone();
@@ -188,7 +222,7 @@ impl Ui {
         self.toasts.add_toast(toast);
     }
 
-    fn page(self: &Rc<Self>, page: &Onboarding) -> adw::StatusPage {
+    fn page(self: &Rc<Self>, page: &Onboarding) -> gtk::Widget {
         // Descriptions are Pango markup: only fixed text goes there. Anything
         // else goes into plain labels or rows with markup off.
         let status = adw::StatusPage::new();
@@ -258,24 +292,20 @@ impl Ui {
                     "Trying again every few seconds.",
                 )
             }
-            Onboarding::Connected { vms } => {
-                status.set_description(Some(&match vms {
-                    0 => "No virtual machines yet".to_owned(),
-                    1 => "1 virtual machine".to_owned(),
-                    n => format!("{n} virtual machines"),
-                }));
-                (APP_ID, "Stallo", "")
+            Onboarding::Connected { socket } => {
+                let vms = vms::Vms::new(self, socket.clone());
+                let root = vms.root.clone().upcast();
+                *self.vms.borrow_mut() = Some(vms);
+                return root;
             }
         };
         status.set_icon_name(Some(icon));
         status.set_title(title);
-        if !description.is_empty() {
-            status.set_description(Some(description));
-        }
+        status.set_description(Some(description));
         if content.first_child().is_some() {
             status.set_child(Some(&content));
         }
-        status
+        status.upcast()
     }
 
     /// Commands to run in a terminal, each with a copy button.

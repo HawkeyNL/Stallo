@@ -11,7 +11,7 @@
       agents. This app is its desktop front end; it talks to the Stallo
       daemon on this computer.
     </p>
-    <p>This is an early preview: it connects to stallod and helps set up access to it.</p>
+    <p>This is an early preview: it lists the virtual machines, starts and stops them, and helps set up access to stallod.</p>
   </description>
   <developer id="io.github.hawkeynl">
     <name>HawkeyNL</name>
