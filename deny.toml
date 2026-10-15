@@ -21,6 +21,9 @@ exceptions = [{ crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-excepti
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The GUI uses the stallo library by path; both are private (publish = false),
+# so nothing outside this repository can resolve that path.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
