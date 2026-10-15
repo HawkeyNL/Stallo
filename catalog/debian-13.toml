@@ -40,6 +40,10 @@ sha512 = "d4721b56d60472370f3ff088a85ca36f298b360d3131af421a009bb8ea03c4d80eb679
 # byte for byte the same as ftp-master.debian.org/keys/archive-key-13.asc
 # and archive-key-13-security.asc; the fingerprints match
 # ftp-master.debian.org/keys.html and keyserver.ubuntu.com (2026-10-15).
+# Like the image hash, the keyring changes only with a Stallo release:
+# Debian signs with its current and previous archive keys, so once a newer
+# key replaces the 13/trixie one, package fetches fail (closed) until a
+# release vendors the new keyring.
 # The package is cached under <data>/images/debian-13.debs/ and not refreshed
 # automatically. To pick up guest-agent updates, delete that directory
 # and run `stallo images pull debian-13`; existing VMs keep what they have.

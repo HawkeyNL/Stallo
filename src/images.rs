@@ -469,15 +469,39 @@ async fn fetch_hashed<D: Digest + 'static>(
     work: &Path,
     expected: &str,
 ) -> Result<PathBuf> {
+    let root = paths.images_dir();
     let image = work.join(format!("{expected}.part"));
+    // curl's size cap counts only what it fetches, not the part it resumes.
+    drop_oversized(&root, &image, entry.max_size)?;
     if !image.exists() || hash_file::<D>(&image).await? != expected {
         tracing::info!("downloading {}", entry.url);
         download(&entry.url, &image, entry.max_size, true).await?;
-        check_hash::<D>(&paths.images_dir(), &image, expected)
+        ensure!(
+            !drop_oversized(&root, &image, entry.max_size)?,
+            "{} is larger than {} bytes",
+            entry.file(),
+            entry.max_size
+        );
+        check_hash::<D>(&root, &image, expected)
             .await
             .with_context(|| format!("{} is not the expected image", entry.file()))?;
     }
     Ok(image)
+}
+
+/// Removes `file` (inside `root`) if it is there but not a regular file or
+/// larger than `max_size`; returns whether it did. A symlink is an error
+/// (`safe_remove` refuses it).
+fn drop_oversized(root: &Path, file: &Path, max_size: u64) -> Result<bool> {
+    let drop = match fs::symlink_metadata(file) {
+        Ok(m) => !m.is_file() || m.len() > max_size,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    if drop {
+        safe_remove(root, file)?;
+    }
+    Ok(drop)
 }
 
 /// Checks the hash of `file` (inside `root`) against `expected`; deletes
@@ -1280,6 +1304,28 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
         assert!(!f.exists());
+    }
+
+    /// A planted partial download larger than the cap, or a directory, is
+    /// removed before it could be resumed or hashed; a symlink fails.
+    #[test]
+    fn oversized_partial_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &fs::canonicalize(dir.path()).unwrap();
+        let f = root.join("x.part");
+        assert!(!drop_oversized(root, &f, 4).unwrap());
+        fs::write(&f, b"1234").unwrap();
+        assert!(!drop_oversized(root, &f, 4).unwrap());
+        assert!(f.exists());
+        fs::write(&f, b"12345").unwrap();
+        assert!(drop_oversized(root, &f, 4).unwrap());
+        assert!(!f.exists());
+        ensure_private_dir(&f).unwrap();
+        assert!(drop_oversized(root, &f, 4).unwrap());
+        assert!(!f.exists());
+        // A symlink is refused outright (safe_remove): the pull fails.
+        std::os::unix::fs::symlink("/etc/hostname", &f).unwrap();
+        assert!(drop_oversized(root, &f, 1 << 20).is_err());
     }
 
     #[test]
