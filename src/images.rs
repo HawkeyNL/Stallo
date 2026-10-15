@@ -597,7 +597,11 @@ fn check_gpg_status(status: &str, fingerprint: &str) -> Result<()> {
             continue;
         }
         match words.next() {
-            Some("BADSIG" | "ERRSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG") => {
+            // ERROR and FAILURE: gpgv hit something it could not process,
+            // such as unsigned data next to a signed block.
+            Some(
+                "BADSIG" | "ERRSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" | "ERROR" | "FAILURE",
+            ) => {
                 bail!("gpgv reported: {line}")
             }
             // The last field of VALIDSIG is the primary key fingerprint.
@@ -985,6 +989,13 @@ mod tests {
             let status = format!("{good}[GNUPG:] {bad} 1A5D6C4C7DB87C81 UEC\n");
             assert!(check_gpg_status(&status, fpr).is_err(), "{bad}");
         }
+        for bad in [
+            "ERROR proc_pkt.plaintext 89_BAD_DATA",
+            "FAILURE gpg-exit 33554433",
+        ] {
+            let status = format!("{good}[GNUPG:] {bad}\n");
+            assert!(check_gpg_status(&status, fpr).is_err(), "{bad}");
+        }
     }
 
     /// Real gpgv against a throwaway key, detached and clearsigned: a good
@@ -1077,12 +1088,58 @@ mod tests {
         assert_ne!(added, clear);
         fs::write(&data, added).unwrap();
         assert!(check(fpr.clone(), None).await.is_err());
+        // Unsigned data (a literal packet) before or after the signed block:
+        // gpgv writes it to `out` but fails, so it is never parsed.
+        let literal = dir.path().join("literal.asc");
+        let evil_plain = dir.path().join("evil");
+        fs::write(&evil_plain, &line).unwrap();
+        let (lit_s, evil_s) = (literal.to_str().unwrap(), evil_plain.to_str().unwrap());
+        gpg(&["--yes", "--store", "--armor", "--output", lit_s, evil_s]);
+        let literal = fs::read_to_string(&literal).unwrap();
+        assert!(literal.starts_with("-----BEGIN PGP MESSAGE-----"));
+        for combined in [format!("{literal}{clear}"), format!("{clear}{literal}")] {
+            fs::write(&data, combined).unwrap();
+            assert!(check(fpr.clone(), None).await.is_err());
+        }
         // Two signed blocks are two signatures: refused.
         fs::write(&data, format!("{clear}{clear}")).unwrap();
         assert!(check(fpr.clone(), None).await.is_err());
         // An unsigned list is refused.
         fs::write(&data, &line).unwrap();
         assert!(check(fpr.clone(), None).await.is_err());
+    }
+
+    /// The real Fedora 44 checksum list (tests/fixtures/) verifies with the
+    /// vendored keyring and gives the image's SHA-256. Offline.
+    #[tokio::test]
+    async fn fedora_checksum_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let entry = find("fedora-44").unwrap();
+        let keyring = keyring_path(&paths, entry.keyring.as_deref().unwrap()).unwrap();
+        let sums = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/Fedora-Cloud-44-1.7-x86_64-CHECKSUM");
+        assert!(
+            entry
+                .sums_url
+                .as_deref()
+                .unwrap()
+                .ends_with("/Fedora-Cloud-44-1.7-x86_64-CHECKSUM")
+        );
+        let out = dir.path().join("signed");
+        let fpr = entry.signing_key.as_deref().unwrap();
+        let text = signed_text(&keyring, fpr, &sums, None, &out).await.unwrap();
+        assert_eq!(
+            expected_sha256(&text, entry.file(), SumsFormat::Bsd).unwrap(),
+            "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f"
+        );
+        // Another key is refused.
+        fs::remove_file(&out).unwrap();
+        assert!(
+            signed_text(&keyring, &"0".repeat(40), &sums, None, &out)
+                .await
+                .is_err()
+        );
     }
 
     /// The private apt root, checked offline with apt itself: every path

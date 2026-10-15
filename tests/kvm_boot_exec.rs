@@ -69,9 +69,7 @@ fn boot_exec_stop_rm() {
         d.ok(&["exec", "dev", "--admin", "--", "id", "-un"]).trim(),
         "root"
     );
-    // The guest user may use sudo with its password (seed.rs).
-    let sudo = d.ok(&["exec", "dev", "--admin", "--", "sudo", "-l", "-U", "agent"]);
-    assert!(sudo.contains("(ALL : ALL) ALL"), "{sudo}");
+    assert_sudo_with_password(&d);
     let t = Instant::now();
     d.ok(&["exec", "dev", "--", "true"]);
     eprintln!("MEASURE exec true: {} ms", t.elapsed().as_millis());
@@ -150,6 +148,31 @@ fn boot_exec_stop_rm() {
         !fs::read_dir(&d.cgroup)
             .unwrap()
             .any(|e| { e.unwrap().file_name().to_string_lossy().starts_with("vm-") })
+    );
+}
+
+/// The guest user gets root through sudo with its password and in no
+/// other way (seed.rs): one cloud-init rule, no admin groups, `sudo -n`
+/// refused, `sudo -S` with the password accepted. The test sets a known
+/// password first, so the VM's secret is never read.
+fn assert_sudo_with_password(d: &Daemon) {
+    let admin = |cmd: &str| d.ok(&["exec", "dev", "--admin", "--", "sh", "-c", cmd]);
+    let rules = admin("grep -v '^#' /etc/sudoers.d/90-cloud-init-users | grep .");
+    assert_eq!(rules, "agent ALL=(ALL:ALL) ALL\n");
+    assert_eq!(admin("id -nG agent"), "agent\n");
+    admin("echo agent:stallo-test-pw | chpasswd");
+    let out = d.stallo(&["exec", "dev", "--", "sudo", "-k", "-n", "true"]);
+    assert!(!out.status.success(), "sudo without a password worked");
+    assert_eq!(
+        d.ok(&[
+            "exec",
+            "dev",
+            "--",
+            "sh",
+            "-c",
+            "echo stallo-test-pw | sudo -k -S -p '' id -un",
+        ]),
+        "root\n"
     );
 }
 

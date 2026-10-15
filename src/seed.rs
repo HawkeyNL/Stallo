@@ -51,9 +51,12 @@ pub fn render(vm: &VmConfig, password_hash: &str, image: &CatalogEntry) -> Resul
         // SELinux confines the guest agent (virt_qemu_ga_t), so exec could
         // neither start its systemd-run scope nor switch to the guest user.
         // Only that domain becomes permissive, which leaves it as
-        // unconfined as Ubuntu's agent. The module stays installed.
+        // unconfined as Ubuntu's agent. The module stays installed. If that
+        // fails, the agent is masked for good (it has not started yet, see
+        // qemu.rs): the VM never reports ready with an agent that cannot
+        // exec, and `stallo new` times out instead.
         runcmd.push_str(
-            "  - [sh, -c, \"echo '(typepermissive virt_qemu_ga_t)' > /run/stallo_qga.cil && semodule -i /run/stallo_qga.cil\"]\n",
+            "  - [sh, -c, \"echo '(typepermissive virt_qemu_ga_t)' > /run/stallo_qga.cil && semodule -i /run/stallo_qga.cil || systemctl mask --now qemu-guest-agent\"]\n",
         );
     }
     runcmd.push_str("  - [sh, -c, \"systemctl daemon-reload && systemctl restart getty@tty1\"]\n");
@@ -246,7 +249,7 @@ mod tests {
         let runcmd = |s: &Seed| s.user_data.split_once("runcmd:\n").unwrap().1.to_owned();
         assert_eq!(
             runcmd(&fedora),
-            "  - [sh, -c, \"echo '(typepermissive virt_qemu_ga_t)' > /run/stallo_qga.cil && semodule -i /run/stallo_qga.cil\"]\n\
+            "  - [sh, -c, \"echo '(typepermissive virt_qemu_ga_t)' > /run/stallo_qga.cil && semodule -i /run/stallo_qga.cil || systemctl mask --now qemu-guest-agent\"]\n\
              \x20 - [sh, -c, \"systemctl daemon-reload && systemctl restart getty@tty1\"]\n"
         );
         assert_eq!(
