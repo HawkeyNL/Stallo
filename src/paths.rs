@@ -1,5 +1,5 @@
-//! Directory layout, socket path checks and the one function that deletes
-//! things (`safe_remove`).
+//! Directory layout, socket path checks, the socket a client picks by
+//! default, and the one function that deletes things (`safe_remove`).
 
 use std::fs;
 use std::io;
@@ -113,6 +113,45 @@ impl Paths {
     /// `<runtime>/vnc/<name>/vnc.sock`.
     pub fn vnc_socket(&self, name: &str) -> PathBuf {
         self.vnc_root().join(name).join(crate::qemu::VNC_SOCK)
+    }
+}
+
+/// The production daemon's socket when it is there (and this user may
+/// reach it), else the dev-mode socket. Refuses to guess when both are
+/// there: a dev command must never hit production VMs by accident.
+pub fn default_socket() -> Result<PathBuf> {
+    let production = Paths::production()?.api_socket();
+    let dev = Paths::dev().map(|p| p.api_socket());
+    let dev_up = dev.as_ref().is_ok_and(|d| d.exists());
+    // `/run/stallo` is only open to group `stallo`: for anyone else the
+    // socket's metadata fails with EACCES instead of NotFound.
+    let prod_denied =
+        fs::metadata(&production).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+    pick_socket(
+        production.exists().then_some(production),
+        dev,
+        dev_up,
+        prod_denied,
+    )
+}
+
+fn pick_socket(
+    production: Option<PathBuf>,
+    dev: Result<PathBuf>,
+    dev_up: bool,
+    prod_denied: bool,
+) -> Result<PathBuf> {
+    match (production, dev) {
+        (None, _) if prod_denied && !dev_up => bail!(
+            "stallod is installed, but you may not use it yet: add yourself to group `stallo` (sudo usermod -aG stallo \"$USER\"), then log out and in again"
+        ),
+        (Some(p), Ok(d)) if dev_up => bail!(
+            "both a production daemon ({}) and a dev-mode daemon ({}) are running; choose one with --socket or STALLO_SOCKET",
+            p.display(),
+            d.display()
+        ),
+        (Some(p), _) => Ok(p),
+        (None, d) => d,
     }
 }
 
@@ -338,6 +377,36 @@ mod tests {
         symlink(root.join("real"), &alias).unwrap();
         assert!(safe_remove(&alias, &alias.join("f")).is_err());
         assert!(root.join("real/f").exists());
+    }
+
+    #[test]
+    fn default_socket_choice() {
+        let (p, d) = (
+            PathBuf::from("/run/stallo/api.sock"),
+            PathBuf::from("/d/api.sock"),
+        );
+        let pick = |prod: bool, dev: bool, up: bool| {
+            let dev = if dev {
+                Ok(d.clone())
+            } else {
+                Err(anyhow::anyhow!("XDG_RUNTIME_DIR is not set"))
+            };
+            pick_socket(prod.then(|| p.clone()), dev, up, false)
+        };
+        assert_eq!(pick(true, true, false).unwrap(), p);
+        assert_eq!(pick(true, false, false).unwrap(), p);
+        assert_eq!(pick(false, true, false).unwrap(), d);
+        assert_eq!(pick(false, true, true).unwrap(), d);
+        assert!(pick(false, false, false).is_err());
+        // Both daemons up: no guessing.
+        let err = pick(true, true, true).unwrap_err().to_string();
+        assert!(err.contains("--socket"), "{err}");
+        // Production there but not open to this user: say so, unless a
+        // dev-mode daemon is up.
+        let denied = |dev_up| pick_socket(None, Ok(d.clone()), dev_up, true);
+        let err = denied(false).unwrap_err().to_string();
+        assert!(err.contains("group `stallo`"), "{err}");
+        assert_eq!(denied(true).unwrap(), d);
     }
 
     #[test]

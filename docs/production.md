@@ -50,6 +50,17 @@ a release build with `dpkg-deb` (no root, no extra tools).
   - It never deletes VMs, images, `/var/lib/stallo` or the user, not even
     on purge. The steps below remove them by hand.
 
+**`stallo-gui`:** `packaging/build-gui-deb.sh` builds
+`target/deb/stallo-gui_<version>_amd64.deb`, the desktop app (an early
+preview). Building it needs `libgtk-4-dev`, `libadwaita-1-dev` and
+`pkg-config`. It holds
+`/usr/bin/stallo-gui` (stripped, size budget 15 MB), the desktop file, the
+icons and the AppStream metadata, and has no maintainer scripts.
+**Depends:** `stallo (= <version>)`, `libgtk-4-1 (>= 4.16)`,
+`libadwaita-1-0 (>= 1.7)`, `libglib2.0-0t64`, `libgcc-s1`, `libc6`. The
+script fails if the binary links a library from any other package
+(`objdump -p`, `dpkg -S`).
+
 **Why not `cargo-deb`** (as the plan said): it is not installed here, and
 installing tools needs the owner's approval. `dpkg-deb` is part of every
 Ubuntu system, and the package is small enough to build by hand.

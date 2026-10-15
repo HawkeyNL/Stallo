@@ -1,0 +1,20 @@
+[package]
+name = "stallo-gui"
+# Not used for packaging: the .deb takes its version from ../Cargo.toml.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Desktop app for Stallo"
+repository = "https://github.com/HawkeyNL/Stallo"
+license-file = "../LICENSE"
+publish = false
+
+[dependencies]
+stallo = { path = ".." }
+# Pinned: gtk-rs breaks its API between minor versions. The feature levels
+# are the minimums the package depends on (Ubuntu 26.04 ships newer).
+gtk4 = { version = "=0.11.5", features = ["v4_16"] }
+libadwaita = { version = "=0.9.2", features = ["v1_7"] }
+
+[lints.rust]
+unsafe_code = "forbid"

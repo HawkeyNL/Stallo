@@ -13,19 +13,26 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The GUI needs GTK 4.16 and libadwaita 1.7: Ubuntu 26.04.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # qemu-img and xorriso for image and seed ISO checks in the unit tests
-      # (no VM is started).
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils xorriso
+      # (no VM is started); GTK and libadwaita to build the GUI; the
+      # validators for its desktop file and AppStream metadata.
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          qemu-utils xorriso libgtk-4-dev libadwaita-1-dev pkg-config
+          desktop-file-utils appstream
+      - run: desktop-file-validate packaging/gui/io.github.hawkeynl.Stallo.desktop
+      - run: appstreamcli validate --no-net packaging/gui/io.github.hawkeynl.Stallo.metainfo.xml
       # rust-toolchain.toml selects the pinned toolchain.
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
 
   deny:
     runs-on: ubuntu-latest
@@ -35,3 +42,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # Every workspace member, not only the root package.
+          arguments: --all-features --workspace

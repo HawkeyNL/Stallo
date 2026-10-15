@@ -84,9 +84,46 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  # The desktop app gets its own runner, so the gtk-rs build scripts and
+  # proc-macros never run next to the stallo .deb. It takes the version from
+  # build: both packages always carry the same one.
+  build-gui:
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same guard as in build: main may have moved on since.
+      - name: Check that main has not moved on
+        if: github.event_name == 'push' && needs.build.outputs.channel == 'edge'
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$(git ls-remote "https://github.com/$REPO.git" refs/heads/main | cut -f 1)" != "$SHA" ]; then
+            echo "::error::main has moved on; this run would publish an older build as the newest."
+            exit 1
+          fi
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev pkg-config
+      # rust-toolchain.toml selects the pinned toolchain.
+      - name: Build the package
+        env:
+          STALLO_DEB_VERSION: ${{ needs.build.outputs.version }}
+        run: packaging/build-gui-deb.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb-gui
+          path: target/deb/stallo-gui_${{ needs.build.outputs.version }}_amd64.deb
+          retention-days: 3
+          if-no-files-found: error
+
   # A fresh runner that runs no code from the build: only apt-repo.sh.
   repo:
-    needs: build
+    needs: [build, build-gui]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -106,6 +143,10 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: deb
+          path: ${{ runner.temp }}/deb
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deb-gui
           path: ${{ runner.temp }}/deb
       - name: Fetch the published tree
         id: fetch
@@ -148,7 +189,8 @@ jobs:
             gpg --batch --quiet --passphrase '' --quick-gen-key "Stallo CI throwaway key" ed25519 sign 1d
           fi
           unset KEY PASSPHRASE
-          packaging/apt-repo.sh "$RUNNER_TEMP/site" "$CHANNEL" "$RUNNER_TEMP/deb/stallo_${VERSION}_amd64.deb"
+          packaging/apt-repo.sh "$RUNNER_TEMP/site" "$CHANNEL" \
+            "$RUNNER_TEMP/deb/stallo_${VERSION}_amd64.deb" "$RUNNER_TEMP/deb/stallo-gui_${VERSION}_amd64.deb"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: site
@@ -157,8 +199,8 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-  # A clean Ubuntu 26.04 must accept the signatures, resolve the package
-  # with its dependencies and download it before anything is published.
+  # A clean Ubuntu 26.04 must accept the signatures, resolve the packages
+  # with their dependencies and download them before anything is published.
   verify:
     needs: [build, repo]
     runs-on: ubuntu-26.04
@@ -183,9 +225,9 @@ jobs:
           Signed-By: /srv/stallo/stallo.asc
           EOF
           apt-get update --error-on=any
-          apt-get install --dry-run "stallo=$VERSION"
-          # Checks the .deb against the signed index.
-          cd /tmp && apt-get download "stallo=$VERSION"
+          apt-get install --dry-run "stallo=$VERSION" "stallo-gui=$VERSION"
+          # Checks the .debs against the signed index.
+          cd /tmp && apt-get download "stallo=$VERSION" "stallo-gui=$VERSION"
 
   publish:
     needs: [build, repo, verify]

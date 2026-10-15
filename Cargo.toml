@@ -8,6 +8,12 @@ repository = "https://github.com/HawkeyNL/Stallo"
 license-file = "LICENSE"
 publish = false
 
+# The GUI is a separate crate so the daemon and CLI build (and the stallo
+# .deb) never need GTK: plain `cargo build` builds only this package.
+[workspace]
+members = ["gui"]
+default-members = ["."]
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
