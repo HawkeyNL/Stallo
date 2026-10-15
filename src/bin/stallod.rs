@@ -566,10 +566,25 @@ async fn dispatch(
         Request::Images => json!(
             images::catalog()
                 .into_iter()
-                .map(|e| ImageInfo {
-                    cached: images::is_cached(&m.paths, &e),
-                    id: e.id,
-                    name: e.name,
+                .map(|e| {
+                    let cached = images::is_cached(&m.paths, &e);
+                    let size_bytes = std::fs::metadata(images::image_path(&m.paths, &e.id))
+                        .ok()
+                        .filter(|f| f.is_file())
+                        .map(|f| f.len());
+                    let mut notes = vec![];
+                    if size_bytes.is_some() && !cached {
+                        notes.push("guest-agent packages not downloaded yet".into());
+                    }
+                    ImageInfo {
+                        cached,
+                        os: Some(e.os),
+                        trust: Some(e.trust),
+                        size_bytes,
+                        notes,
+                        id: e.id,
+                        name: e.name,
+                    }
                 })
                 .collect::<Vec<_>>()
         ),

@@ -402,6 +402,14 @@ impl Server {
     }
 
     #[tool(
+        description = "List the images VMs can be created from: id, whether it is downloaded, size, how it is verified, and notes.",
+        annotations(read_only_hint = true)
+    )]
+    async fn image_list(&self) -> Result<CallToolResult, ErrorData> {
+        self.text(Request::Images, QUICK).await
+    }
+
+    #[tool(
         description = "Details of one VM: state, size, disk use and the guest's IP addresses (null if the guest agent is busy or not answering).",
         annotations(read_only_hint = true)
     )]
@@ -892,6 +900,7 @@ mod tests {
             "snapshot_create",
             "snapshot_restore",
             "snapshot_list",
+            "image_list",
         ];
         let mut tools = tools;
         tools.sort();
@@ -1000,6 +1009,8 @@ mod tests {
         );
         let (_, seen) = tool("snapshot_list", json!({"vm": "dev"})).await;
         assert_eq!(seen, [Request::Snapshots { name: "dev".into() }]);
+        let (_, seen) = tool("image_list", json!({})).await;
+        assert_eq!(seen, [Request::Images]);
 
         // The daemon's refusal reaches the agent as a tool error.
         let (r, _) = tool("exec", json!({"vm": "dev", "argv": ["true"]})).await;

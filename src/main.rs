@@ -522,10 +522,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&v);
             } else {
                 let images: Vec<ImageInfo> = serde_json::from_value(v)?;
-                for i in images {
-                    let state = if i.cached { "cached" } else { "not downloaded" };
-                    println!("{:<16} {:<16} {}", i.id, state, i.name);
-                }
+                print!("{}", images_table(&images));
             }
         }
     }
@@ -836,6 +833,30 @@ fn snaps_table(list: &[Snapshot], now: u64) -> String {
     out
 }
 
+fn images_table(images: &[ImageInfo]) -> String {
+    let mut s = format!(
+        "{:<16} {:<14} {:>9}  {:<12} NOTES\n",
+        "ID", "STATE", "SIZE", "TRUST"
+    );
+    for i in images {
+        let state = if i.cached { "cached" } else { "not downloaded" };
+        let size = i.size_bytes.map_or("-".into(), |b| mib(b >> 20));
+        let trust = serde_json::to_value(i.trust).unwrap_or_default();
+        let notes = std::iter::once(i.name.as_str())
+            .chain(i.notes.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        s.push_str(&format!(
+            "{:<16} {:<14} {:>9}  {:<12} {notes}\n",
+            i.id,
+            state,
+            size,
+            trust.as_str().unwrap_or("-")
+        ));
+    }
+    s
+}
+
 fn print_table(vms: &[VmInfo]) {
     if vms.is_empty() {
         println!("no VMs; create one with `stallo new`");
@@ -1053,6 +1074,27 @@ mod tests {
         assert!(parse_gib("20bib").is_err());
         assert!(parse_gib("20B").is_err());
         assert_eq!(parse_gib("20GiB").unwrap(), 20);
+    }
+
+    #[test]
+    fn images_columns() {
+        let v = serde_json::json!([{"id": "ubuntu-26.04", "name": "Ubuntu", "cached": false,
+            "os": "linux", "trust": "signed-sums", "size_bytes": 865115136,
+            "notes": ["guest-agent packages not downloaded yet"]}]);
+        let images: Vec<ImageInfo> = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            images_table(&images),
+            "ID               STATE               SIZE  TRUST        NOTES\n\
+             ubuntu-26.04     not downloaded   825 MiB  signed-sums  Ubuntu; guest-agent packages not downloaded yet\n"
+        );
+        // What an older stallod sends.
+        let old = serde_json::json!([{"id": "ubuntu-26.04", "name": "Ubuntu", "cached": true}]);
+        let images: Vec<ImageInfo> = serde_json::from_value(old).unwrap();
+        let table = images_table(&images);
+        assert_eq!(
+            table.lines().nth(1),
+            Some("ubuntu-26.04     cached                 -  -            Ubuntu")
+        );
     }
 
     /// A fake daemon holding one guest file.
