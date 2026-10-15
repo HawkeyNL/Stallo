@@ -4,7 +4,7 @@
 # only secret key in $GNUPGHOME. Only the .deb files in pool/ and the
 # previous indexes (as by-hash files) are carried over; everything else is
 # rebuilt.
-# Needs apt-ftparchive (apt-utils), gpg and GNU coreutils/findutils.
+# Needs apt-ftparchive (apt-utils), dpkg-deb, gpg and GNU coreutils/findutils.
 # Usage: apt-repo.sh <site> <stable|edge> <deb>...
 set -eu
 [ $# -ge 3 ] || { echo "usage: $0 <site> <stable|edge> <deb>..." >&2 && exit 2; }
@@ -22,6 +22,10 @@ case $channel in stable | edge) ;; *) echo "channel must be stable or edge" >&2 
 for deb; do
     deb=$(realpath "$deb")
     basename "$deb" | grep -Eqx "$deb_name" || { echo "unexpected package name: $deb" >&2 && exit 1; }
+    # The checks below go by file name, so the name must match the control
+    # fields apt-ftparchive indexes.
+    [ "$(dpkg-deb -f "$deb" Package)_$(dpkg-deb -f "$deb" Version)_$(dpkg-deb -f "$deb" Architecture).deb" = "$(basename "$deb")" ] ||
+        { echo "file name does not match the package's control fields: $deb" >&2 && exit 1; }
     set -- "$@" "$deb"
     shift
 done

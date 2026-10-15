@@ -20,11 +20,15 @@ release.
 
 `.github/workflows/apt-publish.yml`, on the `ubuntu-26.04` runner:
 
-1. **build:** installs the GTK and libadwaita dev packages and builds both
-   `.deb` files with `packaging/build-deb.sh --gui`. This job
+1. **build:** builds the `stallo` `.deb` with `packaging/build-deb.sh`. This job
    runs the crates' build scripts, so it never gets the signing key.
    - An edge run whose commit is no longer the tip of `main` (a re-run of an
      old run) fails, so an older build can never become the newest one.
+   - **build-gui** then builds the `stallo-gui` `.deb` with
+     `packaging/build-gui-deb.sh` on its own runner (with the GTK and
+     libadwaita dev packages), so the GUI's build scripts never run next to
+     the `stallo` package. It takes the version from build and repeats the
+     tip-of-`main` check.
 2. **repo:** on a fresh runner that checks out only `packaging/apt-repo.sh`,
    takes the `.deb` files in `pool/` from the current `gh-pages` branch,
    adds the new ones, drops edge builds beyond the last 10 of each

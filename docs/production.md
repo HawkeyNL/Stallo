@@ -50,7 +50,7 @@ a release build with `dpkg-deb` (no root, no extra tools).
   - It never deletes VMs, images, `/var/lib/stallo` or the user, not even
     on purge. The steps below remove them by hand.
 
-**`stallo-gui`:** `packaging/build-deb.sh --gui` also builds
+**`stallo-gui`:** `packaging/build-gui-deb.sh` builds
 `target/deb/stallo-gui_<version>_amd64.deb`, the desktop app (an early
 preview). Building it needs `libgtk-4-dev`, `libadwaita-1-dev` and
 `pkg-config`. It holds
