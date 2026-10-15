@@ -1319,7 +1319,11 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "libadwaita",
+ "rustix",
+ "serde_json",
  "stallo",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
