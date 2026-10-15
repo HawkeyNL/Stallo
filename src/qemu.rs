@@ -67,7 +67,8 @@ pub fn argv(
     let network = match (vm.net, net_fd) {
         // No NIC means no link ever comes online, and Ubuntu's boot then
         // waits 2 minutes for systemd-networkd-wait-online. An empty
-        // `systemd.extra-unit.*` credential masks it (systemd >= 256).
+        // `systemd.extra-unit.*` credential masks it (systemd >= 256; for
+        // older systemd see the offline network-config in seed.rs).
         (NetProfile::Offline, None) => [
             "-nic none".to_owned(),
             format!(

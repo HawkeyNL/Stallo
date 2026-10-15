@@ -1,0 +1,41 @@
+# Ubuntu 24.04 LTS (Noble Numbat) server cloud image, amd64, qcow2, UEFI/GPT.
+id = "ubuntu-24.04"
+name = "Ubuntu 24.04 LTS server (cloud image)"
+os = "linux"
+firmware = "secure-boot"
+url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+max_size = 4_294_967_296
+
+trust = "signed-sums"
+sums_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+sig_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS.gpg"
+sums_format = "gnu"
+keyring = "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg"
+# "UEC Image Automatic Signing Key <cdimage@ubuntu.com>", which signs
+# SHA256SUMS of the current Ubuntu cloud images (checked 2026-10-15).
+signing_key = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
+
+# The guest agent is not in the cloud image, and offline guests have no apt.
+# These packages ship on the seed ISO and are installed with `dpkg -i`.
+#
+# Closure check (2026-10-15), qemu-guest-agent 1:8.2.2+ds-0ubuntu1.18:
+#   Depends: libc6, libglib2.0-0t64, libnuma1, libudev1, liburing2
+#   Pre-Depends: init-system-helpers
+#   liburing2              Depends: libc6
+# Against noble-server-cloudimg-amd64.manifest (sha256 cfe36676...9796eb):
+#   present: libc6, libglib2.0-0t64, libnuma1, libudev1, init-system-helpers
+#   missing: qemu-guest-agent, liburing2
+#
+# apt fetches them in a private root from these sources only, trusting only
+# the Ubuntu archive keyring. They are cached under
+# <data>/images/ubuntu-24.04.debs/ and not refreshed automatically. To pick
+# up guest-agent updates, delete that directory and run
+# `stallo images pull ubuntu-24.04`; existing VMs keep what they have.
+agent = "deb"
+debs = ["qemu-guest-agent", "liburing2"]
+deb_keyring = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+deb_sources = [
+    "https://archive.ubuntu.com/ubuntu noble main universe",
+    "https://archive.ubuntu.com/ubuntu noble-updates main universe",
+    "https://security.ubuntu.com/ubuntu noble-security main universe",
+]

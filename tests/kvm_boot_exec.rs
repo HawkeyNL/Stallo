@@ -1,4 +1,5 @@
-//! M0 gate: boot, exec, limits, graceful stop, clean removal, admission.
+//! M0 gate: boot, exec, files, limits, graceful stop, second boot, clean
+//! removal, admission.
 
 mod common;
 
@@ -21,7 +22,9 @@ fn boot_exec_stop_rm() {
 
     // Create, start, wait for the guest agent.
     let started = Instant::now();
-    let out = d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    let out = d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     let ready = started.elapsed();
     assert!(out.contains("ready in"), "{out}");
     eprintln!(
@@ -69,6 +72,20 @@ fn boot_exec_stop_rm() {
     let t = Instant::now();
     d.ok(&["exec", "dev", "--", "true"]);
     eprintln!("MEASURE exec true: {} ms", t.elapsed().as_millis());
+    // Offline: the guest sees no network device besides loopback.
+    assert_eq!(
+        d.ok(&["exec", "dev", "--", "ls", "/sys/class/net"]).trim(),
+        "lo"
+    );
+
+    // File round trip through the guest agent.
+    let src = d.base.join("blob");
+    let back = d.base.join("blob.back");
+    let blob: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    fs::write(&src, &blob).unwrap();
+    d.ok(&["cp", src.to_str().unwrap(), "dev:/home/agent/blob"]);
+    d.ok(&["cp", "dev:/home/agent/blob", back.to_str().unwrap()]);
+    assert_eq!(fs::read(&back).unwrap(), blob);
 
     // QEMU overhead: resident memory outside the guest RAM mapping.
     let (total_kib, guest_kib) = rss_split(qemu, 2048 << 10);
@@ -81,7 +98,9 @@ fn boot_exec_stop_rm() {
     );
 
     // Admission: a second VM does not fit the budget and leaves nothing.
-    let out = d.stallo(&["new", "two", "--cpus", "1", "--mem", "1G", "--disk", "10G"]);
+    let out = d.stallo(&[
+        "new", "two", "--image", &d.image, "--cpus", "1", "--mem", "1G", "--disk", "10G",
+    ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("budget"));
     assert!(!d.vm_dir("two").exists());
@@ -97,6 +116,20 @@ fn boot_exec_stop_rm() {
     assert!(d.ok(&["ls"]).contains("stopped"));
     assert!(!cg.exists());
     assert!(!d.vm_runtime("dev").exists());
+
+    // Second boot: ready again, and the file survived.
+    let t = Instant::now();
+    // `start` waits for the guest agent.
+    assert_eq!(d.ok(&["start", "dev"]).trim(), "dev  started");
+    eprintln!(
+        "MEASURE start (second boot) -> guest agent ready: {:.1} s",
+        t.elapsed().as_secs_f64()
+    );
+    d.assert_safe("dev");
+    fs::remove_file(&back).unwrap();
+    d.ok(&["cp", "dev:/home/agent/blob", back.to_str().unwrap()]);
+    assert_eq!(fs::read(&back).unwrap(), blob);
+    d.ok(&["stop", "dev"]);
 
     // Remove: no files, cgroups or sockets left.
     d.ok(&["rm", "dev", "--yes"]);
