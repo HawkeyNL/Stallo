@@ -39,7 +39,6 @@ fn plain_label(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .justify(gtk::Justification::Center)
         .css_classes(["dim-label"])
         .build()
