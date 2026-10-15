@@ -27,8 +27,16 @@ signing_key = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81"
 #   present: libc6, libglib2.0-0t64, libnuma1, libudev1, python3
 #   missing: qemu-guest-agent, liburing2, ubuntu-virt, ubuntu-helper-virt-hwe
 #
-# The packages are cached under <data>/images/debs/26.04/ and not refreshed
-# automatically. To pick up guest-agent updates, delete that directory and
-# run `stallo images pull ubuntu-26.04`; existing VMs keep what they have.
+# apt fetches them in a private root from these sources only, trusting only
+# the Ubuntu archive keyring. They are cached under
+# <data>/images/ubuntu-26.04.debs/ and not refreshed automatically. To pick
+# up guest-agent updates, delete that directory and run
+# `stallo images pull ubuntu-26.04`; existing VMs keep what they have.
 agent = "deb"
 debs = ["qemu-guest-agent", "liburing2", "ubuntu-virt", "ubuntu-helper-virt-hwe"]
+deb_keyring = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+deb_sources = [
+    "https://archive.ubuntu.com/ubuntu resolute main universe",
+    "https://archive.ubuntu.com/ubuntu resolute-updates main universe",
+    "https://security.ubuntu.com/ubuntu resolute-security main universe",
+]

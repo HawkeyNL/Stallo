@@ -161,7 +161,7 @@ impl Daemon {
         safe_remove(&run_root, &runtime).unwrap();
         let data = base.join("data");
         let images = data.join("images");
-        fs::create_dir_all(images.join("debs")).unwrap();
+        fs::create_dir_all(&images).unwrap();
         fs::write(data.join("stallod.toml"), config).unwrap();
 
         // Hard-link the cached image (free) and copy the debs (small).
@@ -173,9 +173,9 @@ impl Daemon {
             image.display()
         );
         fs::hard_link(&image, images.join("ubuntu-26.04.qcow2")).unwrap();
-        let debs = images.join("debs/26.04");
+        let debs = images.join("ubuntu-26.04.debs");
         fs::create_dir(&debs).unwrap();
-        for e in fs::read_dir(source.join("debs/26.04")).unwrap() {
+        for e in fs::read_dir(source.join("ubuntu-26.04.debs")).unwrap() {
             let e = e.unwrap();
             fs::copy(e.path(), debs.join(e.file_name())).unwrap();
         }

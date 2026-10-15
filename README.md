@@ -77,8 +77,8 @@ What the package installs, and how to remove it: [docs/production.md](docs/produ
 ## Requirements
 
 - Ubuntu 26.04 LTS on x86_64 with `/dev/kvm`; your user in group `kvm`.
-- `qemu-system-x86`, `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv` and
-  `ubuntu-cloudimage-keyring`.
+- `qemu-system-x86`, `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
+  `ubuntu-cloudimage-keyring` and `ubuntu-keyring`.
 - A Rust toolchain (pinned in `rust-toolchain.toml`).
 
 ## Development

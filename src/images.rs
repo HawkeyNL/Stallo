@@ -7,8 +7,11 @@
 //! with no backing file and no external data file. Cached images are
 //! read-only and never replaced, because VM disks are overlays on them.
 //!
-//! TLS and OpenPGP stay with `curl` and `gpgv`, which Ubuntu patches; every
-//! subprocess gets fixed arguments, never a shell.
+//! Guest-agent packages come from apt in a private root that trusts only the
+//! catalog's sources and keyring, never the host's apt configuration.
+//!
+//! TLS and OpenPGP stay with `curl`, `gpgv` and apt, which Ubuntu patches;
+//! every subprocess gets fixed arguments, never a shell.
 //!
 //! Callers serialise pulls (the daemon holds one lock for all of them).
 
@@ -58,6 +61,11 @@ pub struct CatalogEntry {
     /// Packages the guest needs for the guest agent but lacks (`deb`).
     #[serde(default)]
     pub debs: Vec<String>,
+    /// apt sources for `debs`: `<https uri> <suite> <components...>`.
+    #[serde(default)]
+    pub deb_sources: Vec<String>,
+    /// The only keyring apt trusts for `deb_sources`.
+    pub deb_keyring: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,13 +163,37 @@ impl CatalogEntry {
             ),
         }
         match self.agent {
-            Agent::Deb => ensure!(!self.debs.is_empty(), "{id}: agent \"deb\" needs debs"),
-            Agent::Preinstalled => {
-                ensure!(
-                    self.debs.is_empty(),
-                    "{id}: a preinstalled agent takes no debs"
-                )
-            }
+            Agent::Deb => ensure!(
+                !self.debs.is_empty() && !self.deb_sources.is_empty() && self.deb_keyring.is_some(),
+                "{id}: agent \"deb\" needs debs, deb_sources and deb_keyring"
+            ),
+            Agent::Preinstalled => ensure!(
+                self.debs.is_empty() && self.deb_sources.is_empty() && self.deb_keyring.is_none(),
+                "{id}: a preinstalled agent takes no debs, deb_sources or deb_keyring"
+            ),
+        }
+        // Both go into sources.list lines: no options, comments or breaks.
+        let plain = |w: &str| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|c| c.is_ascii_graphic() && !b"[]#".contains(&c))
+        };
+        for src in &self.deb_sources {
+            let words: Vec<&str> = src.split(' ').collect();
+            ensure!(
+                words.len() >= 3 && https(words[0]) && words.iter().all(|w| plain(w)),
+                "{id}: deb source {src:?} is not `<https uri> <suite> <components>`"
+            );
+        }
+        // `signed-by=` takes a comma-separated list: one keyring file only.
+        if let Some(k) = &self.deb_keyring {
+            ensure!(
+                k.starts_with('/')
+                    && plain(k)
+                    && !k.contains(',')
+                    && (k.ends_with(".gpg") || k.ends_with(".pgp")),
+                "{id}: deb_keyring must be one absolute .gpg or .pgp path"
+            );
         }
         // Package names become apt arguments: no options.
         for d in &self.debs {
@@ -226,19 +258,53 @@ pub fn image_path(paths: &Paths, id: &str) -> PathBuf {
     paths.images_dir().join(format!("{id}.qcow2"))
 }
 
-/// `<data>/images/debs/<release>/`, e.g. `26.04` for `ubuntu-26.04`.
+/// `<data>/images/<id>.debs/`.
 pub fn debs_dir(paths: &Paths, id: &str) -> PathBuf {
-    paths.images_dir().join("debs").join(release(id))
-}
-
-/// The Ubuntu release in an `ubuntu-<release>` id.
-fn release(id: &str) -> &str {
-    id.trim_start_matches("ubuntu-")
+    paths.images_dir().join(format!("{id}.debs"))
 }
 
 /// Whether the image and its guest-agent packages are cached.
 pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
     image_path(paths, &entry.id).is_file() && debs_dir(paths, &entry.id).is_dir()
+}
+
+/// Refuses an image that is not cached: agents create VMs only from
+/// images a human pulled.
+pub fn ensure_pulled(paths: &Paths, id: &str) -> Result<()> {
+    let entry = find(id)?;
+    ensure!(
+        is_cached(paths, &entry),
+        "image {id} not pulled; a human runs `stallo images pull {id}`"
+    );
+    Ok(())
+}
+
+/// Guest-agent packages that older versions cached per Ubuntu release
+/// (`debs/<release>/`). They came from the host's apt sources, so they are
+/// only a fallback for a host that cannot fetch new ones.
+///
+/// With `keep`, moves them to `<id>.debs/` and returns whether it did;
+/// otherwise deletes them. Either way drops an old partial download.
+fn old_debs(paths: &Paths, id: &str, keep: bool) -> Result<bool> {
+    let root = paths.images_dir();
+    let Some(release) = id.strip_prefix("ubuntu-") else {
+        return Ok(false);
+    };
+    if !root.is_dir() {
+        return Ok(false);
+    }
+    safe_remove(&root, &root.join(format!(".partial-debs-{release}")))?;
+    let old = root.join("debs").join(release);
+    let moved = keep && old.is_dir() && !debs_dir(paths, id).exists();
+    if moved {
+        fs::rename(&old, debs_dir(paths, id))?;
+    } else {
+        safe_remove(&root, &old)?;
+    }
+    fs::File::open(&root)?.sync_all()?;
+    // Goes only once it is empty.
+    let _ = fs::remove_dir(root.join("debs"));
+    Ok(moved)
 }
 
 /// Downloads and verifies whatever of `entry` is not cached yet.
@@ -248,8 +314,20 @@ pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
         pull_image(paths, entry).await?;
     }
     if !debs_dir(paths, &entry.id).is_dir() {
-        pull_debs(paths, entry).await?;
+        // An older cache is used only when fresh packages cannot be
+        // fetched (no network): it is no worse than before the upgrade.
+        if let Err(e) = pull_debs(paths, entry).await {
+            if !old_debs(paths, &entry.id, true)? {
+                return Err(e);
+            }
+            tracing::warn!(
+                "{}: using guest-agent packages cached by an older version: {e:#}",
+                entry.id
+            );
+            return Ok(());
+        }
     }
+    old_debs(paths, &entry.id, false)?;
     Ok(())
 }
 
@@ -303,34 +381,41 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     Ok(())
 }
 
-/// `apt-get download` checks every package against the host's signed apt
-/// indexes; no root is needed. This only fits because guest and host run
-/// the same Ubuntu release.
+/// Downloads `debs` with apt in a private root (see [`apt_root`]). apt
+/// checks every package against the signed indexes; no root is needed.
 async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
-    let release = release(&entry.id);
-    let host = host_release(&fs::read_to_string("/etc/os-release")?);
-    ensure!(
-        host.as_deref() == Some(release),
-        "guest-agent packages for {} can only be fetched on an Ubuntu {release} host",
-        entry.id,
-    );
     let root = paths.images_dir();
-    let final_dir = debs_dir(paths, &entry.id);
-    let work = root.join(format!(".partial-debs-{release}"));
+    let work = root.join(format!(".partial-debs-{}", entry.id));
     safe_remove(&root, &work)?;
-    ensure_private_dir(&work)?;
+    let result = fetch_debs(paths, entry, &work).await;
+    // apt's indexes take about 90 MB: never leave them behind.
+    safe_remove(&root, &work)?;
+    result
+}
+
+async fn fetch_debs(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<()> {
+    ensure_private_dir(work)?;
+    let conf = apt_root(work, entry)?;
+    let debs = work.join("debs");
+    let apt = |args: Vec<String>| {
+        let mut cmd = Command::new("apt-get");
+        cmd.env("APT_CONFIG", &conf)
+            .arg("-q")
+            .args(args)
+            .current_dir(&debs);
+        async move { run_tool(&mut cmd, Duration::from_secs(600)).await }
+    };
+    apt(vec!["update".into()])
+        .await
+        .context("apt-get update for the guest-agent packages failed")?;
     // The guest image is amd64, whatever the host architecture.
-    run_tool(
-        Command::new("apt-get")
-            .arg("download")
-            .args(entry.debs.iter().map(|d| format!("{d}:amd64")))
-            .current_dir(&work),
-        Duration::from_secs(600),
-    )
-    .await
-    .context("apt-get download of the guest-agent packages failed")?;
+    let mut args = vec!["download".to_owned()];
+    args.extend(entry.debs.iter().map(|d| format!("{d}:amd64")));
+    apt(args)
+        .await
+        .context("apt-get download of the guest-agent packages failed")?;
     for pkg in &entry.debs {
-        let found = fs::read_dir(&work)?
+        let found = fs::read_dir(&debs)?
             .filter_map(|e| e.ok())
             .filter(|e| {
                 e.file_name()
@@ -340,9 +425,59 @@ async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
             .count();
         ensure!(found == 1, "expected one .deb for {pkg}, found {found}");
     }
-    ensure_private_dir(final_dir.parent().unwrap())?;
-    fs::rename(&work, &final_dir)?;
+    // A cached directory is trusted as is, so it must be complete on disk
+    // before it gets its name.
+    for e in fs::read_dir(&debs)? {
+        fs::File::open(e?.path())?.sync_all()?;
+    }
+    fs::File::open(&debs)?.sync_all()?;
+    let root = paths.images_dir();
+    fs::rename(&debs, debs_dir(paths, &entry.id))?;
+    fs::File::open(&root)?.sync_all()?;
     Ok(())
+}
+
+/// Lays out a private apt root in `dir` and returns its config file, for
+/// `APT_CONFIG`. Every path apt uses then resolves inside `dir`: the host's
+/// `apt.conf.d`, sources, preferences, keyrings and package state are never
+/// read, and only `deb_keyring` is trusted for the catalog's sources.
+fn apt_root(dir: &Path, entry: &CatalogEntry) -> Result<PathBuf> {
+    let d = dir.to_str().context("data path is not UTF-8")?;
+    ensure!(
+        !d.contains(['"', '\n']),
+        "data path {d:?} cannot go into an apt config"
+    );
+    for sub in [
+        "etc/apt/apt.conf.d",
+        "etc/apt/preferences.d",
+        "var/lib/apt/lists/partial",
+        "debs",
+    ] {
+        ensure_private_dir(&dir.join(sub))?;
+    }
+    let keyring = entry.deb_keyring.as_deref().context("no deb_keyring")?;
+    let sources: String = entry
+        .deb_sources
+        .iter()
+        .map(|s| format!("deb [arch=amd64 signed-by={keyring}] {s}\n"))
+        .collect();
+    fs::write(dir.join("etc/apt/sources.list"), sources)?;
+    // Relative paths resolve under `Dir`. The status file is the only
+    // absolute default that matters: no host package state. An index that
+    // fails to download is an error, not a fallback to older packages.
+    let conf = dir.join("apt.conf");
+    fs::write(
+        &conf,
+        format!(
+            "Dir \"{d}/\";\n\
+             Dir::State::status \"/dev/null\";\n\
+             APT::Architecture \"amd64\";\n\
+             APT::Architectures {{ \"amd64\"; }};\n\
+             Acquire::Languages \"none\";\n\
+             APT::Update::Error-Mode \"any\";\n"
+        ),
+    )?;
+    Ok(conf)
 }
 
 /// Fetches `url` over HTTPS only (redirects included), with a size cap and
@@ -491,20 +626,6 @@ fn check_image_info(info: &Value) -> Result<ImageInfo> {
     Ok(ImageInfo { virtual_size })
 }
 
-/// `VERSION_ID` from `/etc/os-release`, if this is Ubuntu.
-fn host_release(os_release: &str) -> Option<String> {
-    let field = |key: &str| {
-        os_release.lines().find_map(|l| {
-            l.strip_prefix(key)
-                .and_then(|v| v.strip_prefix('='))
-                .map(|v| v.trim_matches('"').to_owned())
-        })
-    };
-    (field("ID").as_deref() == Some("ubuntu"))
-        .then(|| field("VERSION_ID"))
-        .flatten()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,20 +640,20 @@ mod tests {
         assert!(find("../x").is_err());
     }
 
-    /// The built-in entry with `edit` applied to its TOML lines.
+    /// The built-in entry with `edit` applied: a TOML value sets a key,
+    /// `None` removes it.
     fn entry_with(edit: &[(&str, Option<&str>)]) -> Result<CatalogEntry> {
-        let mut lines: Vec<String> = CATALOG[0]
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(str::to_owned)
-            .collect();
+        let mut t: toml::Table = toml::from_str(CATALOG[0])?;
         for &(key, value) in edit {
-            lines.retain(|l| !l.starts_with(&format!("{key} =")));
-            if let Some(v) = value {
-                lines.push(format!("{key} = {v}"));
-            }
+            match value {
+                Some(v) => t.insert(
+                    key.into(),
+                    toml::from_str::<toml::Table>(&format!("v = {v}"))?["v"].clone(),
+                ),
+                None => t.remove(key),
+            };
         }
-        let entry: CatalogEntry = toml::from_str(&lines.join("\n"))?;
+        let entry: CatalogEntry = t.try_into()?;
         entry.validate()?;
         Ok(entry)
     }
@@ -569,8 +690,45 @@ mod tests {
         assert!(err(&[("sha512", Some(r#""a""#))]).contains("signed-sums needs"));
         // deb: packages required, and no options among them.
         assert!(err(&[("debs", Some("[]"))]).contains("needs debs"));
+        for k in ["deb_sources", "deb_keyring"] {
+            assert!(err(&[(k, None)]).contains("needs debs"), "{k}");
+        }
+        for bad in [
+            "http://archive.ubuntu.com/ubuntu resolute main",
+            "https://archive.ubuntu.com/ubuntu resolute",
+            "[trusted=yes] https://archive.ubuntu.com/ubuntu resolute main",
+            "https://archive.ubuntu.com/ubuntu resolute main\ndeb https://x y z",
+            "https://archive.ubuntu.com/ubuntu  resolute main",
+        ] {
+            let v = format!("[{bad:?}]");
+            assert!(
+                err(&[("deb_sources", Some(&v))]).contains("deb source"),
+                "{bad}"
+            );
+        }
+        for bad in [
+            "ubuntu-archive-keyring.gpg",
+            "/k.gpg] https://x y z",
+            "/usr/share/keyrings/ubuntu-archive-keyring.gpg,/tmp/evil.gpg",
+            "/usr/share/keyrings/ubuntu-archive-keyring.gpg,0123456789ABCDEF0123456789ABCDEF01234567.gpg",
+            "/usr/share/keyrings",
+        ] {
+            let v = format!("{bad:?}");
+            assert!(
+                err(&[("deb_keyring", Some(&v))]).contains("absolute"),
+                "{bad}"
+            );
+        }
         assert!(err(&[("debs", Some(r#"["-o"]"#))]).contains("package name"));
         assert!(err(&[("agent", Some(r#""preinstalled""#))]).contains("no debs"));
+        let bare = [
+            ("agent", Some(r#""preinstalled""#)),
+            ("debs", None),
+            ("deb_sources", None),
+            ("deb_keyring", None),
+        ];
+        assert!(err(&bare).contains("not supported yet"));
+        assert!(err(&bare[..3]).contains("no debs"));
         // HTTPS only.
         assert!(err(&[("url", Some(r#""http://example.com/a.img""#))]).contains("https"));
         assert!(err(&[("sums_url", Some(r#""ftp://example.com/S""#))]).contains("https"));
@@ -695,11 +853,167 @@ mod tests {
         assert!(verify_signature(kr, &fpr, &sig, &data).await.is_err());
     }
 
+    /// The private apt root, checked offline with apt itself: every path
+    /// resolves inside it, and apt sees the catalog's sources with the
+    /// pinned keyring and nothing of the host's (which may have PPAs).
     #[test]
-    fn os_release() {
-        let text = "PRETTY_NAME=\"Ubuntu 26.04.1 LTS\"\nVERSION_ID=\"26.04\"\nID=ubuntu\n";
-        assert_eq!(host_release(text).as_deref(), Some("26.04"));
-        assert_eq!(host_release("ID=debian\nVERSION_ID=\"13\"\n"), None);
+    fn apt_root_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = find("ubuntu-26.04").unwrap();
+        let conf = apt_root(dir.path(), &entry).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .env("APT_CONFIG", &conf)
+                .current_dir(dir.path().join("debs"))
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (
+                String::from_utf8(out.stdout).unwrap(),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            assert!(
+                out.status.success() && stderr.is_empty(),
+                "{args:?}: {stderr}"
+            );
+            stdout
+        };
+        let d = dir.path().to_str().unwrap();
+        for key in [
+            "Dir::Etc::parts/d",
+            "Dir::Etc::main/f",
+            "Dir::Etc::sourcelist/f",
+            "Dir::Etc::sourceparts/d",
+            "Dir::Etc::preferences/f",
+            "Dir::Etc::preferencesparts/d",
+            "Dir::Etc::trustedparts/d",
+            "Dir::Etc::netrc/f",
+            "Dir::Etc::netrcparts/d",
+            "Dir::State::lists/d",
+            "Dir::Cache::archives/d",
+            "Dir::Log/d",
+        ] {
+            let v = run(&["apt-config", "shell", "V", key]);
+            assert!(v.starts_with(&format!("V='{d}/")), "{key}: {v}");
+        }
+        for (key, want) in [
+            ("Dir::State::status/f", "/dev/null"),
+            ("APT::Architecture", "amd64"),
+            ("APT::Update::Error-Mode", "any"),
+        ] {
+            let v = run(&["apt-config", "shell", "V", key]);
+            assert_eq!(v, format!("V='{want}'\n"), "{key}");
+        }
+        let targets = run(&[
+            "apt-get",
+            "indextargets",
+            "--no-release-info",
+            "--format",
+            "$(SITE) $(RELEASE) $(COMPONENT)",
+            "Identifier: Packages",
+        ]);
+        let mut targets: Vec<&str> = targets.lines().collect();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(
+            targets,
+            [
+                "https://archive.ubuntu.com/ubuntu resolute main",
+                "https://archive.ubuntu.com/ubuntu resolute universe",
+                "https://archive.ubuntu.com/ubuntu resolute-updates main",
+                "https://archive.ubuntu.com/ubuntu resolute-updates universe",
+                "https://security.ubuntu.com/ubuntu resolute-security main",
+                "https://security.ubuntu.com/ubuntu resolute-security universe",
+            ]
+        );
+        let sources = fs::read_to_string(dir.path().join("etc/apt/sources.list")).unwrap();
+        assert_eq!(sources.lines().count(), 3);
+        assert!(sources.lines().all(|l| l.starts_with(
+            "deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://"
+        )));
+    }
+
+    /// Packages cached by older versions are moved only as a fallback
+    /// (`keep`), and deleted otherwise.
+    #[test]
+    fn old_debs_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        assert!(!old_debs(&paths, "ubuntu-26.04", true).unwrap());
+
+        let images = paths.images_dir();
+        let old_cache = || {
+            ensure_private_dir(&images.join("debs/26.04")).unwrap();
+            fs::write(images.join("debs/26.04/a_1_amd64.deb"), b"x").unwrap();
+            ensure_private_dir(&images.join(".partial-debs-26.04/x")).unwrap();
+        };
+        // Fresh packages fetched: the old ones go.
+        old_cache();
+        assert!(!old_debs(&paths, "ubuntu-26.04", false).unwrap());
+        assert!(!images.join("debs").exists());
+        assert!(!images.join(".partial-debs-26.04").exists());
+
+        // No network: the old ones move into place.
+        old_cache();
+        assert!(old_debs(&paths, "ubuntu-26.04", true).unwrap());
+        let new = debs_dir(&paths, "ubuntu-26.04");
+        assert!(new.join("a_1_amd64.deb").is_file());
+        assert!(!images.join("debs").exists());
+        assert!(!images.join(".partial-debs-26.04").exists());
+
+        // An existing new cache is never replaced.
+        old_cache();
+        assert!(!old_debs(&paths, "ubuntu-26.04", true).unwrap());
+        assert!(!images.join("debs").exists());
+        assert!(new.join("a_1_amd64.deb").is_file());
+    }
+
+    /// Agents get a clear refusal for images that are not pulled; an old
+    /// cache counts only after a human pull moved it.
+    #[test]
+    fn agents_need_pulled_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let err = format!("{:#}", ensure_pulled(&paths, "ubuntu-26.04").unwrap_err());
+        assert!(
+            err.contains("not pulled; a human runs `stallo images pull ubuntu-26.04`"),
+            "{err}"
+        );
+        assert!(ensure_pulled(&paths, "debian-13").is_err());
+        let images = paths.images_dir();
+        ensure_private_dir(&images.join("debs/26.04")).unwrap();
+        fs::write(image_path(&paths, "ubuntu-26.04"), b"").unwrap();
+        assert!(ensure_pulled(&paths, "ubuntu-26.04").is_err());
+        ensure_private_dir(&debs_dir(&paths, "ubuntu-26.04")).unwrap();
+        ensure_pulled(&paths, "ubuntu-26.04").unwrap();
+    }
+
+    /// Fetches the guest-agent packages for real (network, about 20 MB of
+    /// indexes): `cargo test -- --ignored debs_live`.
+    #[tokio::test]
+    #[ignore = "downloads from the Ubuntu archive"]
+    async fn debs_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        ensure_private_dir(&paths.images_dir()).unwrap();
+        let entry = find("ubuntu-26.04").unwrap();
+        pull_debs(&paths, &entry).await.unwrap();
+        let names: Vec<String> = fs::read_dir(debs_dir(&paths, &entry.id))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), entry.debs.len(), "{names:?}");
+        // Only the debs are kept, not apt's indexes.
+        assert_eq!(fs::read_dir(paths.images_dir()).unwrap().count(), 1);
+        // A keyring that did not sign the archive: nothing is fetched.
+        let mut wrong = entry.clone();
+        wrong.id = "wrong-key".into();
+        wrong.deb_keyring = Some("/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg".into());
+        let err = pull_debs(&paths, &wrong).await.unwrap_err();
+        assert!(format!("{err:#}").contains("apt-get update"), "{err:#}");
+        assert!(!debs_dir(&paths, "wrong-key").exists());
+        // Nor are apt's indexes left behind.
+        assert!(!paths.images_dir().join(".partial-debs-wrong-key").exists());
     }
 
     /// S5: needs `qemu-img` (no VM is started).
