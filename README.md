@@ -7,7 +7,62 @@ full control of a VM over MCP: screen, keyboard, mouse, commands, files and
 snapshots. Security and performance come first; guests are treated as
 hostile.
 
-Status: early development. Ubuntu 26.04 LTS hosts only.
+> **Alpha.** Stallo is early alpha software: expect bugs and breaking
+> changes, and do not use it for anything you cannot afford to lose.
+> Ubuntu 26.04 LTS on x86_64 only.
+
+## Install
+
+You need Ubuntu 26.04 LTS on x86_64 with hardware virtualisation (KVM)
+turned on in the firmware. Add the signed APT repository and install the
+package:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/stallo.asc https://hawkeynl.github.io/Stallo/stallo.asc
+gpg --show-keys /etc/apt/keyrings/stallo.asc
+```
+
+Check that the fingerprint `gpg` prints is
+`9C7434157F7D36A0E9B7A2000F3A4FCAC86F5A22`. If it differs, stop and
+remove the file. Then:
+
+```sh
+sudo tee /etc/apt/sources.list.d/stallo.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://hawkeynl.github.io/Stallo/
+Suites: edge
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/stallo.asc
+EOF
+sudo apt update && sudo apt install stallo
+```
+
+- `edge` gets a new build on every change to `main`. There is no `stable`
+  release yet.
+- Update with `sudo apt update && sudo apt upgrade`. An upgrade restarts
+  the daemon, and that **stops every running VM**.
+
+The package creates the system user `stallo` and starts `stallod`. To use
+the `stallo` command, add yourself to group `stallo` and log out and in
+again. Every member of this group has full control over all VMs, so add
+only trusted users.
+
+```sh
+sudo usermod -aG stallo "$USER"
+```
+
+Your first VM:
+
+```sh
+stallo images pull ubuntu-26.04
+stallo new dev
+stallo exec dev -- uname -a
+stallo ls
+```
+
+What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 
 ## How it fits together
 
