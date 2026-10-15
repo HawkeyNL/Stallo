@@ -202,7 +202,6 @@ review fix, passed **all 147 checks** on a fresh lab VM.
 | S18: `systemd-analyze security stallod` | **2.3** (≤ 2.5) |
 | The daemon: uid `stallo`, no capabilities, `NoNewPrivs`, delegated `cpu memory pids`, its own cgroup namespace | PASS |
 | A restart and a reload of `nftables.service` (which flush the ruleset) load the Stallo table again | PASS |
-| Guest-agent packages pulled under the unit (`apt-get download` as `stallo`) | PASS |
 | S1: no TCP or UDP socket of `stallod` | PASS |
 | S2: `api.sock` `0660` and `/run/stallo` `0750`; a supplementary member of `stallo` uses the API; a non-member is refused by the file permissions, and, given access through an ACL, by the daemon's group check (logged); the CLI picks the production socket | PASS |
 | S3: per-VM runtime dir `0700`; a group member cannot connect to QMP; data dir `0700` | PASS |
@@ -240,15 +239,17 @@ review fix, passed **all 147 checks** on a fresh lab VM.
 
 - **The image download** (`curl` to cloud-images.ubuntu.com) under the
   unit: the lab is offline.
-  - The guest-agent packages come from apt in a private root under
-    `/var/lib/stallo/images/` (HTTPS to archive.ubuntu.com and
-    security.ubuntu.com, only the Ubuntu archive key trusted). It writes
-    nowhere else and needs no root, but it has not run under the unit yet;
-    the lab gate only seeds the packages. Check it once on the host with
-    `stallo images pull ubuntu-26.04` after removing
-    `/var/lib/stallo/images/ubuntu-26.04.debs`.
-  - DNS for both goes through `127.0.0.53`, which the table allows for
-    the daemon.
+  - DNS for it and the package pull goes through `127.0.0.53`, which
+    the table allows for the daemon.
+- **The guest-agent package pull under the unit.** The packages come
+  from apt in a private root under `/var/lib/stallo/images/` (HTTPS to
+  archive.ubuntu.com and security.ubuntu.com, only the Ubuntu archive key
+  trusted); it writes nowhere else and needs no root. The earlier gate
+  pulled them with the host's apt; the offline lab cannot reach the
+  archive, so the gate now only seeds them. Owner step: on an
+  internet-connected host, with `stallod.service` running, remove
+  `/var/lib/stallo/images/ubuntu-26.04.debs` (if there) and run
+  `stallo images pull ubuntu-26.04` once.
 - **A reboot of a host with the package installed.** The units are
   enabled, and the lab was not rebooted after the install.
 

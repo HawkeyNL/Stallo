@@ -185,10 +185,14 @@ impl CatalogEntry {
                 "{id}: deb source {src:?} is not `<https uri> <suite> <components>`"
             );
         }
+        // `signed-by=` takes a comma-separated list: one keyring file only.
         if let Some(k) = &self.deb_keyring {
             ensure!(
-                k.starts_with('/') && plain(k),
-                "{id}: deb_keyring must be an absolute path"
+                k.starts_with('/')
+                    && plain(k)
+                    && !k.contains(',')
+                    && (k.ends_with(".gpg") || k.ends_with(".pgp")),
+                "{id}: deb_keyring must be one absolute .gpg or .pgp path"
             );
         }
         // Package names become apt arguments: no options.
@@ -264,9 +268,32 @@ pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
     image_path(paths, &entry.id).is_file() && debs_dir(paths, &entry.id).is_dir()
 }
 
+/// Moves guest-agent packages that older versions cached per Ubuntu
+/// release (`debs/<release>/`) to `<id>.debs/`, so a host without
+/// network keeps working, and drops an old partial download.
+fn migrate_debs(paths: &Paths, id: &str) -> Result<()> {
+    let root = paths.images_dir();
+    let Some(release) = id.strip_prefix("ubuntu-") else {
+        return Ok(());
+    };
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let old = root.join("debs").join(release);
+    if old.is_dir() && !debs_dir(paths, id).exists() {
+        fs::rename(&old, debs_dir(paths, id))?;
+        fs::File::open(&root)?.sync_all()?;
+        // Goes only once it is empty.
+        let _ = fs::remove_dir(root.join("debs"));
+    }
+    safe_remove(&root, &root.join(format!(".partial-debs-{release}")))?;
+    Ok(())
+}
+
 /// Downloads and verifies whatever of `entry` is not cached yet.
 pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     ensure_private_dir(&paths.images_dir())?;
+    migrate_debs(paths, &entry.id)?;
     if !image_path(paths, &entry.id).is_file() {
         pull_image(paths, entry).await?;
     }
@@ -332,8 +359,15 @@ async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     let root = paths.images_dir();
     let work = root.join(format!(".partial-debs-{}", entry.id));
     safe_remove(&root, &work)?;
-    ensure_private_dir(&work)?;
-    let conf = apt_root(&work, entry)?;
+    let result = fetch_debs(paths, entry, &work).await;
+    // apt's indexes take about 90 MB: never leave them behind.
+    safe_remove(&root, &work)?;
+    result
+}
+
+async fn fetch_debs(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<()> {
+    ensure_private_dir(work)?;
+    let conf = apt_root(work, entry)?;
     let debs = work.join("debs");
     let apt = |args: Vec<String>| {
         let mut cmd = Command::new("apt-get");
@@ -363,8 +397,15 @@ async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
             .count();
         ensure!(found == 1, "expected one .deb for {pkg}, found {found}");
     }
+    // A cached directory is trusted as is, so it must be complete on disk
+    // before it gets its name.
+    for e in fs::read_dir(&debs)? {
+        fs::File::open(e?.path())?.sync_all()?;
+    }
+    fs::File::open(&debs)?.sync_all()?;
+    let root = paths.images_dir();
     fs::rename(&debs, debs_dir(paths, &entry.id))?;
-    safe_remove(&root, &work)?;
+    fs::File::open(&root)?.sync_all()?;
     Ok(())
 }
 
@@ -637,7 +678,13 @@ mod tests {
                 "{bad}"
             );
         }
-        for bad in ["ubuntu-archive-keyring.gpg", "/k.gpg] https://x y z"] {
+        for bad in [
+            "ubuntu-archive-keyring.gpg",
+            "/k.gpg] https://x y z",
+            "/usr/share/keyrings/ubuntu-archive-keyring.gpg,/tmp/evil.gpg",
+            "/usr/share/keyrings/ubuntu-archive-keyring.gpg,0123456789ABCDEF0123456789ABCDEF01234567.gpg",
+            "/usr/share/keyrings",
+        ] {
             let v = format!("{bad:?}");
             assert!(
                 err(&[("deb_keyring", Some(&v))]).contains("absolute"),
@@ -858,6 +905,30 @@ mod tests {
         )));
     }
 
+    /// Packages cached by older versions move to `<id>.debs/`.
+    #[test]
+    fn old_debs_cache_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        migrate_debs(&paths, "ubuntu-26.04").unwrap();
+
+        let images = paths.images_dir();
+        ensure_private_dir(&images.join("debs/26.04")).unwrap();
+        fs::write(images.join("debs/26.04/a_1_amd64.deb"), b"x").unwrap();
+        ensure_private_dir(&images.join(".partial-debs-26.04/x")).unwrap();
+        migrate_debs(&paths, "ubuntu-26.04").unwrap();
+        let new = debs_dir(&paths, "ubuntu-26.04");
+        assert!(new.join("a_1_amd64.deb").is_file());
+        assert!(!images.join("debs").exists());
+        assert!(!images.join(".partial-debs-26.04").exists());
+
+        // A newer cache wins; the old one stays untouched.
+        ensure_private_dir(&images.join("debs/26.04")).unwrap();
+        migrate_debs(&paths, "ubuntu-26.04").unwrap();
+        assert!(images.join("debs/26.04").is_dir());
+        assert!(new.join("a_1_amd64.deb").is_file());
+    }
+
     /// Fetches the guest-agent packages for real (network, about 20 MB of
     /// indexes): `cargo test -- --ignored debs_live`.
     #[tokio::test]
@@ -882,6 +953,8 @@ mod tests {
         let err = pull_debs(&paths, &wrong).await.unwrap_err();
         assert!(format!("{err:#}").contains("apt-get update"), "{err:#}");
         assert!(!debs_dir(&paths, "wrong-key").exists());
+        // Nor are apt's indexes left behind.
+        assert!(!paths.images_dir().join(".partial-debs-wrong-key").exists());
     }
 
     /// S5: needs `qemu-img` (no VM is started).
