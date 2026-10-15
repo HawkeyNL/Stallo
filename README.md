@@ -156,8 +156,10 @@ in [docs/network-verification.md](docs/network-verification.md).
 
 `packaging/build-deb.sh` builds a `.deb`. It installs `stallod.service`
 (user `stallo`, hardened: `systemd-analyze security` 2.3) and the network
-table with its loader unit. Members of group `stallo` use the API socket
-`/run/stallo/api.sock`, which the CLI picks by default when it exists.
+table with its loader unit; with `--gui` it also builds `stallo-gui`, the
+desktop app (an early preview). Members of group `stallo` use the API
+socket `/run/stallo/api.sock`, which the CLI picks by default when it
+exists.
 Install steps, rollback and the lab gate are in
 [docs/production.md](docs/production.md).
 

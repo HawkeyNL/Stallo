@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hawkeynl.Stallo</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>Stallo</name>
+  <summary>Manage your virtual machines</summary>
+  <description>
+    <p>
+      Stallo runs QEMU/KVM virtual machines on Ubuntu for people and for AI
+      agents. This app is its desktop front end; it talks to the Stallo
+      daemon on this computer.
+    </p>
+    <p>This is an early preview: it opens an empty window.</p>
+  </description>
+  <developer id="io.github.hawkeynl">
+    <name>HawkeyNL</name>
+  </developer>
+  <launchable type="desktop-id">io.github.hawkeynl.Stallo.desktop</launchable>
+  <url type="homepage">https://github.com/HawkeyNL/Stallo</url>
+  <provides>
+    <binary>stallo-gui</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>

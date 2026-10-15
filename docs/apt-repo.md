@@ -6,7 +6,10 @@ Stallo is published as a signed APT repository on GitHub Pages:
 | Channel | Published | Version | Kept |
 |---|---|---|---|
 | `stable` | on a tag `v<major>.<minor>.<patch>` | the tag; it must equal `version` in `Cargo.toml` | all |
-| `edge` | on every push to `main` | `<Cargo.toml version>~git<UTC yyyymmddHHMMSS>.<sha7>` | the last 10 |
+| `edge` | on every push to `main` | `<Cargo.toml version>~git<UTC yyyymmddHHMMSS>.<sha7>` | the last 10 per package |
+
+Each build publishes two packages with the same version: `stallo` (the
+daemon and CLI) and `stallo-gui` (the desktop app).
 
 An edge build sorts after every earlier edge build and before the release of
 the version in `Cargo.toml`. So `Cargo.toml` holds the **next** version:
@@ -17,13 +20,15 @@ release.
 
 `.github/workflows/apt-publish.yml`, on the `ubuntu-26.04` runner:
 
-1. **build:** builds the `.deb` with `packaging/build-deb.sh`. This job
+1. **build:** installs the GTK and libadwaita dev packages and builds both
+   `.deb` files with `packaging/build-deb.sh --gui`. This job
    runs the crates' build scripts, so it never gets the signing key.
    - An edge run whose commit is no longer the tip of `main` (a re-run of an
      old run) fails, so an older build can never become the newest one.
 2. **repo:** on a fresh runner that checks out only `packaging/apt-repo.sh`,
    takes the `.deb` files in `pool/` from the current `gh-pages` branch,
-   adds the new one, drops edge builds beyond the last 10, and rebuilds and
+   adds the new ones, drops edge builds beyond the last 10 of each
+   package, and rebuilds and
    signs every index (`apt-ftparchive`). Everything else is rebuilt each
    time: `dists/{stable,edge}` (`Packages`, `Packages.gz`, `Release`,
    `InRelease`, `Release.gpg`, `by-hash/`), `stallo.asc` (the public key),
@@ -34,7 +39,8 @@ release.
      into a throwaway `GNUPGHOME` that the step deletes when it ends.
      **Without the secret the run fails**; it never publishes an unsigned
      repository.
-   - `pool/` on `gh-pages` may hold only `stallo_*_amd64.deb` files in
+   - `pool/` on `gh-pages` may hold only `stallo_*_amd64.deb` and
+     `stallo-gui_*_amd64.deb` files in
      `stable/` and `edge/`; anything else (a symlink, another file) fails
      the run instead of being signed.
    - A stable version that is already published is refused: its checksum
@@ -46,9 +52,9 @@ release.
 3. **verify:** a clean `ubuntu:26.04` container adds the new tree as a
    `file:` source with `Signed-By: stallo.asc`, and runs
    `apt-get update --error-on=any` (signatures) and
-   `apt-get install --dry-run stallo=<version>` (dependencies resolve
-   against the Ubuntu archive), then downloads the `.deb` (its checksum
-   against the signed index).
+   `apt-get install --dry-run stallo=<version> stallo-gui=<version>`
+   (dependencies resolve against the Ubuntu archive), then downloads both
+   `.deb` files (their checksums against the signed index).
 4. **publish:** commits the tree as one orphan commit and force-pushes it to
    `gh-pages` (with a lease on the commit the repo job read), so the branch
    never grows. GitHub Pages serves the branch.

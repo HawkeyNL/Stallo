@@ -72,15 +72,18 @@ jobs:
           echo "channel=$channel" >>"$GITHUB_OUTPUT"
           echo "version=$version" >>"$GITHUB_OUTPUT"
           echo "Building stallo $version for $channel"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev pkg-config
       # rust-toolchain.toml selects the pinned toolchain.
-      - name: Build the package
+      - name: Build the packages
         env:
           STALLO_DEB_VERSION: ${{ steps.version.outputs.version }}
-        run: packaging/build-deb.sh
+        run: packaging/build-deb.sh --gui
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deb
-          path: target/deb/stallo_${{ steps.version.outputs.version }}_amd64.deb
+          path: |
+            target/deb/stallo_${{ steps.version.outputs.version }}_amd64.deb
+            target/deb/stallo-gui_${{ steps.version.outputs.version }}_amd64.deb
           retention-days: 3
           if-no-files-found: error
 
@@ -148,7 +151,8 @@ jobs:
             gpg --batch --quiet --passphrase '' --quick-gen-key "Stallo CI throwaway key" ed25519 sign 1d
           fi
           unset KEY PASSPHRASE
-          packaging/apt-repo.sh "$RUNNER_TEMP/site" "$CHANNEL" "$RUNNER_TEMP/deb/stallo_${VERSION}_amd64.deb"
+          packaging/apt-repo.sh "$RUNNER_TEMP/site" "$CHANNEL" \
+            "$RUNNER_TEMP/deb/stallo_${VERSION}_amd64.deb" "$RUNNER_TEMP/deb/stallo-gui_${VERSION}_amd64.deb"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: site
@@ -157,8 +161,8 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-  # A clean Ubuntu 26.04 must accept the signatures, resolve the package
-  # with its dependencies and download it before anything is published.
+  # A clean Ubuntu 26.04 must accept the signatures, resolve the packages
+  # with their dependencies and download them before anything is published.
   verify:
     needs: [build, repo]
     runs-on: ubuntu-26.04
@@ -183,9 +187,9 @@ jobs:
           Signed-By: /srv/stallo/stallo.asc
           EOF
           apt-get update --error-on=any
-          apt-get install --dry-run "stallo=$VERSION"
-          # Checks the .deb against the signed index.
-          cd /tmp && apt-get download "stallo=$VERSION"
+          apt-get install --dry-run "stallo=$VERSION" "stallo-gui=$VERSION"
+          # Checks the .debs against the signed index.
+          cd /tmp && apt-get download "stallo=$VERSION" "stallo-gui=$VERSION"
 
   publish:
     needs: [build, repo, verify]

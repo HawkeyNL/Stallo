@@ -1,20 +1,30 @@
 #!/bin/sh
-# Adds a .deb to the APT repository in <site> (a copy of the gh-pages tree),
-# rebuilds every index and signs them with the only secret key in
-# $GNUPGHOME. Only the .deb files in pool/ and the previous indexes (as
-# by-hash files) are carried over; everything else is rebuilt.
+# Adds .deb files (stallo, stallo-gui) to the APT repository in <site> (a
+# copy of the gh-pages tree), rebuilds every index and signs them with the
+# only secret key in $GNUPGHOME. Only the .deb files in pool/ and the
+# previous indexes (as by-hash files) are carried over; everything else is
+# rebuilt.
 # Needs apt-ftparchive (apt-utils), gpg and GNU coreutils/findutils.
-# Usage: apt-repo.sh <site> <stable|edge> <deb>
+# Usage: apt-repo.sh <site> <stable|edge> <deb>...
 set -eu
-site=$1 channel=$2 deb=$(realpath "$3")
+[ $# -ge 3 ] || { echo "usage: $0 <site> <stable|edge> <deb>..." >&2 && exit 2; }
+site=$1 channel=$2
+shift 2
 keep_edge=10
 url=https://hawkeynl.github.io/Stallo/
-deb_name='stallo_[0-9][0-9A-Za-z.+~-]*_amd64\.deb'
+deb_name='stallo(-gui)?_[0-9][0-9A-Za-z.+~-]*_amd64\.deb'
 
 case $channel in stable | edge) ;; *) echo "channel must be stable or edge" >&2 && exit 2 ;; esac
 [ "$(gpg --batch --list-secret-keys --with-colons | grep -c '^sec:')" = 1 ] ||
     { echo "GNUPGHOME must hold exactly one secret key" >&2 && exit 1; }
-basename "$deb" | grep -Eqx "$deb_name" || { echo "unexpected package name: $deb" >&2 && exit 1; }
+# Replaces each argument with its absolute path (the script changes into
+# <site>); "for" walks the arguments as they were when it started.
+for deb; do
+    deb=$(realpath "$deb")
+    basename "$deb" | grep -Eqx "$deb_name" || { echo "unexpected package name: $deb" >&2 && exit 1; }
+    set -- "$@" "$deb"
+    shift
+done
 
 cd "$site"
 mkdir -p pool/stable pool/edge
@@ -24,13 +34,18 @@ bad=$(find pool -regextype posix-extended \
     ! \( -type d -regex 'pool(/stable|/edge)?' \) \
     ! \( -type f -regex "pool/(stable|edge)/$deb_name" \))
 [ -z "$bad" ] || { printf 'unexpected entries in pool/:\n%s\n' "$bad" >&2 && exit 1; }
-target=pool/$channel/$(basename "$deb")
-# A published version never changes: clients cached its checksum.
-[ ! -e "$target" ] || { echo "$target is already published" >&2 && exit 1; }
-cp "$deb" "$target"
+for deb; do
+    target=pool/$channel/$(basename "$deb")
+    # A published version never changes: clients cached its checksum.
+    [ ! -e "$target" ] || { echo "$target is already published" >&2 && exit 1; }
+    cp "$deb" "$target"
+done
 # Edge file names carry ~git<UTC timestamp>, so the part after "~" sorts by
-# age; the names were checked above and hold no whitespace.
-find pool/edge -name '*.deb' | sort -t '~' -k 2 | head -n "-$keep_edge" | xargs -r rm --
+# age; the names were checked above and hold no whitespace. Each package
+# keeps its own last $keep_edge builds.
+for pkg in stallo stallo-gui; do
+    find pool/edge -name "${pkg}_*.deb" | sort -t '~' -k 2 | head -n "-$keep_edge" | xargs -r rm --
+done
 
 # The Pages CDN caches files for minutes, so a client can get the new
 # InRelease with an old Packages or the other way round. By-hash indexes
