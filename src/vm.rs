@@ -381,10 +381,12 @@ impl Manager {
             .open(dir.join("secret"))
             .and_then(|mut f| std::io::Write::write_all(&mut f, password.as_bytes()))
             .context("cannot write the VM secret")?;
-        let rendered = seed::render(cfg, &seed::hash_password(&password).await?)?;
+        let rendered = seed::render(cfg, &seed::hash_password(&password).await?, &entry)?;
+        let debs =
+            (entry.agent == images::Agent::Deb).then(|| images::debs_dir(&self.paths, &entry.id));
         seed::build_iso(
             &rendered,
-            &images::debs_dir(&self.paths, &entry.id),
+            debs.as_deref(),
             &self.paths.data,
             &dir.join("seed"),
             &dir.join(qemu::SEED),
@@ -438,7 +440,10 @@ impl Manager {
             self.shared_dir(&vnc_dir)?;
         }
         let vnc = cfg.vnc.then(|| self.paths.vnc_socket(name));
-        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd, vnc.as_deref())?;
+        // An image that left the catalog gets no drop-in: on a disk that
+        // already booted, the guest agent need not wait for cloud-init.
+        let agent = images::find(&cfg.image).map_or(images::Agent::Deb, |e| e.agent);
+        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd, vnc.as_deref(), agent)?;
         // Production: the guest's CPUs wait until the spawn checks (AppArmor
         // label, VNC socket, passt) have passed, so no guest code runs in
         // a QEMU that is about to be refused.

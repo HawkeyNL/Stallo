@@ -1,9 +1,9 @@
-//! cloud-init NoCloud seed ISO for offline Ubuntu guests.
+//! cloud-init NoCloud seed ISO for offline Linux guests.
 //!
 //! The ISO (volume label `CIDATA`) carries `meta-data`, `user-data`,
-//! `network-config` and the guest-agent `.deb`s. On first boot cloud-init
-//! creates the `agent` user and installs the guest agent from the ISO, since
-//! an offline guest has no apt.
+//! `network-config` and, for images without one, the guest-agent `.deb`s.
+//! On first boot cloud-init creates the `agent` user and installs the guest
+//! agent from the ISO, since an offline guest has no package mirror.
 
 use std::fs;
 use std::path::Path;
@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::config::{NetProfile, VmConfig};
+use crate::images::{Agent, CatalogEntry};
 use crate::paths::safe_remove;
 use crate::run_tool;
 
@@ -29,8 +30,9 @@ pub struct Seed {
     pub network_config: String,
 }
 
-/// Renders the seed for `vm`. `password_hash` is a SHA-512 crypt string.
-pub fn render(vm: &VmConfig, password_hash: &str) -> Result<Seed> {
+/// Renders the seed for `vm`, made from `image`. `password_hash` is a
+/// SHA-512 crypt string.
+pub fn render(vm: &VmConfig, password_hash: &str, image: &CatalogEntry) -> Result<Seed> {
     // The name and uuid go into YAML; never trust the caller.
     vm.validate()?;
     ensure!(
@@ -41,11 +43,33 @@ pub fn render(vm: &VmConfig, password_hash: &str) -> Result<Seed> {
         "unexpected password hash format"
     );
     let meta_data = format!("instance-id: {}\nlocal-hostname: {}\n", vm.uuid, vm.name);
+    // The console logs in before the agent answers, so "ready" includes
+    // it: a preinstalled agent starts only after cloud-init's final stage
+    // (qemu.rs), and a .deb one is installed and started last.
+    let mut runcmd = String::new();
+    if image.qga_permissive {
+        // SELinux confines the guest agent (virt_qemu_ga_t), so exec could
+        // neither start its systemd-run scope nor switch to the guest user.
+        // Only that domain becomes permissive, which leaves it as
+        // unconfined as Ubuntu's agent. The module stays installed. If that
+        // fails, the agent is masked for good (it has not started yet, see
+        // qemu.rs): the VM never reports ready with an agent that cannot
+        // exec, and `stallo new` times out instead.
+        runcmd.push_str(
+            "  - [sh, -c, \"echo '(typepermissive virt_qemu_ga_t)' > /run/stallo_qga.cil && semodule -i /run/stallo_qga.cil || systemctl mask --now qemu-guest-agent\"]\n",
+        );
+    }
+    runcmd.push_str("  - [sh, -c, \"systemctl daemon-reload && systemctl restart getty@tty1\"]\n");
+    if image.agent == Agent::Deb {
+        runcmd.push_str("  - [sh, -c, \"mkdir -p /run/stallo-seed && mount -o ro LABEL=CIDATA /run/stallo-seed && dpkg -i /run/stallo-seed/debs/*.deb; umount /run/stallo-seed; systemctl start qemu-guest-agent\"]\n");
+    }
     let user_data = format!(
         r#"#cloud-config
 users:
   - name: {GUEST_USER}
-    groups: [sudo]
+    # sudo with the password, as Ubuntu's `sudo` group grants; portable to
+    # distributions without that group.
+    sudo: ["ALL=(ALL:ALL) ALL"]
     shell: /bin/bash
     lock_passwd: false
     passwd: "{password_hash}"
@@ -60,10 +84,7 @@ write_files:
       ExecStart=
       ExecStart=-/sbin/agetty --autologin {GUEST_USER} --noclear %I $TERM
 runcmd:
-  # The console logs in before the agent answers, so "ready" includes it.
-  - [sh, -c, "systemctl daemon-reload && systemctl restart getty@tty1"]
-  - [sh, -c, "mkdir -p /run/stallo-seed && mount -o ro LABEL=CIDATA /run/stallo-seed && dpkg -i /run/stallo-seed/debs/*.deb; umount /run/stallo-seed; systemctl start qemu-guest-agent"]
-"#
+{runcmd}"#
     );
     let network_config = match vm.net {
         // The offline profile has no network device, so the placeholder
@@ -91,14 +112,14 @@ runcmd:
 
 /// Writes the seed files to `work` (a fresh directory inside `root`, which
 /// must be private: the files get default permissions) and builds `iso`
-/// from them plus `debs`. `work` is removed afterwards; `iso` appears only
-/// when complete.
+/// from them plus `debs`, if any. `work` is removed afterwards; `iso`
+/// appears only when complete.
 ///
 /// The ISO stays attached for the VM's life. It holds the password hash,
 /// which the guest has anyway.
 pub async fn build_iso(
     seed: &Seed,
-    debs: &Path,
+    debs: Option<&Path>,
     root: &Path,
     work: &Path,
     iso: &Path,
@@ -119,7 +140,9 @@ pub async fn build_iso(
         fs::write(work.join(name), text)?;
         cmd.arg(graft(name, &work.join(name))?);
     }
-    cmd.arg(graft("debs/", debs)?);
+    if let Some(debs) = debs {
+        cmd.arg(graft("debs/", debs)?);
+    }
     let result = run_tool(&mut cmd, Duration::from_secs(60))
         .await
         .context("cannot build the seed ISO")
@@ -178,6 +201,10 @@ pub async fn hash_password(password: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn image(id: &str) -> CatalogEntry {
+        crate::images::find(id).unwrap()
+    }
+
     fn vm() -> VmConfig {
         VmConfig {
             name: "dev".into(),
@@ -196,7 +223,7 @@ mod tests {
 
     #[test]
     fn renders_seed() {
-        let seed = render(&vm(), "$6$salt$abc./XYZ").unwrap();
+        let seed = render(&vm(), "$6$salt$abc./XYZ", &image("ubuntu-26.04")).unwrap();
         assert_eq!(
             seed.meta_data,
             "instance-id: 4f1c2b9e-0d3a-4c5e-8f7a-1b2c3d4e5f60\nlocal-hostname: dev\n"
@@ -211,6 +238,27 @@ mod tests {
             seed.user_data
                 .contains("dpkg -i /run/stallo-seed/debs/*.deb")
         );
+        assert!(
+            seed.user_data
+                .contains("    sudo: [\"ALL=(ALL:ALL) ALL\"]\n")
+        );
+        assert!(!seed.user_data.contains("groups:"));
+        // Fedora: SELinux step, no dpkg step and no agent start (it starts
+        // after cloud-init by itself); the rest is the same.
+        let fedora = render(&vm(), "$6$salt$abc./XYZ", &image("fedora-44")).unwrap();
+        let runcmd = |s: &Seed| s.user_data.split_once("runcmd:\n").unwrap().1.to_owned();
+        assert_eq!(
+            runcmd(&fedora),
+            "  - [sh, -c, \"echo '(typepermissive virt_qemu_ga_t)' > /run/stallo_qga.cil && semodule -i /run/stallo_qga.cil || systemctl mask --now qemu-guest-agent\"]\n\
+             \x20 - [sh, -c, \"systemctl daemon-reload && systemctl restart getty@tty1\"]\n"
+        );
+        assert_eq!(
+            runcmd(&seed),
+            "  - [sh, -c, \"systemctl daemon-reload && systemctl restart getty@tty1\"]\n\
+             \x20 - [sh, -c, \"mkdir -p /run/stallo-seed && mount -o ro LABEL=CIDATA /run/stallo-seed && dpkg -i /run/stallo-seed/debs/*.deb; umount /run/stallo-seed; systemctl start qemu-guest-agent\"]\n"
+        );
+        let head = |s: &Seed| s.user_data.split_once("runcmd:\n").unwrap().0.to_owned();
+        assert_eq!(head(&fedora), head(&seed));
         assert_eq!(
             seed.network_config,
             "version: 2\nethernets:\n  none:\n    match: {name: \"stallo-none\"}\n    optional: true\n"
@@ -219,7 +267,7 @@ mod tests {
             net: NetProfile::Internet,
             ..vm()
         };
-        let seed = render(&inet, "$6$salt$abc./XYZ").unwrap();
+        let seed = render(&inet, "$6$salt$abc./XYZ", &image("ubuntu-26.04")).unwrap();
         assert_eq!(
             seed.network_config,
             "version: 2\nethernets:\n  nic:\n    match: {name: \"en*\"}\n    dhcp4: true\n    dhcp6: true\n"
@@ -228,13 +276,13 @@ mod tests {
 
     #[test]
     fn refuses_odd_hashes_and_names() {
-        assert!(render(&vm(), "plain").is_err());
+        assert!(render(&vm(), "plain", &image("ubuntu-26.04")).is_err());
         let bad = VmConfig {
             name: "x\nruncmd: [reboot]".into(),
             ..vm()
         };
-        assert!(render(&bad, "$6$s$h").is_err());
-        assert!(render(&vm(), "$6$a\"\nruncmd: x").is_err());
+        assert!(render(&bad, "$6$s$h", &image("ubuntu-26.04")).is_err());
+        assert!(render(&vm(), "$6$a\"\nruncmd: x", &image("ubuntu-26.04")).is_err());
     }
 
     #[test]
@@ -250,7 +298,7 @@ mod tests {
     async fn hashes_with_openssl() {
         let h = hash_password("secret").await.unwrap();
         assert!(h.starts_with("$6$"), "{h}");
-        assert!(render(&vm(), &h).is_ok());
+        assert!(render(&vm(), &h, &image("ubuntu-26.04")).is_ok());
     }
 
     #[test]
@@ -270,10 +318,10 @@ mod tests {
         let debs = root.join("debs");
         fs::create_dir(&debs).unwrap();
         fs::write(debs.join("a.deb"), b"x").unwrap();
-        let seed = render(&vm(), "$6$s$h").unwrap();
+        let seed = render(&vm(), "$6$s$h", &image("ubuntu-26.04")).unwrap();
         build_iso(
             &seed,
-            &debs,
+            Some(&debs),
             &root,
             &root.join("seed"),
             &root.join("seed.iso"),

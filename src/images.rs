@@ -1,11 +1,14 @@
 //! Image catalog and verified downloads.
 //!
-//! A cloud image is used only after: the signature on `SHA256SUMS` verifies
-//! against Ubuntu's keyring (`gpgv`) and comes from the pinned signing key,
-//! the image's SHA-256 (computed here)
-//! matches its line in `SHA256SUMS`, and `qemu-img info` shows a plain qcow2
-//! with no backing file and no external data file. Cached images are
-//! read-only and never replaced, because VM disks are overlays on them.
+//! A cloud image is used only after: the signature on the checksum list
+//! (detached or clearsigned) verifies against the catalog's keyring (`gpgv`)
+//! and comes from the pinned signing key, the image's SHA-256 (computed
+//! here) matches its line in the signed text, and `qemu-img info` shows a
+//! plain qcow2 with no backing file and no external data file. Cached images
+//! are read-only and never replaced, because VM disks are overlays on them.
+//!
+//! Keyrings are host files (Ubuntu's, from its keyring packages) or
+//! vendored in `catalog/keys/` and compiled in.
 //!
 //! Guest-agent packages come from apt in a private root that trusts only the
 //! catalog's sources and keyring, never the host's apt configuration.
@@ -17,7 +20,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -48,10 +51,12 @@ pub struct CatalogEntry {
     pub trust: Trust,
     /// The checksum list (`signed-sums`).
     pub sums_url: Option<String>,
-    /// The detached signature over the checksum list or the image.
+    /// The detached signature over the checksum list or the image; empty
+    /// for a clearsigned checksum list.
     pub sig_url: Option<String>,
     pub sums_format: Option<SumsFormat>,
-    /// The OpenPGP keyring that holds `signing_key`.
+    /// The OpenPGP keyring that holds `signing_key`: an absolute host path,
+    /// or the name of a keyring in `catalog/keys/`.
     pub keyring: Option<String>,
     /// Fingerprint of the primary key that must sign.
     pub signing_key: Option<String>,
@@ -66,6 +71,10 @@ pub struct CatalogEntry {
     pub deb_sources: Vec<String>,
     /// The only keyring apt trusts for `deb_sources`.
     pub deb_keyring: Option<String>,
+    /// Make the guest agent's SELinux domain permissive (see seed.rs): for
+    /// guests where SELinux confines it, such as Fedora.
+    #[serde(default)]
+    pub qga_permissive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,8 +135,22 @@ impl CatalogEntry {
             https(&self.url) && !self.url.ends_with('/'),
             "{id}: url must be an https:// file URL"
         );
-        for u in [&self.sums_url, &self.sig_url].into_iter().flatten() {
+        if let Some(u) = &self.sums_url {
             ensure!(https(u), "{id}: {u:?} is not an https:// URL");
+        }
+        // An empty sig_url means a clearsigned checksum list.
+        if let Some(u) = &self.sig_url {
+            ensure!(
+                https(u) || (u.is_empty() && self.trust == Trust::SignedSums),
+                "{id}: {u:?} is not an https:// URL"
+            );
+        }
+        if let Some(k) = &self.keyring {
+            ensure!(
+                (k.starts_with('/') && !k.contains(char::is_whitespace))
+                    || KEYS.iter().any(|(name, _)| name == k),
+                "{id}: keyring {k:?} is neither an absolute path nor in catalog/keys/"
+            );
         }
         if let Some(k) = &self.signing_key {
             ensure!(
@@ -206,20 +229,9 @@ impl CatalogEntry {
             );
         }
         ensure!(
-            (
-                self.os,
-                self.firmware,
-                self.trust,
-                self.sums_format,
-                self.agent
-            ) == (
-                Os::Linux,
-                Firmware::SecureBoot,
-                Trust::SignedSums,
-                Some(SumsFormat::Gnu),
-                Agent::Deb
-            ),
-            "{id}: not supported yet: only Linux images with Secure Boot, signed GNU checksums and the guest agent as .debs"
+            (self.os, self.firmware, self.trust)
+                == (Os::Linux, Firmware::SecureBoot, Trust::SignedSums),
+            "{id}: not supported yet: only Linux images with Secure Boot and signed checksums"
         );
         Ok(())
     }
@@ -233,7 +245,12 @@ impl CatalogEntry {
 const CATALOG: &[&str] = &[
     include_str!("../catalog/ubuntu-26.04.toml"),
     include_str!("../catalog/ubuntu-24.04.toml"),
+    include_str!("../catalog/fedora-44.toml"),
 ];
+
+/// OpenPGP keyrings (binary) that catalog entries name in `keyring`. A
+/// unit test pins the fingerprints in each.
+const KEYS: &[(&str, &[u8])] = &[("fedora.gpg", include_bytes!("../catalog/keys/fedora.gpg"))];
 
 /// All catalog entries.
 pub fn catalog() -> Vec<CatalogEntry> {
@@ -266,9 +283,10 @@ pub fn debs_dir(paths: &Paths, id: &str) -> PathBuf {
     paths.images_dir().join(format!("{id}.debs"))
 }
 
-/// Whether the image and its guest-agent packages are cached.
+/// Whether the image and its guest-agent packages (if any) are cached.
 pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
-    image_path(paths, &entry.id).is_file() && debs_dir(paths, &entry.id).is_dir()
+    image_path(paths, &entry.id).is_file()
+        && (entry.agent == Agent::Preinstalled || debs_dir(paths, &entry.id).is_dir())
 }
 
 /// Refuses an image that is not cached: agents create VMs only from
@@ -316,7 +334,7 @@ pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     if !image_path(paths, &entry.id).is_file() {
         pull_image(paths, entry).await?;
     }
-    if !debs_dir(paths, &entry.id).is_dir() {
+    if entry.agent == Agent::Deb && !debs_dir(paths, &entry.id).is_dir() {
         // An older cache is used only when fresh packages cannot be
         // fetched (no network): it is no worse than before the upgrade.
         if let Err(e) = pull_debs(paths, entry).await {
@@ -343,18 +361,24 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     let field = |f: &Option<String>| f.clone().context("incomplete catalog entry");
     let sums = work.join("SHA256SUMS");
     let sig = work.join("SHA256SUMS.gpg");
-    for (url, f) in [
-        (field(&entry.sums_url)?, &sums),
-        (field(&entry.sig_url)?, &sig),
-    ] {
+    let signed = work.join("SHA256SUMS.signed");
+    for f in [&sums, &sig, &signed] {
         safe_remove(&root, f)?;
-        download(&url, f, 1 << 20, false).await?;
     }
-    let (keyring, key) = (field(&entry.keyring)?, field(&entry.signing_key)?);
-    verify_signature(&keyring, &key, &sig, &sums)
+    download(&field(&entry.sums_url)?, &sums, 1 << 20, false).await?;
+    let sig_url = field(&entry.sig_url)?;
+    let sig = if sig_url.is_empty() {
+        None
+    } else {
+        download(&sig_url, &sig, 1 << 20, false).await?;
+        Some(sig.as_path())
+    };
+    let keyring = keyring_path(paths, &field(&entry.keyring)?)?;
+    let text = signed_text(&keyring, &field(&entry.signing_key)?, &sums, sig, &signed)
         .await
-        .context("signature check of SHA256SUMS failed")?;
-    let expected = expected_sha256(&fs::read_to_string(&sums)?, entry.file())?;
+        .context("signature check of the checksum list failed")?;
+    let format = entry.sums_format.context("incomplete catalog entry")?;
+    let expected = expected_sha256(&text, entry.file(), format)?;
 
     // Resume a partial download; skip it if a complete file is already
     // there. The name carries the expected hash, so a partial download of
@@ -507,19 +531,62 @@ async fn download(url: &str, dest: &Path, max_size: u64, resume: bool) -> Result
     Ok(())
 }
 
-/// Runs `gpgv` and requires exactly one valid signature by `fingerprint`
-/// and no bad, expired or revoked one. gpgv's exit code alone accepts any
-/// key in the keyring, revoked ones included.
-async fn verify_signature(keyring: &str, fingerprint: &str, sig: &Path, data: &Path) -> Result<()> {
-    let status = run_tool(
-        Command::new("gpgv")
-            .args(["--status-fd", "1", "--keyring", keyring])
-            .arg(sig)
-            .arg(data),
-        Duration::from_secs(30),
-    )
-    .await?;
-    check_gpg_status(&String::from_utf8_lossy(&status), fingerprint)
+/// The keyring file for a catalog `keyring`: an absolute host path as is,
+/// or a vendored keyring, (re)written from the binary to
+/// `<data>/images/keys/` so a changed copy on disk is never trusted.
+fn keyring_path(paths: &Paths, keyring: &str) -> Result<PathBuf> {
+    if keyring.starts_with('/') {
+        return Ok(keyring.into());
+    }
+    let (name, bytes) = KEYS
+        .iter()
+        .find(|(name, _)| *name == keyring)
+        .with_context(|| format!("no keyring {keyring:?} in catalog/keys/"))?;
+    let dir = paths.images_dir().join("keys");
+    ensure_private_dir(&dir)?;
+    let path = dir.join(name);
+    safe_remove(&dir, &path)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Runs `gpgv` on the checksum list `sums` and returns the signed text.
+/// With `sig`, that is a detached signature over all of `sums`. Without,
+/// `sums` is clearsigned and the text is what gpgv writes to `out` as
+/// signed, never the downloaded file: lines outside the signed part are
+/// dropped.
+///
+/// Requires exactly one valid signature by `fingerprint` and no bad,
+/// expired or revoked one. gpgv's exit code alone accepts any key in the
+/// keyring, revoked ones included.
+async fn signed_text(
+    keyring: &Path,
+    fingerprint: &str,
+    sums: &Path,
+    sig: Option<&Path>,
+    out: &Path,
+) -> Result<String> {
+    let mut cmd = Command::new("gpgv");
+    cmd.args(["--status-fd", "1", "--keyring"]).arg(keyring);
+    let text = match sig {
+        Some(sig) => {
+            cmd.arg(sig).arg(sums);
+            sums
+        }
+        None => {
+            cmd.arg("--output").arg(out).arg(sums);
+            out
+        }
+    };
+    let status = run_tool(&mut cmd, Duration::from_secs(30)).await?;
+    check_gpg_status(&String::from_utf8_lossy(&status), fingerprint)?;
+    Ok(fs::read_to_string(text)?)
 }
 
 fn check_gpg_status(status: &str, fingerprint: &str) -> Result<()> {
@@ -530,7 +597,11 @@ fn check_gpg_status(status: &str, fingerprint: &str) -> Result<()> {
             continue;
         }
         match words.next() {
-            Some("BADSIG" | "ERRSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG") => {
+            // ERROR and FAILURE: gpgv hit something it could not process,
+            // such as unsigned data next to a signed block.
+            Some(
+                "BADSIG" | "ERRSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" | "ERROR" | "FAILURE",
+            ) => {
                 bail!("gpgv reported: {line}")
             }
             // The last field of VALIDSIG is the primary key fingerprint.
@@ -546,22 +617,31 @@ fn check_gpg_status(status: &str, fingerprint: &str) -> Result<()> {
     Ok(())
 }
 
-/// Finds the SHA-256 of `file` in a `SHA256SUMS` text (`<hex> *<name>`).
-pub fn expected_sha256(sums: &str, file: &str) -> Result<String> {
+/// Finds the SHA-256 of `file` in a checksum list: `<hex> *<name>` (GNU)
+/// or `SHA256 (<name>) = <hex>` (BSD) lines. Other lines are skipped.
+pub fn expected_sha256(sums: &str, file: &str, format: SumsFormat) -> Result<String> {
     for line in sums.lines() {
-        let Some((hash, name)) = line.split_once(' ') else {
+        let found = match format {
+            SumsFormat::Gnu => line
+                .split_once(' ')
+                .map(|(hash, name)| (hash, name.trim_start_matches([' ', '*']))),
+            SumsFormat::Bsd => line
+                .strip_prefix("SHA256 (")
+                .and_then(|l| l.rsplit_once(") = "))
+                .map(|(name, hash)| (hash, name)),
+        };
+        let Some((hash, name)) = found else {
             continue;
         };
-        let name = name.trim_start_matches([' ', '*']);
         if name == file {
             ensure!(
                 hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()),
-                "malformed SHA256SUMS line for {file}"
+                "malformed checksum line for {file}"
             );
             return Ok(hash.to_ascii_lowercase());
         }
     }
-    bail!("{file} is not listed in SHA256SUMS")
+    bail!("{file} is not in the checksum list")
 }
 
 /// Streams a file through SHA-256 on a blocking thread.
@@ -642,6 +722,11 @@ mod tests {
         let e = find("ubuntu-24.04").unwrap();
         assert_eq!(e.file(), "noble-server-cloudimg-amd64.img");
         assert_eq!(e.debs, ["qemu-guest-agent", "liburing2"]);
+        let e = find("fedora-44").unwrap();
+        assert_eq!(e.file(), "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2");
+        assert_eq!(e.sig_url.as_deref(), Some(""));
+        assert_eq!(e.sums_format, Some(SumsFormat::Bsd));
+        assert_eq!(e.agent, Agent::Preinstalled);
         assert!(find("debian-13").is_err());
         assert!(find("../x").is_err());
     }
@@ -733,11 +818,32 @@ mod tests {
             ("deb_sources", None),
             ("deb_keyring", None),
         ];
-        assert!(err(&bare).contains("not supported yet"));
+        entry_with(&bare).unwrap();
         assert!(err(&bare[..3]).contains("no debs"));
-        // HTTPS only.
+        // Clearsigned BSD checksums with a vendored keyring.
+        entry_with(&[
+            ("sig_url", Some(r#""""#)),
+            ("sums_format", Some(r#""bsd""#)),
+            ("keyring", Some(r#""fedora.gpg""#)),
+        ])
+        .unwrap();
+        for bad in ["nope.gpg", "keys/fedora.gpg", "", "/a b.gpg"] {
+            let v = format!("{bad:?}");
+            assert!(err(&[("keyring", Some(&v))]).contains("keyring"), "{bad}");
+        }
+        // HTTPS only; an empty URL only as the clearsigned sig_url.
         assert!(err(&[("url", Some(r#""http://example.com/a.img""#))]).contains("https"));
         assert!(err(&[("sums_url", Some(r#""ftp://example.com/S""#))]).contains("https"));
+        assert!(err(&[("sums_url", Some(r#""""#))]).contains("https"));
+        let both_empty = [("sig_url", Some(r#""""#)), ("sums_url", Some(r#""""#))];
+        assert!(err(&both_empty).contains("https"));
+        let signed_image = [
+            ("trust", Some(r#""signed-image""#)),
+            ("sig_url", Some(r#""""#)),
+            ("sums_url", None),
+            ("sums_format", None),
+        ];
+        assert!(err(&signed_image).contains("https"));
         // Full fingerprints only.
         for bad in ["7DB87C81", "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81"] {
             let v = format!("{bad:?}");
@@ -746,13 +852,71 @@ mod tests {
         // Unknown fields and values are refused.
         assert!(entry_with(&[("release", Some(r#""26.04""#))]).is_err());
         assert!(entry_with(&[("os", Some(r#""macos""#))]).is_err());
-        for (k, v) in [
-            ("os", r#""windows""#),
-            ("firmware", r#""uefi""#),
-            ("sums_format", r#""bsd""#),
-        ] {
+        for (k, v) in [("os", r#""windows""#), ("firmware", r#""uefi""#)] {
             assert!(err(&[(k, Some(v))]).contains("not supported yet"), "{k}");
         }
+    }
+
+    /// Each vendored keyring holds exactly the primary keys that catalog
+    /// entries pin for it, and every vendored keyring is used. Needs `gpg`.
+    #[test]
+    fn vendored_keys_are_pinned() {
+        let catalog = catalog();
+        for (name, bytes) in KEYS {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(name);
+            fs::write(&file, bytes).unwrap();
+            let out = std::process::Command::new("gpg")
+                .arg("--homedir")
+                .arg(dir.path())
+                .args(["--batch", "--show-keys", "--with-colons"])
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{name}");
+            let listing = String::from_utf8(out.stdout).unwrap();
+            // The fpr record right after each pub record.
+            let mut found: Vec<&str> = listing
+                .lines()
+                .zip(listing.lines().skip(1))
+                .filter(|(a, _)| a.starts_with("pub:"))
+                .filter_map(|(_, b)| b.strip_prefix("fpr:::::::::"))
+                .map(|f| f.trim_end_matches(':'))
+                .collect();
+            let mut pinned: Vec<&str> = catalog
+                .iter()
+                .filter(|e| e.keyring.as_deref() == Some(*name))
+                .filter_map(|e| e.signing_key.as_deref())
+                .collect();
+            found.sort();
+            pinned.sort();
+            pinned.dedup();
+            assert!(!pinned.is_empty(), "{name} is not used");
+            assert_eq!(found, pinned, "{name}");
+        }
+        assert_eq!(
+            find("fedora-44").unwrap().signing_key.as_deref(),
+            Some("36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6")
+        );
+    }
+
+    /// Vendored keyrings are written fresh to `<data>/images/keys/` (0700).
+    #[test]
+    fn vendored_keyring_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let host = "/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg";
+        assert_eq!(keyring_path(&paths, host).unwrap(), Path::new(host));
+        let keys = paths.images_dir().join("keys");
+        assert!(!keys.exists());
+        let path = keyring_path(&paths, "fedora.gpg").unwrap();
+        assert_eq!(path, keys.join("fedora.gpg"));
+        let mode = fs::metadata(&keys).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        fs::write(&path, b"changed").unwrap();
+        keyring_path(&paths, "fedora.gpg").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), KEYS[0].1);
+        assert!(keyring_path(&paths, "nope.gpg").is_err());
     }
 
     #[test]
@@ -762,14 +926,35 @@ mod tests {
             "{} *resolute-server-cloudimg-amd64.manifest\n{h} *resolute-server-cloudimg-amd64.img\n",
             "1".repeat(64)
         );
-        assert_eq!(
-            expected_sha256(&sums, "resolute-server-cloudimg-amd64.img").unwrap(),
-            h
+        let gnu = |sums: &str, file: &str| expected_sha256(sums, file, SumsFormat::Gnu);
+        assert_eq!(gnu(&sums, "resolute-server-cloudimg-amd64.img").unwrap(), h);
+        assert!(gnu(&sums, "resolute-server-cloudimg-amd64").is_err());
+        assert!(gnu("zz *a.img\n", "a.img").is_err());
+        assert_eq!(gnu(&format!("{h}  a.img\n"), "a.img").unwrap(), h);
+        // BSD lines are not GNU lines.
+        assert!(gnu(&format!("SHA256 (a.img) = {h}\n"), "a.img").is_err());
+    }
+
+    #[test]
+    fn bsd_sums_lookup() {
+        let h = "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f";
+        let file = "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2";
+        let sums = format!(
+            "# {file}: 583729152 bytes\n\
+             SHA256 (Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2.xz) = {}\n\
+             SHA256 ({file}) = {h}\n",
+            "1".repeat(64)
         );
-        assert!(expected_sha256(&sums, "resolute-server-cloudimg-amd64").is_err());
-        assert!(expected_sha256("zz *a.img\n", "a.img").is_err());
+        let bsd = |sums: &str, file: &str| expected_sha256(sums, file, SumsFormat::Bsd);
+        assert_eq!(bsd(&sums, file).unwrap(), h);
+        assert_eq!(bsd(&sums.to_uppercase(), &file.to_uppercase()).unwrap(), h);
+        assert!(bsd(&sums, "Fedora-Cloud-Base-Generic-44-1.7.x86_64").is_err());
+        assert!(bsd(&format!("SHA256 (a.img) = {}\n", &h[1..]), "a.img").is_err());
+        assert!(bsd(&format!("SHA512 (a.img) = {h}\n"), "a.img").is_err());
+        assert!(bsd(&format!("{h} *a.img\n"), "a.img").is_err());
+        // A name with ") = " in it: the hash is after the last one.
         assert_eq!(
-            expected_sha256(&format!("{h}  a.img\n"), "a.img").unwrap(),
+            bsd(&format!("SHA256 (a) = b) = {h}\n"), "a) = b").unwrap(),
             h
         );
     }
@@ -804,10 +989,18 @@ mod tests {
             let status = format!("{good}[GNUPG:] {bad} 1A5D6C4C7DB87C81 UEC\n");
             assert!(check_gpg_status(&status, fpr).is_err(), "{bad}");
         }
+        for bad in [
+            "ERROR proc_pkt.plaintext 89_BAD_DATA",
+            "FAILURE gpg-exit 33554433",
+        ] {
+            let status = format!("{good}[GNUPG:] {bad}\n");
+            assert!(check_gpg_status(&status, fpr).is_err(), "{bad}");
+        }
     }
 
-    /// Real gpgv against a throwaway key: a good signature passes; a wrong
-    /// pinned key and a tampered file fail. Needs `gpg` and `gpgv`.
+    /// Real gpgv against a throwaway key, detached and clearsigned: a good
+    /// signature passes; a wrong pinned key and a tampered signed text fail;
+    /// text outside a clearsigned block is ignored. Needs `gpg` and `gpgv`.
     #[tokio::test]
     async fn gpgv_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -844,19 +1037,109 @@ mod tests {
         fs::write(&keyring, gpg(&["--export"])).unwrap();
         let data = dir.path().join("SHA256SUMS");
         let sig = dir.path().join("SHA256SUMS.gpg");
+        let out = dir.path().join("SHA256SUMS.signed");
         fs::write(&data, b"abc *a.img\n").unwrap();
         let (sig_s, data_s) = (sig.to_str().unwrap(), data.to_str().unwrap());
         gpg(&["--detach-sign", "--output", sig_s, data_s]);
 
-        let kr = keyring.to_str().unwrap();
-        verify_signature(kr, &fpr, &sig, &data).await.unwrap();
+        // Detached.
+        let check = |key: String, sig: Option<PathBuf>| {
+            let (keyring, data, out) = (keyring.clone(), data.clone(), out.clone());
+            async move {
+                let _ = fs::remove_file(&out);
+                signed_text(&keyring, &key, &data, sig.as_deref(), &out).await
+            }
+        };
+        let text = check(fpr.clone(), Some(sig.clone())).await.unwrap();
+        assert_eq!(text, "abc *a.img\n");
+        assert!(check("0".repeat(40), Some(sig.clone())).await.is_err());
+        fs::write(&data, b"abd *a.img\n").unwrap();
+        assert!(check(fpr.clone(), Some(sig.clone())).await.is_err());
+        // A detached signature is not a clearsigned file.
+        assert!(check(fpr.clone(), None).await.is_err());
+
+        // Clearsigned: only the signed part counts.
+        let (good, evil) = ("a".repeat(64), "e".repeat(64));
+        let plain = dir.path().join("plain");
+        fs::write(
+            &plain,
+            format!("# a.img: 3 bytes\nSHA256 (a.img) = {good}\n"),
+        )
+        .unwrap();
+        let plain_s = plain.to_str().unwrap();
+        gpg(&["--yes", "--clearsign", "--output", data_s, plain_s]);
+        let clear = fs::read_to_string(&data).unwrap();
+        let lookup = |text: &str| expected_sha256(text, "a.img", SumsFormat::Bsd);
+        let text = check(fpr.clone(), None).await.unwrap();
+        assert_eq!(lookup(&text).unwrap(), good);
+        assert!(!text.contains("PGP"), "{text}");
+        assert!(check("0".repeat(40), None).await.is_err());
+        // Lines added outside the signed block are dropped.
+        let line = format!("SHA256 (a.img) = {evil}\n");
+        fs::write(&data, format!("{line}{clear}{line}")).unwrap();
+        let text = check(fpr.clone(), None).await.unwrap();
+        assert_eq!(lookup(&text).unwrap(), good);
+        assert!(!text.contains(&evil));
+        // A changed line inside it fails the signature.
+        fs::write(&data, clear.replace(&good, &evil)).unwrap();
+        assert!(check(fpr.clone(), None).await.is_err());
+        // So does a line added inside it.
+        let added = clear.replace("# a.img", &format!("{line}# a.img"));
+        assert_ne!(added, clear);
+        fs::write(&data, added).unwrap();
+        assert!(check(fpr.clone(), None).await.is_err());
+        // Unsigned data (a literal packet) before or after the signed block:
+        // gpgv writes it to `out` but fails, so it is never parsed.
+        let literal = dir.path().join("literal.asc");
+        let evil_plain = dir.path().join("evil");
+        fs::write(&evil_plain, &line).unwrap();
+        let (lit_s, evil_s) = (literal.to_str().unwrap(), evil_plain.to_str().unwrap());
+        gpg(&["--yes", "--store", "--armor", "--output", lit_s, evil_s]);
+        let literal = fs::read_to_string(&literal).unwrap();
+        assert!(literal.starts_with("-----BEGIN PGP MESSAGE-----"));
+        for combined in [format!("{literal}{clear}"), format!("{clear}{literal}")] {
+            fs::write(&data, combined).unwrap();
+            assert!(check(fpr.clone(), None).await.is_err());
+        }
+        // Two signed blocks are two signatures: refused.
+        fs::write(&data, format!("{clear}{clear}")).unwrap();
+        assert!(check(fpr.clone(), None).await.is_err());
+        // An unsigned list is refused.
+        fs::write(&data, &line).unwrap();
+        assert!(check(fpr.clone(), None).await.is_err());
+    }
+
+    /// The real Fedora 44 checksum list (tests/fixtures/) verifies with the
+    /// vendored keyring and gives the image's SHA-256. Offline.
+    #[tokio::test]
+    async fn fedora_checksum_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let entry = find("fedora-44").unwrap();
+        let keyring = keyring_path(&paths, entry.keyring.as_deref().unwrap()).unwrap();
+        let sums = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/Fedora-Cloud-44-1.7-x86_64-CHECKSUM");
         assert!(
-            verify_signature(kr, &"0".repeat(40), &sig, &data)
+            entry
+                .sums_url
+                .as_deref()
+                .unwrap()
+                .ends_with("/Fedora-Cloud-44-1.7-x86_64-CHECKSUM")
+        );
+        let out = dir.path().join("signed");
+        let fpr = entry.signing_key.as_deref().unwrap();
+        let text = signed_text(&keyring, fpr, &sums, None, &out).await.unwrap();
+        assert_eq!(
+            expected_sha256(&text, entry.file(), SumsFormat::Bsd).unwrap(),
+            "28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f"
+        );
+        // Another key is refused.
+        fs::remove_file(&out).unwrap();
+        assert!(
+            signed_text(&keyring, &"0".repeat(40), &sums, None, &out)
                 .await
                 .is_err()
         );
-        fs::write(&data, b"abd *a.img\n").unwrap();
-        assert!(verify_signature(kr, &fpr, &sig, &data).await.is_err());
     }
 
     /// The private apt root, checked offline with apt itself: every path
@@ -992,6 +1275,10 @@ mod tests {
         assert!(ensure_pulled(&paths, "ubuntu-26.04").is_err());
         ensure_private_dir(&debs_dir(&paths, "ubuntu-26.04")).unwrap();
         ensure_pulled(&paths, "ubuntu-26.04").unwrap();
+        // A preinstalled guest agent: the image is all there is.
+        assert!(ensure_pulled(&paths, "fedora-44").is_err());
+        fs::write(image_path(&paths, "fedora-44"), b"").unwrap();
+        ensure_pulled(&paths, "fedora-44").unwrap();
     }
 
     /// Fetches the guest-agent packages for real (network, about 20 MB of
