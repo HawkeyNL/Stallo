@@ -6,7 +6,9 @@
 //! here) matches its line in the signed text, and `qemu-img info` shows a
 //! plain qcow2 with no backing file and no external data file. With
 //! `signed-image`, a detached signature over the image itself replaces the
-//! checksum list, and it must be at most [`MAX_SIG_AGE_DAYS`] old. Cached
+//! checksum list, and it must be at most [`MAX_SIG_AGE_DAYS`] old. With
+//! `pinned`, for upstreams that sign nothing, the image's SHA-512 is in the
+//! catalog itself, so an update needs a new Stallo release. Cached
 //! images are read-only and never replaced, because VM disks are overlays on
 //! them.
 //!
@@ -30,7 +32,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use tokio::process::Command;
 
 use crate::config::{NetProfile, validate_image_id};
@@ -72,7 +74,8 @@ pub struct CatalogEntry {
     /// apt sources for `debs`: `<https uri> <suite> <components...>`.
     #[serde(default)]
     pub deb_sources: Vec<String>,
-    /// The only keyring apt trusts for `deb_sources`.
+    /// The only keyring apt trusts for `deb_sources`: an absolute host
+    /// path, or the name of a keyring in `catalog/keys/`.
     pub deb_keyring: Option<String>,
     /// Make the guest agent's SELinux domain permissive (see seed.rs): for
     /// guests where SELinux confines it, such as Fedora.
@@ -152,10 +155,10 @@ impl CatalogEntry {
                 "{id}: {u:?} is not an https:// URL"
             );
         }
+        let vendored = |k: &str| KEYS.iter().any(|(name, _)| *name == k);
         if let Some(k) = &self.keyring {
             ensure!(
-                (k.starts_with('/') && !k.contains(char::is_whitespace))
-                    || KEYS.iter().any(|(name, _)| name == k),
+                (k.starts_with('/') && !k.contains(char::is_whitespace)) || vendored(k),
                 "{id}: keyring {k:?} is neither an absolute path nor in catalog/keys/"
             );
         }
@@ -215,14 +218,15 @@ impl CatalogEntry {
                 "{id}: deb source {src:?} is not `<https uri> <suite> <components>`"
             );
         }
-        // `signed-by=` takes a comma-separated list: one keyring file only.
+        // `signed-by=` takes a comma-separated list: one keyring file only
+        // (apt_root checks the path a vendored name resolves to as well).
         if let Some(k) = &self.deb_keyring {
             ensure!(
-                k.starts_with('/')
+                (k.starts_with('/') || vendored(k))
                     && plain(k)
                     && !k.contains(',')
                     && (k.ends_with(".gpg") || k.ends_with(".pgp")),
-                "{id}: deb_keyring must be one absolute .gpg or .pgp path"
+                "{id}: deb_keyring must be one absolute .gpg or .pgp path, or a keyring in catalog/keys/"
             );
         }
         // Package names become apt arguments: no options.
@@ -236,8 +240,8 @@ impl CatalogEntry {
             );
         }
         ensure!(
-            self.os == Os::Linux && self.trust != Trust::Pinned,
-            "{id}: not supported yet: only Linux images with signatures"
+            self.os == Os::Linux,
+            "{id}: not supported yet: only Linux images"
         );
         Ok(())
     }
@@ -264,15 +268,20 @@ const CATALOG: &[&str] = &[
     include_str!("../catalog/ubuntu-24.04.toml"),
     include_str!("../catalog/fedora-44.toml"),
     include_str!("../catalog/arch.toml"),
+    include_str!("../catalog/debian-13.toml"),
 ];
 
-/// OpenPGP keyrings (binary) that catalog entries name in `keyring`. A
-/// unit test pins the fingerprints in each.
+/// OpenPGP keyrings (binary) that catalog entries name in `keyring` or
+/// `deb_keyring`. A unit test pins the fingerprints in each.
 const KEYS: &[(&str, &[u8])] = &[
     ("fedora.gpg", include_bytes!("../catalog/keys/fedora.gpg")),
     (
         "arch-boxes.gpg",
         include_bytes!("../catalog/keys/arch-boxes.gpg"),
+    ),
+    (
+        "debian-archive-trixie.gpg",
+        include_bytes!("../catalog/keys/debian-archive-trixie.gpg"),
     ),
 ];
 
@@ -393,7 +402,10 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     let image = match entry.trust {
         Trust::SignedSums => fetch_signed_sums(paths, entry, &work).await?,
         Trust::SignedImage => fetch_signed_image(paths, entry, &work).await?,
-        Trust::Pinned => bail!("{}: pinned images are not supported yet", entry.id),
+        Trust::Pinned => {
+            let expected = field(&entry.sha512)?;
+            fetch_hashed::<Sha512>(paths, entry, &work, &expected).await?
+        }
     };
     if let Err(e) = check_image(&image).await {
         // Otherwise the next pull would find the same file complete.
@@ -440,24 +452,46 @@ async fn fetch_signed_sums(paths: &Paths, entry: &CatalogEntry, work: &Path) -> 
         .context("signature check of the checksum list failed")?;
     let format = entry.sums_format.context("incomplete catalog entry")?;
     let expected = expected_sha256(&text, entry.file(), format)?;
+    fetch_hashed::<Sha256>(paths, entry, work, &expected).await
+}
 
-    // Resume a partial download; skip it if a complete file is already
-    // there. The name carries the expected hash, so a partial download of
-    // an older upstream image is never resumed into a newer one.
+/// Downloads the image into `work` and checks it against `expected`, its
+/// hash in lower-case hex; returns its path.
+///
+/// Resumes a partial download, and skips it if a complete file is already
+/// there. The name carries the expected hash, so a partial download of
+/// another file (an older upstream image, a different pin) is never resumed
+/// into this one. A mismatch deletes the file and fails: the next pull
+/// starts from scratch.
+async fn fetch_hashed<D: Digest + 'static>(
+    paths: &Paths,
+    entry: &CatalogEntry,
+    work: &Path,
+    expected: &str,
+) -> Result<PathBuf> {
     let image = work.join(format!("{expected}.part"));
-    if !image.exists() || sha256_file(&image).await? != expected {
+    if !image.exists() || hash_file::<D>(&image).await? != expected {
         tracing::info!("downloading {}", entry.url);
         download(&entry.url, &image, entry.max_size, true).await?;
-        let actual = sha256_file(&image).await?;
-        if actual != expected {
-            safe_remove(&root, &image)?;
-            bail!(
-                "SHA-256 mismatch for {}: got {actual}, want {expected}",
-                entry.file()
-            );
-        }
+        check_hash::<D>(&paths.images_dir(), &image, expected)
+            .await
+            .with_context(|| format!("{} is not the expected image", entry.file()))?;
     }
     Ok(image)
+}
+
+/// Checks the hash of `file` (inside `root`) against `expected`; deletes
+/// the file if it differs.
+async fn check_hash<D: Digest + 'static>(root: &Path, file: &Path, expected: &str) -> Result<()> {
+    let actual = hash_file::<D>(file).await?;
+    if actual != expected {
+        safe_remove(root, file)?;
+        bail!(
+            "hash mismatch for {}: got {actual}, want {expected}",
+            file.display()
+        );
+    }
+    Ok(())
 }
 
 /// Downloads the image into `work` and checks the detached signature over
@@ -577,7 +611,11 @@ async fn pull_debs(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
 
 async fn fetch_debs(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<()> {
     ensure_private_dir(work)?;
-    let conf = apt_root(work, entry)?;
+    let keyring = keyring_path(
+        paths,
+        entry.deb_keyring.as_deref().context("no deb_keyring")?,
+    )?;
+    let conf = apt_root(work, entry, &keyring)?;
     let debs = work.join("debs");
     let apt = |args: Vec<String>| {
         let mut cmd = Command::new("apt-get");
@@ -622,8 +660,9 @@ async fn fetch_debs(paths: &Paths, entry: &CatalogEntry, work: &Path) -> Result<
 /// Lays out a private apt root in `dir` and returns its config file, for
 /// `APT_CONFIG`. Every path apt uses then resolves inside `dir`: the host's
 /// `apt.conf.d`, sources, preferences, keyrings and package state are never
-/// read, and only `deb_keyring` is trusted for the catalog's sources.
-fn apt_root(dir: &Path, entry: &CatalogEntry) -> Result<PathBuf> {
+/// read, and only `keyring` (the resolved `deb_keyring`) is trusted for the
+/// catalog's sources.
+fn apt_root(dir: &Path, entry: &CatalogEntry, keyring: &Path) -> Result<PathBuf> {
     let d = dir.to_str().context("data path is not UTF-8")?;
     ensure!(
         !d.contains(['"', '\n']),
@@ -637,7 +676,16 @@ fn apt_root(dir: &Path, entry: &CatalogEntry) -> Result<PathBuf> {
     ] {
         ensure_private_dir(&dir.join(sub))?;
     }
-    let keyring = entry.deb_keyring.as_deref().context("no deb_keyring")?;
+    // `signed-by=` takes a comma-separated list, and the line ends at
+    // whitespace or `]`: one plain keyring path only.
+    let keyring = keyring.to_str().context("keyring path is not UTF-8")?;
+    ensure!(
+        keyring.starts_with('/')
+            && keyring
+                .bytes()
+                .all(|c| c.is_ascii_graphic() && !b"[],#".contains(&c)),
+        "keyring path {keyring:?} cannot go into an apt source"
+    );
     let sources: String = entry
         .deb_sources
         .iter()
@@ -819,12 +867,13 @@ pub fn expected_sha256(sums: &str, file: &str, format: SumsFormat) -> Result<Str
     bail!("{file} is not in the checksum list")
 }
 
-/// Streams a file through SHA-256 on a blocking thread.
-pub async fn sha256_file(path: &Path) -> Result<String> {
+/// Streams a file through hash `D` on a blocking thread; returns it in
+/// lower-case hex.
+pub async fn hash_file<D: Digest + 'static>(path: &Path) -> Result<String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut f = fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
+        let mut hasher = D::new();
         let mut buf = vec![0; 1 << 20];
         loop {
             let n = f.read(&mut buf)?;
@@ -909,7 +958,14 @@ mod tests {
             (Trust::SignedImage, Firmware::Uefi, Agent::Preinstalled)
         );
         assert_eq!(e.sig_url.unwrap(), format!("{}.sig", e.url));
-        assert!(find("debian-13").is_err());
+        let e = find("debian-13").unwrap();
+        assert_eq!(e.file(), "debian-13-generic-amd64-20261015-2632.qcow2");
+        assert_eq!(
+            (e.trust, e.firmware, e.agent),
+            (Trust::Pinned, Firmware::SecureBoot, Agent::Deb)
+        );
+        assert_eq!(e.debs, ["qemu-guest-agent"]);
+        assert_eq!(e.deb_keyring.as_deref(), Some("debian-archive-trixie.gpg"));
         assert!(find("../x").is_err());
     }
 
@@ -945,8 +1001,7 @@ mod tests {
             ("keyring", None),
             ("signing_key", None),
         ];
-        // Valid but not handled yet.
-        assert!(err(&pinned).contains("not supported yet"));
+        entry_with(&pinned).unwrap();
         // pinned: sha512 required, keys refused.
         assert!(err(&pinned[..1]).contains("pinned needs"));
         let mut keyed = pinned.to_vec();
@@ -992,6 +1047,8 @@ mod tests {
                 "{bad}"
             );
         }
+        // A vendored keyring by name.
+        entry_with(&[("deb_keyring", Some(r#""debian-archive-trixie.gpg""#))]).unwrap();
         assert!(err(&[("debs", Some(r#"["-o"]"#))]).contains("package name"));
         assert!(err(&[("agent", Some(r#""preinstalled""#))]).contains("no debs"));
         let bare = [
@@ -1051,6 +1108,7 @@ mod tests {
             ("ubuntu-24.04", true),
             ("fedora-44", false),
             ("arch", false),
+            ("debian-13", false),
         ] {
             let e = find(id).unwrap();
             e.check_net(NetProfile::Offline).unwrap();
@@ -1083,12 +1141,13 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "{name}");
             let listing = String::from_utf8(out.stdout).unwrap();
-            // The fpr record right after each pub record.
+            // The first fpr record after each pub record (designated
+            // revokers, `rvk`, may come in between).
+            let listing = format!("\n{listing}");
             let mut found: Vec<&str> = listing
-                .lines()
-                .zip(listing.lines().skip(1))
-                .filter(|(a, _)| a.starts_with("pub:"))
-                .filter_map(|(_, b)| b.strip_prefix("fpr:::::::::"))
+                .split("\npub:")
+                .skip(1)
+                .filter_map(|key| key.lines().find_map(|l| l.strip_prefix("fpr:::::::::")))
                 .map(|f| f.trim_end_matches(':'))
                 .collect();
             let mut pinned: Vec<&str> = catalog
@@ -1096,11 +1155,42 @@ mod tests {
                 .filter(|e| e.keyring.as_deref() == Some(*name))
                 .filter_map(|e| e.signing_key.as_deref())
                 .collect();
+            // apt checks the archive keys itself; their fingerprints are
+            // pinned here.
+            if catalog
+                .iter()
+                .any(|e| e.deb_keyring.as_deref() == Some(*name))
+            {
+                assert_eq!(*name, "debian-archive-trixie.gpg");
+                pinned.extend([
+                    // Debian Archive Automatic Signing Key (13/trixie)
+                    "04B54C3CDCA79751B16BC6B5225629DF75B188BD",
+                    // Debian Security Archive Automatic Signing Key (13/trixie)
+                    "5E04A1E3223A19A20706E20F9904613D4CCE68C6",
+                ]);
+            }
             found.sort();
             pinned.sort();
             pinned.dedup();
             assert!(!pinned.is_empty(), "{name} is not used");
             assert_eq!(found, pinned, "{name}");
+            // gpg's view is not apt's (sqv): the bytes are pinned too, so
+            // a packet gpg skips cannot slip in unseen.
+            let sha256: String = Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let want = match *name {
+                "fedora.gpg" => "ee42b9c07cf45061e59446506442fed9a68270e2a65b775d41b2549501fc4dbc",
+                "arch-boxes.gpg" => {
+                    "f21550af3ff9c63fee0f109127c1e61a54f0e382285eb3c557576770b7fb79c1"
+                }
+                "debian-archive-trixie.gpg" => {
+                    "9429548ea361e7182aa8427ac1d0a4bea09af5d71edce5761ffbe8789b943537"
+                }
+                _ => panic!("{name}: pin its SHA-256 here"),
+            };
+            assert_eq!(sha256, want, "{name}");
         }
         assert_eq!(
             find("fedora-44").unwrap().signing_key.as_deref(),
@@ -1172,14 +1262,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sha256_of_file() {
+    async fn hashes_of_file() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("f");
         fs::write(&f, b"abc").unwrap();
         assert_eq!(
-            sha256_file(&f).await.unwrap(),
+            hash_file::<Sha256>(&f).await.unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        let sha512 = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+        assert_eq!(hash_file::<Sha512>(&f).await.unwrap(), sha512);
+        // pinned: a match keeps the file, a mismatch deletes it.
+        check_hash::<Sha512>(dir.path(), &f, sha512).await.unwrap();
+        assert!(f.exists());
+        let err = check_hash::<Sha512>(dir.path(), &f, &"0".repeat(128))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
+        assert!(!f.exists());
     }
 
     #[test]
@@ -1489,7 +1589,8 @@ mod tests {
     fn apt_root_is_private() {
         let dir = tempfile::tempdir().unwrap();
         let entry = find("ubuntu-26.04").unwrap();
-        let conf = apt_root(dir.path(), &entry).unwrap();
+        let keyring = Path::new(entry.deb_keyring.as_deref().unwrap());
+        let conf = apt_root(dir.path(), &entry, keyring).unwrap();
         let run = |args: &[&str]| {
             let out = std::process::Command::new(args[0])
                 .args(&args[1..])
@@ -1560,6 +1661,13 @@ mod tests {
         assert!(sources.lines().all(|l| l.starts_with(
             "deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://"
         )));
+        // A keyring path that would break the line is refused.
+        for bad in ["/a b.gpg", "/a,b.gpg", "/a].gpg", "a.gpg"] {
+            assert!(
+                apt_root(dir.path(), &entry, Path::new(bad)).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     /// Packages cached by older versions are moved only as a fallback
@@ -1595,6 +1703,13 @@ mod tests {
         assert!(!old_debs(&paths, "ubuntu-26.04", true).unwrap());
         assert!(!images.join("debs").exists());
         assert!(new.join("a_1_amd64.deb").is_file());
+
+        // Only Ubuntu had the old cache: other ids touch nothing.
+        ensure_private_dir(&images.join("debs/13")).unwrap();
+        assert!(!old_debs(&paths, "debian-13", true).unwrap());
+        assert!(!old_debs(&paths, "debian-13", false).unwrap());
+        assert!(images.join("debs/13").is_dir());
+        assert!(!debs_dir(&paths, "debian-13").exists());
     }
 
     /// Agents get a clear refusal for images that are not pulled; an old
@@ -1622,22 +1737,27 @@ mod tests {
     }
 
     /// Fetches the guest-agent packages for real (network, about 20 MB of
-    /// indexes): `cargo test -- --ignored debs_live`.
+    /// indexes for Ubuntu, 60 MB for Debian): `cargo test -- --ignored
+    /// debs_live`.
     #[tokio::test]
-    #[ignore = "downloads from the Ubuntu archive"]
+    #[ignore = "downloads from the Ubuntu and Debian archives"]
     async fn debs_live() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
         ensure_private_dir(&paths.images_dir()).unwrap();
+        for id in ["debian-13", "ubuntu-26.04"] {
+            let entry = find(id).unwrap();
+            pull_debs(&paths, &entry).await.unwrap();
+            let names: Vec<String> = fs::read_dir(debs_dir(&paths, &entry.id))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(names.len(), entry.debs.len(), "{names:?}");
+        }
+        // Only the debs (and the vendored keyring) are kept, not apt's
+        // indexes.
+        assert_eq!(fs::read_dir(paths.images_dir()).unwrap().count(), 3);
         let entry = find("ubuntu-26.04").unwrap();
-        pull_debs(&paths, &entry).await.unwrap();
-        let names: Vec<String> = fs::read_dir(debs_dir(&paths, &entry.id))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(names.len(), entry.debs.len(), "{names:?}");
-        // Only the debs are kept, not apt's indexes.
-        assert_eq!(fs::read_dir(paths.images_dir()).unwrap().count(), 1);
         // A keyring that did not sign the archive: nothing is fetched.
         let mut wrong = entry.clone();
         wrong.id = "wrong-key".into();

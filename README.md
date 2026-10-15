@@ -70,13 +70,17 @@ Guest images (`stallo images` lists them):
 | `ubuntu-24.04` | Ubuntu 24.04 LTS server cloud image | |
 | `fedora-44` | Fedora 44 Cloud Base Generic (44-1.7) | The guest agent's SELinux domain is made permissive (see `catalog/fedora-44.toml`). Offline only for now. |
 | `arch` | Arch Linux cloud image (arch-boxes) | No Secure Boot (its boot loader is not signed for it). Rolling: `latest/` moves every two weeks, and the first pull is kept. Offline only for now. |
+| `debian-13` | Debian 13 generic cloud image (20261015-2632) | Pinned (upstream unsigned): Debian signs no checksums for its cloud images, so Stallo checks a SHA-512 built into it, and a newer build needs a Stallo release. Offline only for now. |
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
 Ubuntu images are checked with the host's Ubuntu keyrings; other
 distributions' signing keys ship with Stallo in `catalog/keys/`. Arch signs
 the image itself rather than a checksum list; a signature older than 45
-days is refused. The `internet` profile is refused for images it was not
-verified with (`internet` in the catalog entry): so far the Ubuntu ones.
+days is refused. Debian's image has no signature at all: its SHA-512 is
+pinned in the catalog (`catalog/debian-13.toml`), while its guest-agent
+package comes from the signed Debian archive. The `internet` profile is
+refused for images it was not verified with (`internet` in the catalog
+entry): so far the Ubuntu ones.
 
 What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 
