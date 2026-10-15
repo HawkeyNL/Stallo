@@ -1,20 +1,22 @@
 //! The connected window: the VM list with the host meter, and a VM's
-//! overview with its lifecycle actions. All text from the daemon goes
-//! through the view-model (`stallo::printable`) into plain labels.
+//! overview with its lifecycle actions and its snapshots. All text from
+//! the daemon goes through the view-model (`stallo::printable`) into plain
+//! labels.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::time::Instant;
+use std::rc::{Rc, Weak};
+use std::time::{Instant, SystemTime};
 
 use adw::prelude::*;
 use adw::{gio, glib, gtk};
 use libadwaita as adw;
 use stallo::api::{VmDetails, VmInfo};
+use stallo::snapshot::Snapshot;
 
 use crate::Ui;
 use crate::client;
-use crate::model::{self, Op, Pending, Poll};
+use crate::model::{self, Action, Op, Pending, Poll};
 
 /// The pill around a VM's state in the sidebar.
 pub const CSS: &str = ".state-pill { border-radius: 999px; padding: 1px 8px; background-color: alpha(currentColor, 0.12); }";
@@ -53,19 +55,45 @@ struct Row {
     shown: RefCell<Option<model::RowVm>>,
 }
 
-/// The content pane for one VM.
+/// The content pane for one VM: the Overview and Snapshots tabs.
 struct Detail {
     name: String,
+    vms: Weak<Vms>,
     page: adw::NavigationPage,
     /// In [`Op::ALL`] order.
     actions: Vec<gio::SimpleAction>,
     resume: gtk::Button,
     stop: adw::SplitButton,
     force_off: gtk::Button,
+    /// Shown while an action on this VM runs.
+    busy: adw::Spinner,
     values: Vec<adw::ActionRow>,
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
+    tabs: adw::ViewStack,
+    take: gtk::Button,
+    /// A spinner until the first snapshot list, then the timeline.
+    snaps_view: gtk::Stack,
+    timeline: gtk::ListBox,
+    snap_rows: RefCell<Vec<SnapWidgets>>,
+    /// Oldest first, as the daemon lists them.
+    snaps: RefCell<Option<Vec<Snapshot>>>,
+    snaps_poll: RefCell<Poll>,
 }
+
+/// One snapshot on the timeline.
+struct SnapWidgets {
+    tag: String,
+    row: adw::ActionRow,
+    chip: gtk::Label,
+    restore: gtk::Button,
+    delete: gtk::Button,
+}
+
+/// The name of the Snapshots tab in [`Detail::tabs`].
+const SNAPSHOTS: &str = "snapshots";
+/// Under the name of a new snapshot.
+const NAME_HINT: &str = "Optional. Without a name it is called snap1, snap2 and so on.";
 
 impl Vms {
     pub fn new(ui: &Rc<Ui>, socket: PathBuf) -> Rc<Self> {
@@ -272,6 +300,34 @@ impl Vms {
             return;
         };
         let visible = !self.split.is_collapsed() || self.split.shows_content();
+        // Not while an action on the VM runs: the daemon would make the
+        // list wait for it. The action asks again when it is done.
+        if visible
+            && detail.tabs.visible_child_name().as_deref() == Some(SNAPSHOTS)
+            && !self.pending.borrow().blocks(&detail.name)
+            && detail.snaps_poll.borrow_mut().due(now)
+        {
+            let (v, socket, name) = (self.clone(), self.socket.clone(), detail.name.clone());
+            let detail = detail.clone();
+            glib::spawn_future_local(async move {
+                let got =
+                    client::spawn(async move { client::snapshots(&socket, name).await }).await;
+                let ok = matches!(got, Ok(Ok(_)));
+                detail.snaps_poll.borrow_mut().done(Instant::now(), ok);
+                match got {
+                    Ok(Ok(list)) => {
+                        *detail.snaps.borrow_mut() = Some(list);
+                        v.refresh(&detail);
+                    }
+                    // Only the first time: later the old list stays.
+                    Ok(Err(e)) if detail.snaps.borrow().is_none() => v.ui.toast(&format!(
+                        "Could not list the snapshots of {}: {e}",
+                        stallo::printable(&detail.name, 64)
+                    )),
+                    _ => {}
+                }
+            });
+        }
         let have = detail.details.borrow().is_some();
         if model::wants_info(visible, model::kind(&vm.state), have)
             && detail.poll.borrow_mut().due(now)
@@ -343,15 +399,7 @@ impl Vms {
         };
         let current = self.detail.borrow().clone();
         if current.is_none_or(|d| d.name != vm.name) {
-            let detail = Detail::new(&vm);
-            for (action, op) in detail.actions.iter().zip(Op::ALL) {
-                let (v, name) = (Rc::downgrade(self), vm.name.clone());
-                action.connect_activate(move |_, _| {
-                    if let Some(v) = v.upgrade() {
-                        v.ask(op, &name);
-                    }
-                });
-            }
+            let detail = Detail::new(&vm, self);
             self.split.set_content(Some(&detail.page));
             self.refresh(&detail);
             *self.detail.borrow_mut() = Some(detail);
@@ -365,8 +413,8 @@ impl Vms {
     /// Updates the open VM's page from what is known now.
     fn refresh(&self, detail: &Detail) {
         if let Some(vm) = self.vm(&detail.name) {
-            let blocked = !self.online.get() || self.pending.borrow().blocks(&detail.name);
-            detail.update(&vm, blocked);
+            let busy = self.pending.borrow().blocks(&detail.name);
+            detail.update(&vm, self.online.get(), busy);
         }
     }
 
@@ -376,14 +424,46 @@ impl Vms {
         }
     }
 
-    /// Runs an action, after a confirmation if it may lose data.
+    /// Runs a lifecycle action, after a confirmation if it may lose data.
     fn ask(self: &Rc<Self>, op: Op, name: &str) {
         let Some(vm) = self.vm(name) else {
             return;
         };
-        let Some(c) = model::confirm(op, &vm) else {
-            return self.run(op, name);
-        };
+        match model::confirm(op, &vm) {
+            Some(c) => self.confirm(&c, Action::Life(op), name),
+            None => self.run(Action::Life(op), name),
+        }
+    }
+
+    /// The open VM and its snapshot `tag`, if both are still there.
+    fn snapshot(&self, name: &str, tag: &str) -> Option<(VmInfo, Snapshot)> {
+        let detail = self.detail.borrow().clone().filter(|d| d.name == name)?;
+        let snap = detail
+            .snaps
+            .borrow()
+            .iter()
+            .flatten()
+            .find(|s| s.name == tag)
+            .cloned()?;
+        Some((self.vm(name)?, snap))
+    }
+
+    fn ask_restore(self: &Rc<Self>, name: &str, tag: &str) {
+        if let Some((vm, snap)) = self.snapshot(name, tag) {
+            let c = model::confirm_restore(&vm, &snap);
+            self.confirm(&c, Action::Restore(snap.name), name);
+        }
+    }
+
+    fn ask_delete(self: &Rc<Self>, name: &str, tag: &str) {
+        if let Some((vm, snap)) = self.snapshot(name, tag) {
+            let c = model::confirm_delete(&vm, &snap.name);
+            self.confirm(&c, Action::Delete(snap.name), name);
+        }
+    }
+
+    /// Asks before `action`, with Cancel as the default.
+    fn confirm(self: &Rc<Self>, c: &model::Confirm, action: Action, name: &str) {
         let dialog = adw::AlertDialog::builder()
             .heading(&c.heading)
             .heading_use_markup(false)
@@ -398,34 +478,122 @@ impl Vms {
         let (v, name) = (Rc::downgrade(self), name.to_owned());
         dialog.connect_response(Some("confirm"), move |_, _| {
             if let Some(v) = v.upgrade() {
-                v.run(op, &name);
+                v.run(action.clone(), &name);
             }
         });
         dialog.present(Some(&self.root));
     }
 
-    /// Runs a lifecycle action; one per VM at a time.
-    fn run(self: &Rc<Self>, op: Op, name: &str) {
+    /// Asks for an optional name, checked as the daemon checks it.
+    fn ask_take(self: &Rc<Self>, name: &str) {
+        let detail = self.detail.borrow().clone().filter(|d| d.name == name);
+        let (Some(vm), Some(detail)) = (self.vm(name), detail) else {
+            return;
+        };
+        let snaps = detail.snaps.borrow().clone();
+        let entry = adw::EntryRow::builder()
+            .title("Name")
+            .activates_default(true)
+            .build();
+        let names = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        names.append(&entry);
+        let hint = gtk::Label::builder()
+            .label(NAME_HINT)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        // Read out with the entry: the hint, or why the name is refused.
+        entry
+            .upcast_ref::<gtk::Widget>()
+            .update_relation(&[gtk::accessible::Relation::DescribedBy(&[hint.upcast_ref()])]);
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        content.append(&names);
+        content.append(&hint);
+        let dialog = adw::AlertDialog::builder()
+            .heading("Take Snapshot")
+            .body(model::take_note(&vm))
+            .body_use_markup(false)
+            .extra_child(&content)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("take", "Take Snapshot");
+        dialog.set_response_appearance("take", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("take"));
+        dialog.set_close_response("cancel");
+        // Weak: the dialog owns the entry and so this handler.
+        let (d, list) = (dialog.downgrade(), snaps.clone());
+        entry.connect_changed(move |e| {
+            let checked = model::snapshot_name(&e.text(), list.as_deref());
+            if let Some(d) = d.upgrade() {
+                d.set_response_enabled("take", checked.is_ok());
+            }
+            match checked {
+                Ok(_) => {
+                    e.remove_css_class("error");
+                    hint.set_label(NAME_HINT);
+                }
+                Err(why) => {
+                    e.add_css_class("error");
+                    hint.set_label(&why);
+                }
+            }
+        });
+        let (v, name) = (Rc::downgrade(self), name.to_owned());
+        dialog.connect_response(Some("take"), move |_, _| {
+            if let (Some(v), Ok(tag)) = (
+                v.upgrade(),
+                model::snapshot_name(&entry.text(), snaps.as_deref()),
+            ) {
+                v.run(Action::Take(tag), &name);
+            }
+        });
+        dialog.present(Some(&self.root));
+    }
+
+    /// Runs an action; one per VM at a time.
+    fn run(self: &Rc<Self>, action: Action, name: &str) {
         if !self.online.get() || !self.pending.borrow_mut().start(name) {
             return;
         }
         self.refresh_open();
         let (v, socket, name) = (self.clone(), self.socket.clone(), name.to_owned());
         glib::spawn_future_local(async move {
-            let vm = name.clone();
-            let got = client::spawn(async move { client::act(&socket, op, &vm).await }).await;
+            let (vm, sent) = (name.clone(), action.clone());
+            let got = client::spawn(async move { client::act(&socket, &sent, &vm).await }).await;
             // Its buttons stay off until a list asked for from now on.
             v.pending.borrow_mut().finish(&name, Instant::now());
-            if let Ok(Err(e)) = got {
-                v.ui.toast(&op.failed(&name, &e));
+            match got {
+                Ok(Ok(data)) => {
+                    if let Some(text) = action.done(&name, &data) {
+                        v.ui.toast(&text);
+                    }
+                }
+                Ok(Err(e)) => v.ui.toast(&action.failed(&name, &e)),
+                Err(_) => {}
             }
             v.refresh_open();
             v.list_poll.borrow_mut().soon();
             if let Some(d) = v.detail.borrow().as_ref() {
                 d.poll.borrow_mut().soon();
+                d.snaps_poll.borrow_mut().soon();
             }
             v.tick();
         });
+    }
+
+    /// The Snapshots tab may have come into view: fresh data now.
+    fn tab_changed(self: &Rc<Self>) {
+        if let Some(d) = self.detail.borrow().as_ref() {
+            d.snaps_poll.borrow_mut().soon();
+        }
+        self.tick();
     }
 
     fn show_host(&self, m: &model::Meter) {
@@ -497,12 +665,18 @@ impl Row {
 }
 
 impl Detail {
-    fn new(vm: &VmInfo) -> Rc<Self> {
+    fn new(vm: &VmInfo, vms: &Rc<Vms>) -> Rc<Self> {
         let group = gio::SimpleActionGroup::new();
         let actions: Vec<gio::SimpleAction> = Op::ALL
             .iter()
-            .map(|op| {
+            .map(|&op| {
                 let a = gio::SimpleAction::new(op.action(), None);
+                let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+                a.connect_activate(move |_, _| {
+                    if let Some(v) = v.upgrade() {
+                        v.ask(op, &name);
+                    }
+                });
                 group.add_action(&a);
                 a
             })
@@ -534,11 +708,16 @@ impl Detail {
             .css_classes(["destructive-action"])
             .visible(false)
             .build();
+        let busy = adw::Spinner::builder()
+            .tooltip_text("Working")
+            .visible(false)
+            .build();
         let header = adw::HeaderBar::new();
         header.pack_end(&stop);
         header.pack_end(&force_off);
         header.pack_end(&start);
         header.pack_end(&resume);
+        header.pack_end(&busy);
 
         let overview = adw::PreferencesPage::new();
         let mut values = Vec::new();
@@ -556,25 +735,120 @@ impl Detail {
             }
             overview.add(&group);
         }
+
+        let take = gtk::Button::builder()
+            .label("Take Snapshot")
+            .valign(gtk::Align::Center)
+            .build();
+        let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+        take.connect_clicked(move |_| {
+            if let Some(v) = v.upgrade() {
+                v.ask_take(&name);
+            }
+        });
+        let timeline = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        timeline.set_placeholder(Some(
+            &gtk::Label::builder()
+                .label("No snapshots yet")
+                .margin_top(12)
+                .margin_bottom(12)
+                .css_classes(["dim-label"])
+                .build(),
+        ));
+        let snaps_view = gtk::Stack::new();
+        snaps_view.add_named(&adw::Spinner::new(), Some("loading"));
+        snaps_view.add_named(&timeline, Some("list"));
+        // Fixed text only: descriptions are markup.
+        let snaps_group = adw::PreferencesGroup::builder()
+            .title("Timeline")
+            .description(
+                "Newest first. A snapshot saves the disk, and the memory unless the VM is stopped.",
+            )
+            .header_suffix(&take)
+            .build();
+        snaps_group.add(&snaps_view);
+        let snapshots = adw::PreferencesPage::new();
+        snapshots.add(&snaps_group);
+
+        let tabs = adw::ViewStack::new();
+        tabs.add_titled_with_icon(&overview, Some("overview"), "Overview", "computer-symbolic");
+        tabs.add_titled_with_icon(
+            &snapshots,
+            Some(SNAPSHOTS),
+            "Snapshots",
+            "camera-photo-symbolic",
+        );
+        // Tabs in the header bar, or at the bottom when narrow.
+        let switcher = adw::ViewSwitcher::builder()
+            .stack(&tabs)
+            .policy(adw::ViewSwitcherPolicy::Wide)
+            .build();
+        let title = gtk::Label::builder()
+            .label(stallo::printable(&vm.name, 64))
+            .css_classes(["title"])
+            .build();
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let titles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        titles.append(&switcher);
+        titles.append(&title);
+        header.set_title_widget(Some(&titles));
+        let bar = adw::ViewSwitcherBar::builder().stack(&tabs).build();
+        vms.split
+            .bind_property("collapsed", &switcher, "visible")
+            .invert_boolean()
+            .sync_create()
+            .build();
+        vms.split
+            .bind_property("collapsed", &title, "visible")
+            .sync_create()
+            .build();
+        vms.split
+            .bind_property("collapsed", &bar, "reveal")
+            .sync_create()
+            .build();
+        let view = toolbar(&header, &tabs);
+        view.add_bottom_bar(&bar);
+        let v = Rc::downgrade(vms);
+        tabs.connect_visible_child_name_notify(move |_| {
+            if let Some(v) = v.upgrade() {
+                v.tab_changed();
+            }
+        });
+
         let page = adw::NavigationPage::builder()
             .title(stallo::printable(&vm.name, 64))
-            .child(&toolbar(&header, &overview))
+            .child(&view)
             .build();
         page.insert_action_group("vm", Some(&group));
         Rc::new(Self {
             name: vm.name.clone(),
+            vms: Rc::downgrade(vms),
             page,
             actions,
             resume,
             stop,
             force_off,
+            busy,
             values,
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
+            tabs,
+            take,
+            snaps_view,
+            timeline,
+            snap_rows: RefCell::default(),
+            snaps: RefCell::default(),
+            snaps_poll: RefCell::new(Poll::new(model::SNAPS_EVERY)),
         })
     }
 
-    fn update(&self, vm: &VmInfo, blocked: bool) {
+    /// Shows `vm` as it is now. No actions while offline or `busy` (an
+    /// action on it runs or just ran).
+    fn update(&self, vm: &VmInfo, online: bool, busy: bool) {
+        let blocked = !online || busy;
         let set = model::actions(vm, blocked);
         for (action, op) in self.actions.iter().zip(Op::ALL) {
             action.set_enabled(set.allows(op));
@@ -582,12 +856,102 @@ impl Detail {
         self.resume.set_visible(set.halted);
         self.force_off.set_visible(set.halted);
         self.stop.set_visible(!set.halted);
+        self.busy.set_visible(busy);
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {
             if row.subtitle().as_deref() != Some(value.as_str()) {
                 row.set_subtitle(&value);
             }
+        }
+
+        let snaps = self.snaps.borrow();
+        let full = model::take_block(snaps.as_deref());
+        self.take.set_sensitive(!blocked && full.is_none());
+        self.take.set_tooltip_text(full.as_deref());
+        let Some(snaps) = snaps.as_ref() else {
+            return;
+        };
+        self.snaps_view.set_visible_child_name("list");
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let rows = model::timeline(vm, snaps, now);
+        let same = {
+            let shown = self.snap_rows.borrow();
+            shown.len() == rows.len() && shown.iter().zip(&rows).all(|(w, r)| w.tag == r.tag)
+        };
+        if !same {
+            self.timeline.remove_all();
+            let widgets: Vec<SnapWidgets> = rows.iter().map(|r| self.snap_row(r)).collect();
+            for w in &widgets {
+                self.timeline.append(&w.row);
+            }
+            *self.snap_rows.borrow_mut() = widgets;
+        }
+        for (w, r) in self.snap_rows.borrow().iter().zip(&rows) {
+            if w.row.subtitle().as_deref() != Some(r.subtitle.as_str()) {
+                w.row.set_subtitle(&r.subtitle);
+            }
+            w.chip.set_visible(r.memory);
+            w.restore
+                .set_sensitive(!blocked && r.restore_block.is_none());
+            w.restore.set_tooltip_text(r.restore_block);
+            w.delete.set_sensitive(!blocked);
+        }
+    }
+
+    fn snap_row(&self, r: &model::SnapRow) -> SnapWidgets {
+        let row = adw::ActionRow::builder()
+            .title(&r.name)
+            .use_markup(false)
+            .build();
+        let chip = gtk::Label::builder()
+            .label("With memory")
+            .valign(gtk::Align::Center)
+            .css_classes(["caption", "state-pill", "accent"])
+            .build();
+        let restore = gtk::Button::builder()
+            .label("Restore")
+            .valign(gtk::Align::Center)
+            .build();
+        let delete = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        // The label child would name it plain "Restore".
+        restore.reset_relation(gtk::AccessibleRelation::LabelledBy);
+        restore.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Restore {}",
+            r.name
+        ))]);
+        delete.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Delete {}",
+            r.name
+        ))]);
+        row.add_suffix(&chip);
+        row.add_suffix(&restore);
+        row.add_suffix(&delete);
+        let (v, name, tag) = (self.vms.clone(), self.name.clone(), r.tag.clone());
+        restore.connect_clicked(move |_| {
+            if let Some(v) = v.upgrade() {
+                v.ask_restore(&name, &tag);
+            }
+        });
+        let (v, name, tag) = (self.vms.clone(), self.name.clone(), r.tag.clone());
+        delete.connect_clicked(move |_| {
+            if let Some(v) = v.upgrade() {
+                v.ask_delete(&name, &tag);
+            }
+        });
+        SnapWidgets {
+            tag: r.tag.clone(),
+            row,
+            chip,
+            restore,
+            delete,
         }
     }
 }
