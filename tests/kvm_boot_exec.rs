@@ -77,6 +77,7 @@ fn boot_exec_stop_rm() {
         d.ok(&["exec", "dev", "--", "ls", "/sys/class/net"]).trim(),
         "lo"
     );
+    assert_no_wait_online(&d);
 
     // File round trip through the guest agent.
     let src = d.base.join("blob");
@@ -126,6 +127,7 @@ fn boot_exec_stop_rm() {
         t.elapsed().as_secs_f64()
     );
     d.assert_safe("dev");
+    assert_no_wait_online(&d);
     fs::remove_file(&back).unwrap();
     d.ok(&["cp", "dev:/home/agent/blob", back.to_str().unwrap()]);
     assert_eq!(fs::read(&back).unwrap(), blob);
@@ -146,6 +148,22 @@ fn boot_exec_stop_rm() {
             .unwrap()
             .any(|e| { e.unwrap().file_name().to_string_lossy().starts_with("vm-") })
     );
+}
+
+/// systemd-networkd-wait-online never started in the guest: without a
+/// NIC it would hold the boot for 2 minutes (see qemu.rs and seed.rs).
+fn assert_no_wait_online(d: &Daemon) {
+    let started = d.ok(&[
+        "exec",
+        "dev",
+        "--",
+        "systemctl",
+        "show",
+        "-P",
+        "ExecMainStartTimestampMonotonic",
+        "systemd-networkd-wait-online.service",
+    ]);
+    assert_eq!(started.trim(), "0", "wait-online ran");
 }
 
 /// Resident KiB of `pid`: (total, in mappings of at least `guest_kib`,

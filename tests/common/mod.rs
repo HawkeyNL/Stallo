@@ -108,13 +108,18 @@ fn kill_stale_units() {
 }
 
 /// Panics if any QEMU of this user is running (for example a dev-mode VM):
-/// the test would be a second VM on the host.
+/// the test would be a second VM on the host. A QEMU killed by the previous
+/// test can leave its cgroup before it is reaped, so give it 10 s to go.
 fn assert_no_other_qemu() {
     let uid = rustix::process::getuid().as_raw().to_string();
-    let out = Command::new("pgrep")
-        .args(["-u", &uid, "qemu-system"])
-        .output()
-        .unwrap();
+    let pgrep = || {
+        Command::new("pgrep")
+            .args(["-u", &uid, "qemu-system"])
+            .output()
+            .unwrap()
+    };
+    let _ = wait_for(Duration::from_secs(10), || pgrep().stdout.is_empty());
+    let out = pgrep();
     assert!(
         out.stdout.is_empty(),
         "another QEMU of this user is running (pids {}); stop it first",
