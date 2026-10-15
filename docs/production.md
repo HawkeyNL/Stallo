@@ -22,7 +22,8 @@ a release build with `dpkg-deb` (no root, no extra tools).
 
 **Depends:** `apparmor`, `nftables`, `passt`, `qemu-system-x86 (>= 1:10.2)`,
 `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
-`ubuntu-cloudimage-keyring`, `passwd` (`useradd`), and `systemd (>= 257)`
+`ubuntu-cloudimage-keyring`, `ubuntu-keyring`, `passwd` (`useradd`), and
+`systemd (>= 257)`
 (older versions ignore `ProtectControlGroups=private`).
 
 **Maintainer scripts:**
@@ -239,8 +240,13 @@ review fix, passed **all 147 checks** on a fresh lab VM.
 
 - **The image download** (`curl` to cloud-images.ubuntu.com) under the
   unit: the lab is offline.
-  - The guest-agent download (`apt-get download`) did run under the unit,
-    from the lab's local apt source.
+  - The guest-agent packages come from apt in a private root under
+    `/var/lib/stallo/images/` (HTTPS to archive.ubuntu.com and
+    security.ubuntu.com, only the Ubuntu archive key trusted). It writes
+    nowhere else and needs no root, but it has not run under the unit yet;
+    the lab gate only seeds the packages. Check it once on the host with
+    `stallo images pull ubuntu-26.04` after removing
+    `/var/lib/stallo/images/ubuntu-26.04.debs`.
   - DNS for both goes through `127.0.0.53`, which the table allows for
     the daemon.
 - **A reboot of a host with the package installed.** The units are
