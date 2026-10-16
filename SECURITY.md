@@ -65,15 +65,28 @@ the port can still use up the connection slots: Tailscale ACLs are the
 real boundary. Anyone with the token can do what agents may do; keep the
 file private and rotate it by restarting with a new one.
 
+## Images
+
+A cached image is a VM disk's read-only base, so `stallo images rm` (humans
+only) is refused while any VM, stopped VMs and `stallo run` clones
+included, names it in `vm.toml` or has a disk whose qcow2 header names it
+as backing file; it never follows symlinks. A pull needs the disk floor
+plus twice the image's largest size free, so a download cannot push the
+host below the floor. Signatures on moving URLs are refused when too old:
+over 90 days for Ubuntu's `current/` checksum lists, over 45 days for
+Arch's `latest/` image.
+
 ## Agent policy
 
 Agents reach Stallo through `stallo mcp`, which marks its requests
 `via: mcp`. The daemon then refuses every tool on a VM whose agent
 control is off (the default; `stallo agent <vm> on` turns it on), refuses
 VM creation unless `agents_can_create = true` in `stallod.toml`, and
-never lets agents delete VMs, pull images, resume VMs or change agent
-control. Turning agent control off stops new agent calls; calls already
-running (an `exec` can run up to an hour) finish first.
+never lets agents delete VMs, pull or delete images, resume VMs or change
+agent control. Agents create VMs only from images a human has already pulled
+(`stallo images pull <id>`). Turning agent control off stops new agent
+calls; calls already running (an `exec` can run up to an hour) finish
+first.
 
 `via` is declared by the client. This is policy for well-behaved agents,
 not a boundary: any process that can reach the API socket (in dev mode,
@@ -98,9 +111,9 @@ add only trusted users, and agents only through `stallo mcp`.
 Every API call is logged, one JSON line each, in
 `<data>/audit/<vm>.jsonl` (or `_daemon.jsonl` for calls that name no
 existing VM): time, peer UID and PID, `via`, operation, argument sizes,
-`argv[0]` for exec, result size, duration and ok/error. Never typed text,
-file data, file paths, exec arguments after `argv[0]`, stdin or error
-messages. Logs rotate at 10 MiB (three kept) and outlive `stallo rm`. An
+`argv[0]` for exec, the image id for `pull` and `image_rm`, result size,
+duration and ok/error. Never typed text, file data, file paths, exec
+arguments after `argv[0]`, stdin or error messages. Logs rotate at 10 MiB (three kept) and outlive `stallo rm`. An
 agent call that cannot be logged is refused.
 
 Known limitation: in dev mode the daemon runs as the developer's own user, so

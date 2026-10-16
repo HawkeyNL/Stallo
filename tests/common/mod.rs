@@ -26,7 +26,8 @@
 //!   through `safe_remove`; it keeps them if anything is still alive.
 //!
 //! Images are hard-linked from the dev-mode cache, so pull the image once
-//! with dev mode first.
+//! with dev mode first. Tests use `ubuntu-26.04` unless `STALLO_IT_IMAGE_ID`
+//! names another catalog image.
 
 #![allow(dead_code)]
 
@@ -46,6 +47,8 @@ pub const HEADROOM_MIB: u64 = 6144;
 
 pub struct Daemon {
     pub name: String,
+    /// The image every test VM is created from, see [`image_id`].
+    pub image: String,
     unit: String,
     cache_root: PathBuf,
     pub base: PathBuf,
@@ -67,6 +70,13 @@ pub fn enabled() -> bool {
         eprintln!("skipped: set STALLO_IT=1 to run KVM integration tests");
     }
     on
+}
+
+/// `STALLO_IT_IMAGE_ID`, or `ubuntu-26.04`.
+pub fn image_id() -> String {
+    let id = std::env::var("STALLO_IT_IMAGE_ID").unwrap_or_else(|_| "ubuntu-26.04".into());
+    stallo::config::validate_image_id(&id).unwrap();
+    id
 }
 
 pub fn env_path(var: &str) -> PathBuf {
@@ -98,13 +108,18 @@ fn kill_stale_units() {
 }
 
 /// Panics if any QEMU of this user is running (for example a dev-mode VM):
-/// the test would be a second VM on the host.
+/// the test would be a second VM on the host. A QEMU killed by the previous
+/// test can leave its cgroup before it is reaped, so give it 10 s to go.
 fn assert_no_other_qemu() {
     let uid = rustix::process::getuid().as_raw().to_string();
-    let out = Command::new("pgrep")
-        .args(["-u", &uid, "qemu-system"])
-        .output()
-        .unwrap();
+    let pgrep = || {
+        Command::new("pgrep")
+            .args(["-u", &uid, "qemu-system"])
+            .output()
+            .unwrap()
+    };
+    let _ = wait_for(Duration::from_secs(10), || pgrep().stdout.is_empty());
+    let out = pgrep();
     assert!(
         out.stdout.is_empty(),
         "another QEMU of this user is running (pids {}); stop it first",
@@ -161,23 +176,27 @@ impl Daemon {
         safe_remove(&run_root, &runtime).unwrap();
         let data = base.join("data");
         let images = data.join("images");
-        fs::create_dir_all(images.join("debs")).unwrap();
+        fs::create_dir_all(&images).unwrap();
         fs::write(data.join("stallod.toml"), config).unwrap();
 
-        // Hard-link the cached image (free) and copy the debs (small).
+        // Hard-link the cached image (free) and copy the debs (small), if
+        // the image needs any.
+        let id = image_id();
         let source = home.join(".local/share/stallo-dev/images");
-        let image = source.join("ubuntu-26.04.qcow2");
+        let image = source.join(format!("{id}.qcow2"));
         assert!(
             image.exists(),
-            "{} missing; run `stallo images pull ubuntu-26.04` in dev mode first",
+            "{} missing; run `stallo images pull {id}` in dev mode first",
             image.display()
         );
-        fs::hard_link(&image, images.join("ubuntu-26.04.qcow2")).unwrap();
-        let debs = images.join("debs/26.04");
-        fs::create_dir(&debs).unwrap();
-        for e in fs::read_dir(source.join("debs/26.04")).unwrap() {
-            let e = e.unwrap();
-            fs::copy(e.path(), debs.join(e.file_name())).unwrap();
+        fs::hard_link(&image, images.join(format!("{id}.qcow2"))).unwrap();
+        let debs = images.join(format!("{id}.debs"));
+        if let Ok(cached) = fs::read_dir(source.join(format!("{id}.debs"))) {
+            fs::create_dir(&debs).unwrap();
+            for e in cached {
+                let e = e.unwrap();
+                fs::copy(e.path(), debs.join(e.file_name())).unwrap();
+            }
         }
 
         let unit = format!("stallo-it-{name}");
@@ -225,6 +244,7 @@ impl Daemon {
         let socket = runtime.join("api.sock");
         let d = Self {
             name: name.to_owned(),
+            image: id,
             unit,
             cache_root,
             base,

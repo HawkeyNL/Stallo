@@ -15,7 +15,9 @@ fn memory_limit_is_enforced() {
         return;
     }
     let d = Daemon::start("limits", "");
-    d.ok(&["new", "lim", "--cpus", "1", "--mem", "1G", "--disk", "10G"]);
+    d.ok(&[
+        "new", "lim", "--image", &d.image, "--cpus", "1", "--mem", "1G", "--disk", "10G",
+    ]);
     d.assert_safe("lim");
 
     let cg = d.vm_cgroup("lim");

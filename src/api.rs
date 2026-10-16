@@ -192,6 +192,10 @@ pub enum Request {
     Pull {
         image: String,
     },
+    /// Deletes a cached image no VM uses (humans only).
+    ImageRm {
+        image: String,
+    },
 }
 
 /// One response line: `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
@@ -304,7 +308,23 @@ pub const FILE_WRITE_CHUNK: usize = 512 << 10;
 pub struct ImageInfo {
     pub id: String,
     pub name: String,
+    /// The image and its guest-agent packages are downloaded and verified.
     pub cached: bool,
+    // Optional: an older stallod does not send these.
+    #[serde(default)]
+    pub os: Option<crate::images::Os>,
+    #[serde(default)]
+    pub trust: Option<crate::images::Trust>,
+    /// Bytes of the cached image file.
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    /// Date of the signature the cached image was verified with
+    /// (`YYYY-MM-DD`), if the pull recorded one.
+    #[serde(default)]
+    pub sig_date: Option<String>,
+    /// Things to know before using the image.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// What an agent (`via: mcp`) may do with a request.
@@ -329,6 +349,7 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         New { .. } => Gate::Create,
         Rm { .. }
         | Pull { .. }
+        | ImageRm { .. }
         | Resume { .. }
         | SetAgent { .. }
         | SetVnc { .. }
@@ -481,6 +502,21 @@ mod tests {
     fn agent_gates() {
         let name = || "dev".to_owned();
         assert_eq!(agent_gate(&Request::List), Gate::Open);
+        // image_list reads only the catalog and cache; pulling stays human,
+        // also through `new` (the daemon refuses images that are not cached).
+        assert_eq!(agent_gate(&Request::Images), Gate::Open);
+        assert_eq!(
+            agent_gate(&Request::Pull {
+                image: "ubuntu-26.04".into()
+            }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::ImageRm {
+                image: "ubuntu-26.04".into()
+            }),
+            Gate::Closed
+        );
         assert_eq!(
             agent_gate(&Request::SetAgent {
                 name: name(),

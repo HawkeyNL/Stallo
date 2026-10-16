@@ -98,9 +98,9 @@ setup_net() {
 # --- The daemon, as user stallo, in production mode --------------------------
 setup_daemon() {
 	id stallo >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --groups kvm stallo
-	install -d -o stallo -g stallo -m 700 /var/lib/stallo /var/lib/stallo/images /var/lib/stallo/images/debs
+	install -d -o stallo -g stallo -m 700 /var/lib/stallo /var/lib/stallo/images
 	install -o stallo -g stallo -m 444 "$IMAGES/ubuntu-26.04.qcow2" /var/lib/stallo/images/
-	cp -r "$IMAGES/debs/26.04" /var/lib/stallo/images/debs/ && chown -R stallo:stallo /var/lib/stallo/images/debs
+	cp -r "$IMAGES/debs/26.04" /var/lib/stallo/images/ubuntu-26.04.debs && chown -R stallo:stallo /var/lib/stallo/images/ubuntu-26.04.debs
 	# A 2-vCPU, 3 GiB lab VM: room for one 1-vCPU, 1 GiB guest.
 	cat >/var/lib/stallo/stallod.toml <<-'EOF'
 		[host]
