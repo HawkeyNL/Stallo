@@ -4,6 +4,7 @@
 
 mod client;
 mod model;
+mod rfb;
 mod vms;
 
 use std::cell::{Cell, RefCell};
