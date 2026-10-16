@@ -11,6 +11,7 @@ use stallo::api::{Request, VmDetails, VmInfo};
 use stallo::config::NetProfile;
 use stallo::host::HostInfo;
 use stallo::printable;
+use stallo::snapshot::Snapshot;
 
 /// How often the window probes again while it shows an onboarding page.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -392,6 +393,93 @@ impl Op {
     }
 }
 
+/// The time limit of a snapshot action. The daemon gives the snapshot job
+/// alone 600 s; around it, it waits for the VM's lock, may start the VM,
+/// waits up to 10 s for the guest agent or stops the VM again. Also the
+/// longest any action may take.
+pub const SNAP_LIMIT: Duration = Duration::from_secs(900);
+
+/// Anything that changes a VM: a lifecycle [`Op`] or a snapshot action.
+/// Snapshot names are raw, as the daemon listed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Life(Op),
+    /// Takes a snapshot; the daemon picks a name if there is none.
+    Take(Option<String>),
+    Restore(String),
+    Delete(String),
+}
+
+impl Action {
+    pub fn request(&self, vm: &str) -> Request {
+        let name = vm.to_owned();
+        match self {
+            Action::Life(op) => op.request(vm),
+            Action::Take(tag) => Request::Snapshot {
+                name,
+                tag: tag.clone(),
+            },
+            Action::Restore(tag) => Request::Restore {
+                name,
+                tag: Some(tag.clone()),
+            },
+            Action::Delete(tag) => Request::SnapshotDelete {
+                name,
+                tag: tag.clone(),
+            },
+        }
+    }
+
+    pub fn limit(&self) -> Duration {
+        match self {
+            Action::Life(op) => op.limit(),
+            _ => SNAP_LIMIT,
+        }
+    }
+
+    /// The toast when it fails. A snapshot action that timed out may
+    /// still run in the daemon.
+    pub fn failed(&self, vm: &str, e: &CallError) -> String {
+        let vm = printable(vm, 64);
+        let (what, slow) = match self {
+            Action::Life(op) => return op.failed(&vm, e),
+            Action::Take(_) => (
+                format!("take a snapshot of {vm}"),
+                format!("The snapshot of {vm}"),
+            ),
+            Action::Restore(tag) => {
+                let tag = printable(tag, 64);
+                (format!("restore {tag}"), format!("Restoring {tag}"))
+            }
+            Action::Delete(tag) => {
+                let tag = printable(tag, 64);
+                (format!("delete {tag}"), format!("Deleting {tag}"))
+            }
+        };
+        match e {
+            CallError::Timeout => {
+                format!("{slow} takes long and may still be running; check the list later")
+            }
+            _ => format!("Could not {what}: {e}"),
+        }
+    }
+
+    /// The toast when it worked, given the daemon's answer. Snapshot
+    /// actions may take minutes, so they say when they are done.
+    pub fn done(&self, vm: &str, data: &serde_json::Value) -> Option<String> {
+        let vm = printable(vm, 64);
+        match self {
+            Action::Life(_) => None,
+            Action::Take(_) => Some(match data.get("name").and_then(|n| n.as_str()) {
+                Some(n) => format!("Snapshot {} taken", printable(n, 64)),
+                None => "Snapshot taken".to_owned(),
+            }),
+            Action::Restore(tag) => Some(format!("{vm} restored to {}", printable(tag, 64))),
+            Action::Delete(tag) => Some(format!("Snapshot {} deleted", printable(tag, 64))),
+        }
+    }
+}
+
 /// Which actions a VM offers now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ActionSet {
@@ -506,6 +594,151 @@ impl Pending {
 /// it runs, and once for a stopped VM (disk use).
 pub fn wants_info(page_visible: bool, kind: Kind, have: bool) -> bool {
     page_visible && (kind == Kind::Running || !have)
+}
+
+/// How often an open Snapshots tab asks for the list.
+pub const SNAPS_EVERY: Duration = Duration::from_secs(15);
+
+/// Whether the Snapshots tab leaves the daemon alone. `stuck` is the VM
+/// state and time of a snapshot list that timed out: its connection may
+/// still wait in the daemon for the VM's lock, behind a job of up to
+/// [`SNAP_LIMIT`], and every new list would queue one more. So no new list
+/// until the VM's state changes or that time is up.
+pub fn snaps_wait(stuck: Option<&(String, Instant)>, state: &str, now: Instant) -> bool {
+    stuck.is_some_and(|(s, at)| s == state && now < *at + SNAP_LIMIT)
+}
+
+/// One snapshot on the timeline. Display strings are safe for plain
+/// labels; `tag` is the raw name to send back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapRow {
+    pub tag: String,
+    pub name: String,
+    /// When it was taken, and the size of its saved memory.
+    pub subtitle: String,
+    /// It holds the VM's memory (RAM).
+    pub memory: bool,
+    /// Why it cannot be restored now, whatever else runs.
+    pub restore_block: Option<&'static str>,
+}
+
+/// The timeline: newest first. `now` is the host clock in Unix seconds.
+pub fn timeline(vm: &VmInfo, snaps: &[Snapshot], now: u64) -> Vec<SnapRow> {
+    snaps
+        .iter()
+        .rev()
+        .map(|s| {
+            let mut subtitle = age(now.saturating_sub(s.created));
+            if s.ram_bytes > 0 {
+                subtitle.push_str(" · ");
+                subtitle.push_str(&size(s.ram_bytes));
+            }
+            SnapRow {
+                tag: s.name.clone(),
+                name: printable(&s.name, 64),
+                subtitle,
+                memory: s.ram_bytes > 0,
+                restore_block: restore_block(vm, s),
+            }
+        })
+        .collect()
+}
+
+/// The daemon's restore rules, so the button is off where it would refuse.
+fn restore_block(vm: &VmInfo, snap: &Snapshot) -> Option<&'static str> {
+    if stallo::snapshot::ram_missing(snap) {
+        Some("Its saved memory is missing, so it cannot be restored")
+    } else if snap.ram_bytes == 0 && kind(&vm.state) != Kind::Stopped {
+        Some("Stop the VM to restore a snapshot without memory")
+    } else {
+        None
+    }
+}
+
+/// How long ago, in words.
+fn age(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..60 => return "Just now".to_owned(),
+        60..3600 => (secs / 60, "minute"),
+        3600..86400 => (secs / 3600, "hour"),
+        _ => (secs / 86400, "day"),
+    };
+    let s = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{s} ago")
+}
+
+fn size(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GiB", bytes as f64 / BYTES_PER_GIB)
+    } else {
+        format!("{} MiB", (bytes >> 20).max(1))
+    }
+}
+
+/// Why no snapshot can be taken now (the daemon's limit), if so.
+pub fn take_block(snaps: Option<&[Snapshot]>) -> Option<String> {
+    let max = stallo::snapshot::MAX_SNAPSHOTS;
+    snaps
+        .is_some_and(|s| s.len() >= max)
+        .then(|| format!("This VM has {max} snapshots, the most it can have. Delete one first."))
+}
+
+/// What a new snapshot of `vm` holds.
+pub fn take_note(vm: &VmInfo) -> &'static str {
+    match kind(&vm.state) {
+        Kind::Stopped => "The VM is stopped, so the snapshot holds its disk only.",
+        Kind::Running => {
+            "The snapshot holds the disk and the memory, so the VM can go back to this very moment. The VM pauses briefly while its memory is saved."
+        }
+        _ => {
+            "The snapshot holds the disk and the memory, so the VM can go back to this very moment."
+        }
+    }
+}
+
+/// The name typed for a new snapshot: none (the daemon picks one), or one
+/// that the daemon's own check accepts and that is not taken yet.
+pub fn snapshot_name(typed: &str, snaps: Option<&[Snapshot]>) -> Result<Option<String>, String> {
+    if typed.is_empty() {
+        return Ok(None);
+    }
+    stallo::config::validate_tag(typed).map_err(|e| printable(&e.to_string(), 200))?;
+    if snaps.is_some_and(|s| s.iter().any(|s| s.name == typed)) {
+        return Err("A snapshot with this name already exists".to_owned());
+    }
+    Ok(Some(typed.to_owned()))
+}
+
+/// The question before restoring `snap`.
+pub fn confirm_restore(vm: &VmInfo, snap: &Snapshot) -> Confirm {
+    let (vm_name, tag) = (printable(&vm.name, 64), printable(&snap.name, 64));
+    let then = match (snap.ram_bytes > 0, kind(&vm.state)) {
+        (true, Kind::Stopped) => "The VM starts from that moment.",
+        (true, Kind::Running) => "The VM carries on from that moment.",
+        // The daemon resumes only a VM that was running.
+        (true, _) => "The VM stays paused at that moment.",
+        (false, _) => "The VM stays stopped.",
+    };
+    Confirm {
+        heading: format!("Restore {tag}?"),
+        body: format!(
+            "{vm_name} goes back to the moment {tag} was taken. Everything that changed since then is lost, unless another snapshot holds it. {then}"
+        ),
+        button: "Restore",
+    }
+}
+
+/// The question before deleting snapshot `tag`.
+pub fn confirm_delete(vm: &VmInfo, tag: &str) -> Confirm {
+    let tag = printable(tag, 64);
+    Confirm {
+        heading: format!("Delete {tag}?"),
+        body: format!(
+            "Snapshot {tag} of {} is deleted for good. The VM itself does not change.",
+            printable(&vm.name, 64)
+        ),
+        button: "Delete",
+    }
 }
 
 const MIB_PER_GIB: f64 = 1024.0;
@@ -1279,6 +1512,243 @@ mod tests {
         };
         assert_eq!(no_budget(0), 0.0);
         assert_eq!(no_budget(1), 1.0);
+    }
+
+    fn snap(name: &str, ram_bytes: u64, created: u64, vm_clock_ms: u64) -> Snapshot {
+        Snapshot {
+            name: name.into(),
+            ram_bytes,
+            created,
+            vm_clock_ms,
+        }
+    }
+
+    #[test]
+    fn snapshot_timeline() {
+        let snaps = [
+            snap("disk", 0, 1000, 0),
+            snap("before-upgrade", 412 << 20, 9_000, 754_000),
+            snap("big", 3 << 29, 9_990, 1),
+            snap("lost", 0, 9_999, 5_000),
+        ];
+        let rows = timeline(&vm("stopped"), &snaps, 10_000);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["lost", "big", "before-upgrade", "disk"],
+            "newest first"
+        );
+        let subtitles: Vec<&str> = rows.iter().map(|r| r.subtitle.as_str()).collect();
+        assert_eq!(
+            subtitles,
+            [
+                "Just now",
+                "Just now · 1.5 GiB",
+                "16 minutes ago · 412 MiB",
+                "2 hours ago"
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.memory).collect::<Vec<_>>(),
+            [false, true, true, false]
+        );
+        // Stopped: everything restores but a RAM snapshot whose RAM is gone.
+        let blocks: Vec<_> = rows.iter().map(|r| r.restore_block).collect();
+        assert!(blocks[0].unwrap().contains("missing"));
+        assert_eq!(&blocks[1..], [None, None, None]);
+        // Running: a disk-only snapshot needs the VM stopped first.
+        for state in ["running", "paused", "paused (disk full)"] {
+            let rows = timeline(&vm(state), &snaps, 10_000);
+            assert!(
+                rows[0].restore_block.unwrap().contains("missing"),
+                "{state}"
+            );
+            assert_eq!(rows[1].restore_block, None, "{state}");
+            assert!(
+                rows[3].restore_block.unwrap().starts_with("Stop the VM"),
+                "{state}"
+            );
+        }
+        // Clock skew: never "in the future".
+        assert_eq!(
+            timeline(&vm("stopped"), &snaps[..1], 0)[0].subtitle,
+            "Just now"
+        );
+        // Daemon text is cleaned; the raw name goes back to the daemon.
+        let odd = timeline(&vm("stopped"), &[snap("a\u{202E}b", 0, 0, 0)], 0);
+        assert_eq!(
+            (odd[0].name.as_str(), odd[0].tag.as_str()),
+            ("ab", "a\u{202E}b")
+        );
+        for (secs, text) in [
+            (59, "Just now"),
+            (60, "1 minute ago"),
+            (7199, "1 hour ago"),
+            (7200, "2 hours ago"),
+            (86_400, "1 day ago"),
+            (10 * 86_400, "10 days ago"),
+        ] {
+            assert_eq!(age(secs), text);
+        }
+        assert_eq!(size(1), "1 MiB");
+    }
+
+    #[test]
+    fn taking_snapshots() {
+        let max = stallo::snapshot::MAX_SNAPSHOTS;
+        let full: Vec<Snapshot> = (0..max).map(|i| snap(&format!("s{i}"), 0, 0, 0)).collect();
+        assert_eq!(take_block(None), None);
+        assert_eq!(take_block(Some(&full[1..])), None);
+        assert!(take_block(Some(&full)).unwrap().contains(&max.to_string()));
+        assert!(take_note(&vm("running")).contains("pauses briefly"));
+        assert!(take_note(&vm("stopped")).contains("disk only"));
+        assert!(!take_note(&vm("paused")).contains("pauses"));
+
+        let some = Some(&full[..2]);
+        assert_eq!(snapshot_name("", some), Ok(None));
+        assert_eq!(
+            snapshot_name("before-upgrade.2", some),
+            Ok(Some("before-upgrade.2".into()))
+        );
+        assert_eq!(
+            snapshot_name("s1", some),
+            Err("A snapshot with this name already exists".into())
+        );
+        assert_eq!(snapshot_name("s1", None), Ok(Some("s1".into())));
+        // The library's own check, passed through.
+        for bad in ["1st", "with space", "a/b", "-x", &"x".repeat(65), "é"] {
+            let e = snapshot_name(bad, some).unwrap_err();
+            assert!(e.starts_with("invalid snapshot name"), "{bad}: {e}");
+            assert!(stallo::config::validate_tag(bad).is_err());
+        }
+        assert!(
+            !snapshot_name("a\u{1b}[31m", None)
+                .unwrap_err()
+                .contains('\u{1b}')
+        );
+    }
+
+    #[test]
+    fn snapshot_list_waits_after_a_timeout() {
+        let t0 = Instant::now();
+        let stuck = ("running".to_owned(), t0);
+        assert!(!snaps_wait(None, "running", t0));
+        assert!(snaps_wait(Some(&stuck), "running", t0 + BACKOFF));
+        assert!(!snaps_wait(Some(&stuck), "stopped", t0), "state changed");
+        assert!(!snaps_wait(Some(&stuck), "running", t0 + SNAP_LIMIT));
+    }
+
+    #[test]
+    fn snapshot_confirmations() {
+        let ram = snap("s1", 1 << 20, 0, 1);
+        let disk = snap("s2", 0, 0, 0);
+        let c = confirm_restore(&vm("running"), &ram);
+        assert_eq!((c.heading.as_str(), c.button), ("Restore s1?", "Restore"));
+        assert_eq!(
+            c.body,
+            "dev goes back to the moment s1 was taken. Everything that changed since then is lost, unless another snapshot holds it. The VM carries on from that moment."
+        );
+        assert!(
+            confirm_restore(&vm("stopped"), &ram)
+                .body
+                .ends_with("The VM starts from that moment.")
+        );
+        assert!(
+            confirm_restore(&vm("stopped"), &disk)
+                .body
+                .ends_with("The VM stays stopped.")
+        );
+        for state in ["paused", "paused (disk full)", "io-error"] {
+            assert!(
+                confirm_restore(&vm(state), &ram)
+                    .body
+                    .ends_with("The VM stays paused at that moment."),
+                "{state}"
+            );
+        }
+        let c = confirm_delete(&vm("running"), "s\u{202E}1");
+        assert_eq!((c.heading.as_str(), c.button), ("Delete s1?", "Delete"));
+        assert_eq!(
+            c.body,
+            "Snapshot s1 of dev is deleted for good. The VM itself does not change."
+        );
+    }
+
+    #[test]
+    fn snapshot_actions() {
+        let wire = |a: Action| serde_json::to_string(&a.request("dev")).unwrap();
+        assert_eq!(
+            wire(Action::Take(None)),
+            r#"{"op":"snapshot","name":"dev","tag":null}"#
+        );
+        assert_eq!(
+            wire(Action::Take(Some("s1".into()))),
+            r#"{"op":"snapshot","name":"dev","tag":"s1"}"#
+        );
+        assert_eq!(
+            wire(Action::Restore("s1".into())),
+            r#"{"op":"restore","name":"dev","tag":"s1"}"#
+        );
+        assert_eq!(
+            wire(Action::Delete("s1".into())),
+            r#"{"op":"snapshot_delete","name":"dev","tag":"s1"}"#
+        );
+        assert_eq!(
+            wire(Action::Life(Op::Reset)),
+            r#"{"op":"reset","name":"dev"}"#
+        );
+        assert_eq!(Action::Take(None).limit(), Duration::from_secs(900));
+        assert_eq!(Action::Delete("s".into()).limit(), SNAP_LIMIT);
+        assert_eq!(Action::Life(Op::Stop).limit(), Op::Stop.limit());
+        assert!(
+            Op::ALL.iter().all(|op| op.limit() <= SNAP_LIMIT),
+            "the longest"
+        );
+
+        let e = CallError::Timeout;
+        assert_eq!(
+            Action::Take(None).failed("dev", &e),
+            "The snapshot of dev takes long and may still be running; check the list later"
+        );
+        assert_eq!(
+            Action::Restore("s1".into()).failed("dev", &e),
+            "Restoring s1 takes long and may still be running; check the list later"
+        );
+        assert_eq!(
+            Action::Delete("s\u{1b}1".into()).failed("dev", &CallError::Denied),
+            "Could not delete s1: permission denied"
+        );
+        assert_eq!(
+            Action::Life(Op::Start).failed("dev", &e),
+            Op::Start.failed("dev", &e)
+        );
+        let taken = serde_json::json!({"name": "snap3\u{1b}", "ram": true, "ms": 5});
+        assert_eq!(
+            Action::Take(None).done("dev", &taken).as_deref(),
+            Some("Snapshot snap3 taken")
+        );
+        assert_eq!(
+            Action::Take(None)
+                .done("dev", &serde_json::Value::Null)
+                .as_deref(),
+            Some("Snapshot taken")
+        );
+        assert_eq!(
+            Action::Restore("s1".into())
+                .done("dev", &serde_json::Value::Null)
+                .as_deref(),
+            Some("dev restored to s1")
+        );
+        assert_eq!(
+            Action::Delete("s1".into())
+                .done("dev", &serde_json::Value::Null)
+                .as_deref(),
+            Some("Snapshot s1 deleted")
+        );
+        assert_eq!(
+            Action::Life(Op::Start).done("dev", &serde_json::Value::Null),
+            None
+        );
     }
 
     #[test]

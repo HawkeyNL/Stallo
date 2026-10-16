@@ -10,22 +10,26 @@ use std::time::Duration;
 use stallo::api::{Envelope, Request, Via, VmDetails, VmInfo};
 use stallo::host::HostInfo;
 use stallo::paths::Paths;
+use stallo::snapshot::Snapshot;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::model::{self, CallError, Op, Probe, Production};
+use crate::model::{self, Action, CallError, Probe, Production};
 
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide: 8, in two pools. Actions may
-/// take up to 150 s each, so they have their own slots and reads (polls,
-/// the probe) never wait behind them.
+/// Requests in flight at once, app-wide: 12, in three pools. Lifecycle
+/// actions may take up to 150 s each and snapshot actions 15 min, so each
+/// kind has its own slots: reads (polls, the probe) never wait behind an
+/// action, and a start or stop never waits behind a snapshot job.
 const READ_SLOTS: usize = 4;
 const ACTION_SLOTS: usize = 4;
+const SNAP_SLOTS: usize = 4;
 static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
 static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
+static SNAPS: Semaphore = Semaphore::const_new(SNAP_SLOTS);
 
 fn runtime() -> &'static Handle {
     static RT: OnceLock<Handle> = OnceLock::new();
@@ -113,11 +117,24 @@ pub async fn info(socket: &Path, name: String) -> Result<VmDetails, CallError> {
     get(socket, Request::Info { name }, READ_TIMEOUT).await
 }
 
-/// Starts, stops, resets or resumes a VM.
-pub async fn act(socket: &Path, op: Op, name: &str) -> Result<(), CallError> {
-    call_in(&ACTIONS, socket, op.request(name), op.limit())
-        .await
-        .map(drop)
+/// A VM's snapshots, oldest first (`snapshots`).
+pub async fn snapshots(socket: &Path, name: String) -> Result<Vec<Snapshot>, CallError> {
+    get(socket, Request::Snapshots { name }, READ_TIMEOUT).await
+}
+
+/// Changes a VM: a lifecycle or snapshot action. Returns the answer.
+pub async fn act(
+    socket: &Path,
+    action: &Action,
+    name: &str,
+) -> Result<serde_json::Value, CallError> {
+    // ponytail: waiting for a slot still counts against the limit, so a
+    // fifth snapshot action at once may time out unsent; fine for 4 slots.
+    let slots = match action {
+        Action::Life(_) => &ACTIONS,
+        _ => &SNAPS,
+    };
+    call_in(slots, socket, action.request(name), action.limit()).await
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -166,6 +183,7 @@ fn local_probe() -> Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Op;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -268,17 +286,83 @@ mod tests {
             (Op::Resume, r#"{"op":"resume","name":"dev"}"#),
         ] {
             let (_d, s, fake) = serve(line, answer("{\"ok\":true}\n"));
-            let done = run(async move { act(&s, op, "dev").await });
+            let done = run(async move { act(&s, &Action::Life(op), "dev").await });
             fake.join().unwrap();
-            assert_eq!(done, Ok(()), "{op:?}");
+            assert_eq!(done, Ok(serde_json::Value::Null), "{op:?}");
         }
         let (_d, s, _) = serve(
             r#"{"op":"resume","name":"dev"}"#,
             answer("{\"ok\":false,\"error\":\"dev is not paused\"}\n"),
         );
         assert_eq!(
-            run(async move { act(&s, Op::Resume, "dev").await }),
+            run(async move { act(&s, &Action::Life(Op::Resume), "dev").await }),
             Err(CallError::Failed("dev is not paused".into()))
+        );
+    }
+
+    #[test]
+    fn snapshot_requests() {
+        let (_d, s, fake) = serve(
+            r#"{"op":"snapshots","name":"dev"}"#,
+            answer(concat!(
+                r#"{"ok":true,"data":[{"name":"s1","ram_bytes":0,"created":10,"vm_clock_ms":0},"#,
+                r#"{"name":"s2","ram_bytes":4096,"created":20,"vm_clock_ms":7}]}"#,
+                "\n"
+            )),
+        );
+        let list = run(async move { snapshots(&s, "dev".into()).await }).unwrap();
+        fake.join().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[1].name.as_str(), list[1].ram_bytes), ("s2", 4096));
+        let (_d, s, _) = serve(
+            r#"{"op":"snapshots","name":"dev"}"#,
+            answer("{\"ok\":true,\"data\":[{\"name\":\"s1\"}]}\n"),
+        );
+        assert!(matches!(
+            run(async move { snapshots(&s, "dev".into()).await }),
+            Err(CallError::Failed(_))
+        ));
+
+        for (action, line, reply) in [
+            (
+                Action::Take(None),
+                r#"{"op":"snapshot","name":"dev","tag":null}"#,
+                r#"{"ok":true,"data":{"name":"snap1","ram":true,"pause_ms":2200,"ms":2500}}"#,
+            ),
+            (
+                Action::Take(Some("s1".into())),
+                r#"{"op":"snapshot","name":"dev","tag":"s1"}"#,
+                r#"{"ok":true,"data":{"name":"s1","ram":false,"ms":300}}"#,
+            ),
+            (
+                Action::Restore("s1".into()),
+                r#"{"op":"restore","name":"dev","tag":"s1"}"#,
+                r#"{"ok":true,"data":{"name":"s1","state":"stopped","ms":300}}"#,
+            ),
+            (
+                Action::Delete("s1".into()),
+                r#"{"op":"snapshot_delete","name":"dev","tag":"s1"}"#,
+                r#"{"ok":true}"#,
+            ),
+        ] {
+            let (_d, s, fake) = serve(line, move |mut s| {
+                s.write_all(format!("{reply}\n").as_bytes()).unwrap()
+            });
+            let a = action.clone();
+            let got = run(async move { act(&s, &a, "dev").await });
+            fake.join().unwrap();
+            let want: serde_json::Value = serde_json::from_str(reply).unwrap();
+            assert_eq!(got, Ok(want["data"].clone()), "{action:?}");
+        }
+        let (_d, s, _) = serve(
+            r#"{"op":"restore","name":"dev","tag":"s2"}"#,
+            answer("{\"ok\":false,\"error\":\"s2 has no RAM state; stop the VM first\"}\n"),
+        );
+        assert_eq!(
+            run(async move { act(&s, &Action::Restore("s2".into()), "dev").await }),
+            Err(CallError::Failed(
+                "s2 has no RAM state; stop the VM first".into()
+            ))
         );
     }
 
@@ -376,6 +460,31 @@ mod tests {
             .await
         });
         assert_eq!(wait, Err(CallError::Timeout), "actions still queue");
+        drop(held);
+    }
+
+    #[test]
+    fn lifecycle_passes_busy_snapshots() {
+        // Every snapshot slot taken, e.g. by RAM snapshots of big VMs.
+        let held = runtime()
+            .block_on(SNAPS.acquire_many(SNAP_SLOTS as u32))
+            .unwrap();
+        let (_d, s, fake) = serve(
+            r#"{"op":"stop","name":"dev","force":false}"#,
+            answer("{\"ok\":true}\n"),
+        );
+        let stop = run(async move { act(&s, &Action::Life(Op::Stop), "dev").await });
+        fake.join().unwrap();
+        assert_eq!(stop, Ok(serde_json::Value::Null));
+        let (_d, s, _) = serve(
+            r#"{"op":"snapshot_delete","name":"dev","tag":"s1"}"#,
+            answer("{\"ok\":true}\n"),
+        );
+        let queued = run(async move {
+            let delete = Action::Delete("s1".into());
+            tokio::time::timeout(Duration::from_millis(200), act(&s, &delete, "dev")).await
+        });
+        assert!(queued.is_err(), "snapshot actions still queue");
         drop(held);
     }
 

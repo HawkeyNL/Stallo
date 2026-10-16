@@ -726,7 +726,7 @@ impl Manager {
 /// RAM image is gone: restoring only the disk would revert to a
 /// crash-consistent state without saying so. Disk-only snapshots of stopped
 /// VMs have a guest clock of 0.
-fn ram_missing(snap: &Snapshot) -> bool {
+pub fn ram_missing(snap: &Snapshot) -> bool {
     snap.vm_clock_ms > 0 && snap.ram_bytes == 0
 }
 

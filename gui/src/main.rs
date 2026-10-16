@@ -1,6 +1,6 @@
 //! stallo-gui: the desktop app for Stallo. It finds the daemon, walks the
 //! user through anything that stops it from connecting, and then lists the
-//! VMs and starts and stops them.
+//! VMs, starts and stops them, and takes and restores snapshots.
 
 mod client;
 mod model;
@@ -179,7 +179,7 @@ impl Ui {
                 {
                     let old = Rc::downgrade(&vms);
                     glib::timeout_add_local_once(
-                        model::Op::Start.limit() + client::READ_TIMEOUT,
+                        model::SNAP_LIMIT + client::READ_TIMEOUT,
                         move || assert!(old.upgrade().is_none(), "a replaced page leaked"),
                     );
                 }
