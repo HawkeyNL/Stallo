@@ -4,6 +4,7 @@
 
 mod client;
 mod model;
+mod rfb;
 mod vms;
 
 use std::cell::{Cell, RefCell};
@@ -52,6 +53,15 @@ fn sh_quote(s: &str) -> String {
 }
 
 fn main() -> glib::ExitCode {
+    // RUST_LOG=error|warn|info|debug|trace (default warn), on stderr.
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(tracing::Level::WARN);
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .init();
     let mut flags = gio::ApplicationFlags::empty();
     if !model::single_instance(std::env::var_os("STALLO_SOCKET").is_some()) {
         flags |= gio::ApplicationFlags::NON_UNIQUE;
