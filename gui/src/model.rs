@@ -494,8 +494,8 @@ pub enum Action {
     Take(Option<String>),
     Restore(String),
     Delete(String),
-    /// Turns the live screen (VNC) on; it comes with the next start.
-    LiveScreen,
+    /// Turns the live screen (VNC) on or off from the next start.
+    LiveScreen(bool),
     /// Stops the VM cleanly and starts it again, after turning the live
     /// screen on if `live_screen`.
     Restart {
@@ -507,9 +507,9 @@ impl Action {
     /// The requests to send, in order; the first error ends the action.
     pub fn requests(&self, vm: &str) -> Vec<Request> {
         let name = vm.to_owned();
-        let live_screen = || Request::SetVnc {
+        let live_screen = |on| Request::SetVnc {
             name: vm.to_owned(),
-            on: true,
+            on,
         };
         match self {
             Action::Life(op) => vec![op.request(vm)],
@@ -525,9 +525,9 @@ impl Action {
                 name,
                 tag: tag.clone(),
             }],
-            Action::LiveScreen => vec![live_screen()],
+            Action::LiveScreen(on) => vec![live_screen(*on)],
             Action::Restart { live_screen: on } => on
-                .then(live_screen)
+                .then(|| live_screen(true))
                 .into_iter()
                 .chain([Op::Stop.request(vm), Op::Start.request(vm)])
                 .collect(),
@@ -546,8 +546,20 @@ impl Action {
     pub fn lifecycle(&self) -> bool {
         matches!(
             self,
-            Action::Life(_) | Action::LiveScreen | Action::Restart { .. }
+            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. }
         )
+    }
+
+    /// What is left of it from request `step` on, the one that failed:
+    /// what the error toast is about.
+    pub fn failed_at(&self, step: usize) -> Action {
+        match self {
+            // The live screen is on; only the restart failed.
+            Action::Restart { live_screen: true } if step > 0 => {
+                Action::Restart { live_screen: false }
+            }
+            a => a.clone(),
+        }
     }
 
     /// The toast when it fails. A snapshot action that timed out may
@@ -565,8 +577,17 @@ impl Action {
                 };
                 (format!("{verb} {vm}"), None)
             }
-            Action::LiveScreen => (format!("turn on the live screen of {vm}"), None),
-            Action::Restart { .. } => (format!("restart {vm}"), None),
+            Action::LiveScreen(on) => (
+                format!(
+                    "turn {} the live screen of {vm}",
+                    if *on { "on" } else { "off" }
+                ),
+                None,
+            ),
+            Action::Restart { live_screen: true } => {
+                (format!("turn on the live screen and restart {vm}"), None)
+            }
+            Action::Restart { live_screen: false } => (format!("restart {vm}"), None),
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
                 Some(format!("Snapshot of {vm} still running")),
@@ -609,7 +630,8 @@ impl Action {
             Action::Take(_) => "Taking snapshot…",
             Action::Restore(_) => "Restoring snapshot…",
             Action::Delete(_) => "Deleting snapshot…",
-            Action::LiveScreen => "Turning on live screen…",
+            Action::LiveScreen(true) => "Turning on live screen…",
+            Action::LiveScreen(false) => "Turning off live screen…",
             Action::Restart { .. } => "Restarting…",
         }
     }
@@ -620,7 +642,7 @@ impl Action {
         let vm = printable(vm, 64);
         match self {
             // The Screen tab shows the outcome.
-            Action::Life(_) | Action::LiveScreen | Action::Restart { .. } => None,
+            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. } => None,
             Action::Take(_) => Some(match data.get("name").and_then(|n| n.as_str()) {
                 Some(n) => format!("Snapshot {} taken", printable(n, 64)),
                 None => "Snapshot taken".to_owned(),
@@ -1167,7 +1189,7 @@ pub fn screen_status(page: &ScreenPage) -> ScreenStatus {
         ),
         ScreenPage::Off { on: true, restart } => (
             Some("video-display-symbolic"),
-            "Live Screen Comes With a Restart",
+            "Restart to Show the Screen",
             "The live screen is on, but the VM started before that. It shows here once the VM has stopped and started again.",
             restart.then_some("Restart…"),
         ),
@@ -1205,6 +1227,18 @@ pub fn confirm_live_screen(vm: &VmInfo) -> Confirm {
 }
 
 pub const LATER: &str = "At Next Start";
+
+/// The question before the Overview switch turns the live screen on.
+pub fn confirm_live_screen_switch(vm: &VmInfo) -> Confirm {
+    Confirm {
+        heading: "Turn On Live Screen?".to_owned(),
+        body: format!(
+            concat!("It comes on when {} starts next. ", live_screen_risk!()),
+            printable(&vm.name, 64)
+        ),
+        button: "Turn On",
+    }
+}
 
 /// The question before a restart that brings the live screen.
 pub fn confirm_restart(vm: &VmInfo) -> Confirm {
@@ -1273,8 +1307,8 @@ pub fn button_bit(button: u32) -> Option<u8> {
 }
 
 /// RFB wheel buttons: up, down.
-pub const WHEEL_UP: u8 = 8;
-pub const WHEEL_DOWN: u8 = 16;
+const WHEEL_UP: u8 = 8;
+const WHEEL_DOWN: u8 = 16;
 /// Touchpad scrolling in pixels per wheel click.
 // ponytail: a guess that feels right on one touchpad; tune when reported.
 pub const SCROLL_PIXELS: f64 = 20.0;
@@ -1282,17 +1316,69 @@ pub const SCROLL_PIXELS: f64 = 20.0;
 /// change the input queue must keep.
 const MAX_CLICKS: f64 = 5.0;
 
-/// Whole wheel clicks in `acc` + `delta` (wheel steps, negative is up);
-/// the rest stays in `acc` for the next event.
-pub fn wheel_clicks(acc: &mut f64, delta: f64) -> i32 {
-    *acc += delta;
-    let clicks = acc.trunc().clamp(-MAX_CLICKS, MAX_CLICKS);
-    *acc = if clicks.abs() == MAX_CLICKS {
-        0.0
-    } else {
-        *acc - clicks
-    };
-    clicks as i32
+/// The pointer as the guest sees it, in framebuffer pixels.
+#[derive(Debug, Default)]
+pub struct Mouse {
+    x: u16,
+    y: u16,
+    buttons: u8,
+    /// Scrolling not yet a whole wheel click.
+    wheel: f64,
+}
+
+impl Mouse {
+    fn at(&mut self, x: u16, y: u16) -> Input {
+        (self.x, self.y) = (x, y);
+        Input::Pointer {
+            x,
+            y,
+            buttons: self.buttons,
+        }
+    }
+
+    /// A move: sent while on the screen, or anywhere while a button is
+    /// held (a drag that leaves it).
+    pub fn moved(&mut self, x: u16, y: u16, inside: bool) -> Option<Input> {
+        (inside || self.buttons != 0).then(|| self.at(x, y))
+    }
+
+    /// A button `bit` went down or up; `None` if that changes nothing.
+    pub fn button(&mut self, x: u16, y: u16, bit: u8, down: bool) -> Option<Input> {
+        let held = self.buttons;
+        self.buttons = if down { held | bit } else { held & !bit };
+        (self.buttons != held).then(|| self.at(x, y))
+    }
+
+    /// Wheel clicks for `delta` wheel steps (negative is up), each a press
+    /// and a release. Whole clicks only; the rest waits for the next event.
+    pub fn scroll(&mut self, x: u16, y: u16, delta: f64) -> Vec<Input> {
+        self.wheel += delta;
+        let clicks = self.wheel.trunc().clamp(-MAX_CLICKS, MAX_CLICKS);
+        // A fling is capped, and its rest dropped.
+        self.wheel = if clicks.abs() == MAX_CLICKS {
+            0.0
+        } else {
+            self.wheel - clicks
+        };
+        let bit = if clicks < 0.0 { WHEEL_UP } else { WHEEL_DOWN };
+        let up = self.at(x, y);
+        let down = Input::Pointer {
+            x,
+            y,
+            buttons: self.buttons | bit,
+        };
+        (0..clicks.abs() as usize)
+            .flat_map(|_| [down, up])
+            .collect()
+    }
+
+    /// Input stops here (view-only, or a new session): the guest lets go
+    /// of any held button, and nothing carries over.
+    pub fn let_go(&mut self) -> Option<Input> {
+        let (x, y, held) = (self.x, self.y, self.buttons);
+        *self = Mouse::default();
+        (held != 0).then_some(Input::Pointer { x, y, buttons: 0 })
+    }
 }
 
 /// Whether a frame may update the texture shown (`shown`: its serial and
@@ -2643,6 +2729,10 @@ mod tests {
         );
         assert!(c.body.contains("not logged"));
         assert_eq!(c.button, "Restart Now");
+        let c = confirm_live_screen_switch(&odd);
+        assert_eq!(c.button, "Turn On");
+        assert!(c.body.contains("when dev starts next"), "{}", c.body);
+        assert!(c.body.contains("not logged"));
         let c = confirm_restart(&odd);
         assert_eq!(c.heading, "Restart dev?");
         assert_eq!(c.button, "Restart");
@@ -2701,22 +2791,61 @@ mod tests {
     }
 
     #[test]
-    fn buttons_and_wheel() {
+    fn mouse_buttons_and_wheel() {
+        let at = |x, y, buttons| Input::Pointer { x, y, buttons };
         assert_eq!(button_bit(1), Some(1));
         assert_eq!(button_bit(2), Some(2));
         assert_eq!(button_bit(3), Some(4));
         assert_eq!(button_bit(8), None);
-        let mut acc = 0.0;
-        assert_eq!(wheel_clicks(&mut acc, 1.0), 1);
-        assert_eq!(wheel_clicks(&mut acc, -1.0), -1);
+        let mut m = Mouse::default();
+        // Hover on the screen only; a drag goes on outside it.
+        assert_eq!(m.moved(5, 6, true), Some(at(5, 6, 0)));
+        assert_eq!(m.moved(0, 6, false), None);
+        assert_eq!(m.button(5, 6, 1, true), Some(at(5, 6, 1)));
+        assert_eq!(m.button(5, 6, 1, true), None, "no change");
+        assert_eq!(m.moved(0, 9, false), Some(at(0, 9, 1)));
+        assert_eq!(m.button(0, 9, 4, true), Some(at(0, 9, 5)));
+        assert_eq!(m.button(0, 9, 1, false), Some(at(0, 9, 4)));
+        // The wheel: a click is a press and a release, held buttons kept.
+        assert_eq!(m.scroll(1, 2, -1.0), [at(1, 2, 4 | 8), at(1, 2, 4)]);
+        assert_eq!(m.scroll(1, 2, 1.0), [at(1, 2, 4 | 16), at(1, 2, 4)]);
         // A touchpad: fractions add up to a click.
-        assert_eq!(wheel_clicks(&mut acc, 0.4), 0);
-        assert_eq!(wheel_clicks(&mut acc, 0.4), 0);
-        assert_eq!(wheel_clicks(&mut acc, 0.4), 1);
-        assert!((acc - 0.2).abs() < 1e-9);
+        assert!(m.scroll(1, 2, 0.4).is_empty());
+        assert!(m.scroll(1, 2, 0.4).is_empty());
+        assert_eq!(m.scroll(1, 2, 0.4).len(), 2);
         // A fling is capped, and its rest dropped.
-        assert_eq!(wheel_clicks(&mut acc, -40.0), -5);
-        assert_eq!(acc, 0.0);
+        assert_eq!(m.scroll(1, 2, -40.0).len(), 10);
+        assert!(m.scroll(1, 2, 0.9).is_empty());
+    }
+
+    #[test]
+    fn no_phantom_buttons() {
+        let mut m = Mouse::default();
+        // View-only turns on mid-drag: the guest lets go where it was.
+        m.button(7, 8, 1, true);
+        m.moved(9, 10, false);
+        m.scroll(9, 10, 0.5);
+        assert_eq!(
+            m.let_go(),
+            Some(Input::Pointer {
+                x: 9,
+                y: 10,
+                buttons: 0
+            })
+        );
+        // Nothing carries over: no held button, no half wheel click.
+        assert_eq!(m.let_go(), None);
+        assert!(m.scroll(9, 10, 0.5).is_empty());
+        assert_eq!(
+            m.moved(1, 1, true),
+            Some(Input::Pointer {
+                x: 1,
+                y: 1,
+                buttons: 0
+            })
+        );
+        // Nothing held: nothing to send.
+        assert_eq!(Mouse::default().let_go(), None);
     }
 
     #[test]
@@ -2810,13 +2939,21 @@ mod tests {
         let set = r#"{"op":"set_vnc","name":"dev","on":true}"#;
         let stop = r#"{"op":"stop","name":"dev","force":false}"#;
         let start = r#"{"op":"start","name":"dev","wait":false}"#;
-        assert_eq!(wire(Action::LiveScreen), [set]);
+        assert_eq!(wire(Action::LiveScreen(true)), [set]);
+        assert_eq!(
+            wire(Action::LiveScreen(false)),
+            [r#"{"op":"set_vnc","name":"dev","on":false}"#]
+        );
         assert_eq!(
             wire(Action::Restart { live_screen: true }),
             [set, stop, start]
         );
         assert_eq!(wire(Action::Restart { live_screen: false }), [stop, start]);
-        for a in [Action::LiveScreen, Action::Restart { live_screen: true }] {
+        for a in [
+            Action::LiveScreen(true),
+            Action::LiveScreen(false),
+            Action::Restart { live_screen: true },
+        ] {
             assert!(a.lifecycle());
             assert_eq!(a.limit(), Op::Stop.limit());
             assert!(a.progress().ends_with('…'));
@@ -2824,9 +2961,31 @@ mod tests {
         }
         assert!(!Action::Take(None).lifecycle());
         assert_eq!(
-            Action::LiveScreen.failed("dev", &CallError::Timeout).title,
+            Action::LiveScreen(true)
+                .failed("dev", &CallError::Timeout)
+                .title,
             "Could not turn on the live screen of dev"
         );
+        assert_eq!(
+            Action::LiveScreen(false)
+                .failed("dev", &CallError::Timeout)
+                .title,
+            "Could not turn off the live screen of dev"
+        );
+        // Restart with the live screen: which request failed decides.
+        let both = Action::Restart { live_screen: true };
+        let title = |step| {
+            both.failed_at(step)
+                .failed("dev", &CallError::Timeout)
+                .title
+        };
+        assert_eq!(
+            title(0),
+            "Could not turn on the live screen and restart dev"
+        );
+        assert_eq!(title(1), "Could not restart dev");
+        assert_eq!(title(2), "Could not restart dev");
+        assert_eq!(Action::Take(None).failed_at(0), Action::Take(None));
         assert_eq!(
             Action::Restart { live_screen: false }
                 .failed("dev", &CallError::Timeout)

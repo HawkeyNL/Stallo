@@ -262,6 +262,9 @@ fn harness_rejects_unsafe_argv() {
     };
     assert!(ok(&["-cpu", "host,-svm,-vmx"]));
     assert!(ok(&["-vnc", "unix:/r/vnc/dev/vnc.sock"]));
+    // A doubled comma is part of the path.
+    assert!(ok(&["-vnc", "unix:/r/vnc/a,,b/vnc.sock"]));
+    assert!(ok(&["-display", "none"]));
     for bad in [
         &["-netdev", "user,id=n0"][..],
         &["--netdev", "user,id=n0"],
@@ -270,6 +273,12 @@ fn harness_rejects_unsafe_argv() {
         &["-nic", "user"],
         &["-vnc", ":0"],
         &["-vnc", "tcp:127.0.0.1:5900"],
+        &["-vnc", "unix:/r/vnc.sock,websocket=on"],
+        &["-vnc", "unix:/r/vnc.sock,password=off"],
+        &["-vnc", "unix:/r/a,,b,share=ignore"],
+        &["-vnc", "unix:/r/websocket"],
+        &["-display", "vnc=unix:/r/vnc.sock"],
+        &["--display", "vnc=:0"],
         &["-gdb", "tcp::1234"],
         &["-chardev", "socket,id=c,host=0.0.0.0,port=1"],
         &["-smp", "8"],

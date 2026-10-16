@@ -111,6 +111,8 @@ struct Detail {
     /// Shown while an action on this VM runs.
     busy: adw::Spinner,
     values: Vec<adw::ActionRow>,
+    /// VNC on or off from the next start.
+    live_screen: adw::SwitchRow,
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
     tabs: adw::ViewStack,
@@ -667,7 +669,7 @@ impl Vms {
                         v.ui.toast(&text);
                     }
                 }
-                Ok(Err(e)) => v.ui.fail(&action.failed(&name, &e)),
+                Ok(Err((step, e))) => v.ui.fail(&action.failed_at(step).failed(&name, &e)),
                 Err(_) => {}
             }
             v.refresh_open();
@@ -682,6 +684,43 @@ impl Vms {
             }
             v.tick();
         });
+    }
+
+    /// The Overview switch moved: off at once, on after the risk is
+    /// spelled out. A move that matches the VM (an update) does nothing.
+    fn switch_live_screen(self: &Rc<Self>, row: &adw::SwitchRow, name: &str) {
+        let on = row.is_active();
+        let Some(vm) = self.vm(name).filter(|vm| vm.vnc != on) else {
+            return;
+        };
+        if !on {
+            return self.run(Action::LiveScreen(false), name);
+        }
+        let c = model::confirm_live_screen_switch(&vm);
+        let dialog = adw::AlertDialog::builder()
+            .heading(&c.heading)
+            .heading_use_markup(false)
+            .body(&c.body)
+            .body_use_markup(false)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("confirm", c.button);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let (v, name, row) = (Rc::downgrade(self), name.to_owned(), row.downgrade());
+        dialog.connect_response(None, move |_, response| match response {
+            "confirm" => {
+                if let Some(v) = v.upgrade() {
+                    v.run(Action::LiveScreen(true), &name);
+                }
+            }
+            _ => {
+                if let Some(row) = row.upgrade() {
+                    row.set_active(false);
+                }
+            }
+        });
+        dialog.present(Some(&self.root));
     }
 
     /// Fresh VM list and details at the next tick.
@@ -848,6 +887,24 @@ impl Detail {
             overview.add(&group);
         }
 
+        let live_screen = adw::SwitchRow::builder()
+            .title("Live Screen")
+            .subtitle(
+                "Shows the VM's screen in the Screen tab. Changes take effect at the next start.",
+            )
+            .use_markup(false)
+            .active(vm.vnc)
+            .build();
+        let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+        live_screen.connect_active_notify(move |row| {
+            if let Some(v) = v.upgrade() {
+                v.switch_live_screen(row, &name);
+            }
+        });
+        let screen_group = adw::PreferencesGroup::builder().title("Screen").build();
+        screen_group.add(&live_screen);
+        overview.add(&screen_group);
+
         let take = gtk::Button::builder()
             .label("Take Snapshot")
             .valign(gtk::Align::Center)
@@ -967,6 +1024,7 @@ impl Detail {
             resume,
             busy,
             values,
+            live_screen,
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
             tabs,
@@ -1006,6 +1064,11 @@ impl Detail {
         }
         self.screen
             .update(vm, self.details.borrow().as_ref(), blocked);
+        // Not while an action runs: it may be this switch's own.
+        self.live_screen.set_sensitive(!blocked);
+        if !blocked {
+            self.live_screen.set_active(vm.vnc);
+        }
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {

@@ -17,10 +17,10 @@
 //!   `AF_UNIX`/`AF_NETLINK` sockets (no IP at all), and
 //!   `RuntimeMaxSec=900` as a dead-man switch if the test process dies;
 //! - every QEMU in the unit must be offline (`-nic none`, no network
-//!   device or host listener but a VNC Unix socket), with at most 2 vCPUs
-//!   and 2 GiB (one
-//!   measurement may ask for 4 GiB with [`Daemon::start_sized`], and only
-//!   while the host keeps 6 GiB available besides);
+//!   device, and no host listener but a plain VNC Unix socket), with at
+//!   most 2 vCPUs and 2 GiB (one measurement may ask for 4 GiB with
+//!   [`Daemon::start_sized`], and only while the host keeps 6 GiB
+//!   available besides);
 //! - data lives in `$HOME/.cache/stallo-it/<test>/`, runtime files in
 //!   `$XDG_RUNTIME_DIR/stallo-it-<test>/`;
 //! - a guard kills the unit's whole cgroup and removes both directories
@@ -378,10 +378,20 @@ fn check_argv_max(argv: &[String], max_memory_mib: u64) {
     for name in ["-netdev", "-net", "-gdb", "-spice"] {
         assert!(after(name).is_empty(), "VM must have no {name}: {argv:?}");
     }
+    // A Unix socket path and nothing else: no options after it (a comma
+    // that is not doubled), no websocket, no VNC display.
     for vnc in after("-vnc") {
         assert!(
-            vnc.starts_with("unix:"),
-            "VNC only on a Unix socket: {argv:?}"
+            vnc.starts_with("unix:")
+                && !vnc.replace(",,", "").contains(',')
+                && !vnc.contains("websocket"),
+            "VNC only on a plain Unix socket: {argv:?}"
+        );
+    }
+    for display in after("-display") {
+        assert!(
+            !display.contains("vnc"),
+            "VM must have no VNC display: {argv:?}"
         );
     }
     for bad in [

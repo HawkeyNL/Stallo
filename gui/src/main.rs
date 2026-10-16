@@ -119,7 +119,7 @@ impl Ui {
             .content(&toasts)
             .build();
         let css = gtk::CssProvider::new();
-        css.load_from_string(&[vms::CSS, screen::CSS].join("\n"));
+        css.load_from_string(vms::CSS);
         gtk::style_context_add_provider_for_display(
             &WidgetExt::display(&window),
             &css,

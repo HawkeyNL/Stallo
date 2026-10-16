@@ -1,7 +1,7 @@
 //! The Screen tab: a VM's display through the RFB client, with keyboard
 //! and mouse, fit or 1:1, view-only and fullscreen. What it shows comes
 //! from the view-model. The guest's pixels are untrusted: they are only
-//! ever drawn inside a frame, and in fullscreen under a pill that says
+//! ever drawn inside a frame, and in fullscreen under a strip that says
 //! whose screen it is, so they never pass for the host's own windows.
 
 use std::cell::{Cell, RefCell};
@@ -20,9 +20,6 @@ use crate::model::{self, Action, KeyPress, Link, Op, ScreenPage};
 use crate::rfb::{Frame, Input, Session};
 use crate::vms::Vms;
 
-/// The rounded floating pill over the screen in fullscreen.
-pub const CSS: &str = ".guest-pill { border-radius: 999px; padding: 4px 4px 4px 14px; }";
-
 /// The guest's pixels as texture memory, without a copy.
 struct Pixels(Arc<Vec<u8>>);
 
@@ -39,24 +36,26 @@ pub struct Screen {
     pub root: gtk::Stack,
     status: adw::StatusPage,
     spinner: adw::Spinner,
-    /// Why the connection ended.
+    /// Why the connection ended, behind Details.
     reason: gtk::Label,
+    details_list: gtk::ListBox,
     /// The one action of a status page.
     action: gtk::Button,
     /// Why the screen is view-only.
     banner: adw::Banner,
     /// Holds `frame` while it is not fullscreen.
     holder: adw::Bin,
-    frame: gtk::Overlay,
+    frame: adw::Bin,
     scroller: gtk::ScrolledWindow,
     picture: gtk::Picture,
     hint: gtk::Label,
     ctrl_alt_del: gtk::Button,
     view_only: gtk::ToggleButton,
     actual_size: gtk::ToggleButton,
-    /// Fullscreen only: whose screen this is, and the ways out.
-    pill: gtk::Box,
-    pill_hint: gtk::Label,
+    /// Fullscreen only, above the guest: whose screen this is, and the
+    /// ways out.
+    strip: gtk::Box,
+    strip_hint: gtk::Label,
     release: gtk::Button,
     full: RefCell<Option<adw::Window>>,
 
@@ -81,9 +80,7 @@ pub struct Screen {
     /// The window whose system shortcuts go to the guest while grabbed.
     inhibited: RefCell<Option<gdk::Toplevel>>,
     keys: RefCell<model::Keys>,
-    buttons: Cell<u8>,
-    /// Scrolling not yet a whole wheel click.
-    wheel: Cell<f64>,
+    mouse: RefCell<model::Mouse>,
 }
 
 impl Screen {
@@ -93,15 +90,32 @@ impl Screen {
             .width_request(32)
             .height_request(32)
             .build();
-        let reason = crate::plain_label("");
         let action = gtk::Button::builder()
             .halign(gtk::Align::Center)
             .css_classes(["pill", "suggested-action"])
             .build();
+        // The raw error, for a bug report; the page says it plainly.
+        let reason = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .selectable(true)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        reason.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        let details = adw::ExpanderRow::builder().title("Details").build();
+        details.add_row(&reason);
+        let details_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        details_list.append(&details);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 24);
         content.append(&spinner);
-        content.append(&reason);
         content.append(&action);
+        content.append(&details_list);
         let status = adw::StatusPage::builder().child(&content).build();
 
         let picture = gtk::Picture::builder()
@@ -120,7 +134,7 @@ impl Screen {
             .child(&picture)
             .build();
 
-        let pill_hint = gtk::Label::builder()
+        let strip_hint = gtk::Label::builder()
             .label(model::RELEASE_HINT)
             .css_classes(["caption", "dim-label"])
             .build();
@@ -130,23 +144,25 @@ impl Screen {
             .build();
         let leave = gtk::Button::builder()
             .icon_name("view-restore-symbolic")
-            .tooltip_text("Leave Fullscreen")
+            .tooltip_text("Leave Fullscreen (F11)")
             .css_classes(["flat", "circular"])
             .build();
-        let pill = gtk::Box::builder()
+        leave.update_property(&[gtk::accessible::Property::Label("Leave Fullscreen")]);
+        let line = gtk::Box::builder()
             .spacing(12)
             .halign(gtk::Align::Center)
-            .valign(gtk::Align::Start)
-            .margin_top(12)
-            .visible(false)
-            .css_classes(["osd", "guest-pill"])
+            .hexpand(true)
+            .margin_top(6)
+            .margin_bottom(6)
             .build();
-        pill.append(&gtk::Label::new(Some(&format!("Guest screen: {title}"))));
-        pill.append(&pill_hint);
-        pill.append(&release);
-        pill.append(&leave);
+        line.append(&gtk::Label::new(Some(&format!("Guest screen: {title}"))));
+        line.append(&strip_hint);
+        line.append(&release);
+        line.append(&leave);
+        let strip = gtk::Box::builder().css_classes(["osd"]).build();
+        strip.append(&line);
         // A card: the guest's pixels always sit in a visible frame.
-        let frame = gtk::Overlay::builder()
+        let frame = adw::Bin::builder()
             .child(&scroller)
             .overflow(gtk::Overflow::Hidden)
             .margin_top(12)
@@ -155,7 +171,6 @@ impl Screen {
             .margin_end(12)
             .css_classes(["card"])
             .build();
-        frame.add_overlay(&pill);
         let holder = adw::Bin::builder().child(&frame).vexpand(true).build();
 
         let banner = adw::Banner::builder()
@@ -182,7 +197,7 @@ impl Screen {
         actual_size.update_property(&[gtk::accessible::Property::Label("Actual Size")]);
         let fullscreen = gtk::Button::builder()
             .icon_name("view-fullscreen-symbolic")
-            .tooltip_text("Fullscreen")
+            .tooltip_text("Fullscreen (F11)")
             .build();
         fullscreen.update_property(&[gtk::accessible::Property::Label("Fullscreen")]);
         let bar = gtk::ActionBar::new();
@@ -209,6 +224,7 @@ impl Screen {
             status,
             spinner,
             reason,
+            details_list,
             action,
             banner,
             holder,
@@ -219,8 +235,8 @@ impl Screen {
             ctrl_alt_del,
             view_only,
             actual_size,
-            pill,
-            pill_hint,
+            strip,
+            strip_hint,
             release,
             full: RefCell::default(),
             vm: RefCell::default(),
@@ -237,8 +253,7 @@ impl Screen {
             grabbed: Cell::new(false),
             inhibited: RefCell::default(),
             keys: RefCell::default(),
-            buttons: Cell::new(0),
-            wheel: Cell::new(0.0),
+            mouse: RefCell::default(),
         });
         screen.connect_signals(&leave, &fullscreen);
         screen
@@ -261,7 +276,7 @@ impl Screen {
         });
         let s = weak();
         self.ctrl_alt_del.connect_clicked(move |_| {
-            if let Some(s) = s.upgrade() {
+            if let Some(s) = s.upgrade().filter(|s| s.input_allowed()) {
                 for input in model::ctrl_alt_del() {
                     s.send(input);
                 }
@@ -270,6 +285,11 @@ impl Screen {
         let s = weak();
         self.view_only.connect_toggled(move |_| {
             if let Some(s) = s.upgrade() {
+                // Mid-drag: no button stays held in the guest.
+                let up = s.mouse.borrow_mut().let_go();
+                if let Some(input) = up {
+                    s.send(input);
+                }
                 s.ungrab();
                 s.show_input();
             }
@@ -306,15 +326,9 @@ impl Screen {
             None => glib::Propagation::Proceed,
         });
         self.picture.add_controller(input);
-        // Focus on the screen (a click, Tab, fullscreen) hands the guest
-        // the keyboard; focus elsewhere takes it back.
+        // A click or fullscreen hands the guest the keyboard; focus
+        // elsewhere takes it back.
         let focus = gtk::EventControllerFocus::new();
-        let s = weak();
-        focus.connect_enter(move |_| {
-            if let Some(s) = s.upgrade() {
-                s.grab(None);
-            }
-        });
         let s = weak();
         focus.connect_leave(move |_| {
             if let Some(s) = s.upgrade() {
@@ -322,6 +336,29 @@ impl Screen {
             }
         });
         self.picture.add_controller(focus);
+
+        // F11 anywhere in the window while the screen shows.
+        let s = weak();
+        let toggle = gtk::CallbackAction::new(move |_, _| {
+            let Some(s) = s.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if !s.root.is_mapped() || s.page() != Some(ScreenPage::Live) {
+                return glib::Propagation::Proceed;
+            }
+            s.fullscreen();
+            glib::Propagation::Stop
+        });
+        let shortcuts = gtk::ShortcutController::new();
+        shortcuts.set_scope(gtk::ShortcutScope::Managed);
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            Some(gtk::KeyvalTrigger::new(
+                gdk::Key::F11,
+                gdk::ModifierType::empty(),
+            )),
+            Some(toggle),
+        ));
+        self.root.add_controller(shortcuts);
     }
 
     /// The VM as it is now. `blocked`: no actions now.
@@ -370,6 +407,8 @@ impl Screen {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         *self.link.borrow_mut() = Link::Connecting;
+        // A new session: nothing held, nothing half scrolled.
+        self.mouse.replace(model::Mouse::default());
         self.shown.set(None);
         self.texture.take();
         self.picture.set_paintable(None::<&gdk::Paintable>);
@@ -499,7 +538,7 @@ impl Screen {
             if let ScreenPage::Ended(why) = &page {
                 self.reason.set_label(why);
             }
-            self.reason
+            self.details_list
                 .set_visible(matches!(page, ScreenPage::Ended(_)));
             self.action.set_visible(s.button.is_some());
             self.action.set_label(s.button.unwrap_or_default());
@@ -529,7 +568,7 @@ impl Screen {
             model::GRAB_HINT
         });
         self.hint.set_visible(allowed);
-        self.pill_hint.set_visible(grabbed);
+        self.strip_hint.set_visible(grabbed);
         self.release.set_visible(grabbed);
         self.ctrl_alt_del.set_sensitive(allowed);
         self.banner
@@ -549,7 +588,7 @@ impl Screen {
             ScreenPage::Off {
                 on: false,
                 restart: false,
-            } => v.run(Action::LiveScreen, &self.name),
+            } => v.run(Action::LiveScreen(true), &self.name),
             ScreenPage::Off {
                 on: false,
                 restart: true,
@@ -585,7 +624,7 @@ impl Screen {
         let (weak, name) = (Rc::downgrade(v), self.name.clone());
         dialog.connect_response(None, move |_, response| {
             let action = match response {
-                "later" => Action::LiveScreen,
+                "later" => Action::LiveScreen(true),
                 "restart" => Action::Restart { live_screen: true },
                 _ => return,
             };
@@ -699,20 +738,18 @@ impl Screen {
                         return glib::Propagation::Stop;
                     }
                 }
-                let held = self.buttons.get();
-                let buttons = if press { held | bit } else { held & !bit };
-                if buttons != held {
-                    self.buttons.set(buttons);
-                    self.send(Input::Pointer { x, y, buttons });
+                let input = self.mouse.borrow_mut().button(x, y, bit, press);
+                if let Some(input) = input {
+                    self.send(input);
                 }
                 glib::Propagation::Stop
             }
             T::MotionNotify => {
-                let buttons = self.buttons.get();
-                if let Some((x, y, inside)) = self.point(event)
-                    && (inside || buttons != 0)
-                {
-                    self.send(Input::Pointer { x, y, buttons });
+                if let Some((x, y, inside)) = self.point(event) {
+                    let input = self.mouse.borrow_mut().moved(x, y, inside);
+                    if let Some(input) = input {
+                        self.send(input);
+                    }
                 }
                 glib::Propagation::Stop
             }
@@ -729,25 +766,11 @@ impl Screen {
                     },
                     _ => 0.0,
                 };
-                let mut wheel = self.wheel.get();
-                let clicks = model::wheel_clicks(&mut wheel, delta);
-                self.wheel.set(wheel);
-                let Some((x, y, _)) = self.point(event) else {
-                    return glib::Propagation::Stop;
-                };
-                let buttons = self.buttons.get();
-                let bit = if clicks < 0 {
-                    model::WHEEL_UP
-                } else {
-                    model::WHEEL_DOWN
-                };
-                for _ in 0..clicks.unsigned_abs() {
-                    self.send(Input::Pointer {
-                        x,
-                        y,
-                        buttons: buttons | bit,
-                    });
-                    self.send(Input::Pointer { x, y, buttons });
+                if let Some((x, y, _)) = self.point(event) {
+                    let clicks = self.mouse.borrow_mut().scroll(x, y, delta);
+                    for input in clicks {
+                        self.send(input);
+                    }
                 }
                 glib::Propagation::Stop
             }
@@ -791,21 +814,25 @@ impl Screen {
         self.scroller.set_policy(policy, policy);
     }
 
-    /// Moves the framed screen into a fullscreen window of its own, with
-    /// the guest pill on top.
+    /// Moves the framed screen into a fullscreen window of its own,
+    /// under the guest strip, and hands the guest the keyboard. Leaves
+    /// fullscreen if it is on (F11).
     fn fullscreen(self: &Rc<Self>) {
         if self.full.borrow().is_some() {
-            return;
+            return self.leave_fullscreen();
         }
         let parent = self.root.root().and_downcast::<gtk::Window>();
         self.holder.set_child(None::<&gtk::Widget>);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&self.strip);
+        content.append(&self.frame);
         let window = adw::Window::builder()
             .title(format!(
                 "Guest screen: {}",
                 stallo::printable(&self.name, 64)
             ))
             .modal(true)
-            .content(&self.frame)
+            .content(&content)
             .build();
         window.set_transient_for(parent.as_ref());
         let s = Rc::downgrade(self);
@@ -815,12 +842,12 @@ impl Screen {
             }
             glib::Propagation::Proceed
         });
-        // Esc leaves, unless the guest has the keyboard (then it never
-        // gets here).
+        // Esc and F11 leave, unless the guest has the keyboard (then they
+        // never get here).
         let keys = gtk::EventControllerKey::new();
         let w = window.downgrade();
         keys.connect_key_pressed(move |_, key, _, _| {
-            if key != gdk::Key::Escape {
+            if key != gdk::Key::Escape && key != gdk::Key::F11 {
                 return glib::Propagation::Proceed;
             }
             if let Some(w) = w.upgrade() {
@@ -829,11 +856,11 @@ impl Screen {
             glib::Propagation::Stop
         });
         window.add_controller(keys);
-        self.pill.set_visible(true);
         *self.full.borrow_mut() = Some(window.clone());
         window.fullscreen();
         window.present();
         self.picture.grab_focus();
+        self.grab(None);
     }
 
     fn leave_fullscreen(&self) {
@@ -847,8 +874,11 @@ impl Screen {
     fn restore(&self, window: &adw::Window) {
         self.ungrab();
         self.full.take();
+        if let Some(content) = self.frame.parent().and_downcast::<gtk::Box>() {
+            content.remove(&self.strip);
+            content.remove(&self.frame);
+        }
         window.set_content(None::<&gtk::Widget>);
-        self.pill.set_visible(false);
         self.holder.set_child(Some(&self.frame));
     }
 }

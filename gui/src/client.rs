@@ -122,18 +122,22 @@ pub async fn snapshots(socket: &Path, name: String) -> Result<Vec<Snapshot>, Cal
     get(socket, Request::Snapshots { name }, READ_TIMEOUT).await
 }
 
-/// Changes a VM: a lifecycle or snapshot action. Returns the last answer.
+/// Changes a VM: a lifecycle or snapshot action. Returns the last answer,
+/// or the index of the request that failed (see [`Action::failed_at`])
+/// and why.
 pub async fn act(
     socket: &Path,
     action: &Action,
     name: &str,
-) -> Result<serde_json::Value, CallError> {
+) -> Result<serde_json::Value, (usize, CallError)> {
     // ponytail: waiting for a slot still counts against the limit, so a
     // fifth snapshot action at once may time out unsent; fine for 4 slots.
     let slots = if action.lifecycle() { &ACTIONS } else { &SNAPS };
     let mut answer = serde_json::Value::Null;
-    for request in action.requests(name) {
-        answer = call_in(slots, socket, request, action.limit()).await?;
+    for (step, request) in action.requests(name).into_iter().enumerate() {
+        answer = call_in(slots, socket, request, action.limit())
+            .await
+            .map_err(|e| (step, e))?;
     }
     Ok(answer)
 }
@@ -297,7 +301,7 @@ mod tests {
         );
         assert_eq!(
             run(async move { act(&s, &Action::Life(Op::Resume), "dev").await }),
-            Err(CallError::Failed("dev is not paused".into()))
+            Err((0, CallError::Failed("dev is not paused".into())))
         );
     }
 
@@ -361,8 +365,9 @@ mod tests {
         );
         assert_eq!(
             run(async move { act(&s, &Action::Restore("s2".into()), "dev").await }),
-            Err(CallError::Failed(
-                "s2 has no RAM state; stop the VM first".into()
+            Err((
+                0,
+                CallError::Failed("s2 has no RAM state; stop the VM first".into())
             ))
         );
     }
@@ -405,7 +410,8 @@ mod tests {
         let (_d, s, fake) = daemon(vec![ok, "{\"ok\":false,\"error\":\"dev is busy\"}\n"]);
         let restart = Action::Restart { live_screen: true };
         let got = run(async move { act(&s, &restart, "dev").await });
-        assert_eq!(got, Err(CallError::Failed("dev is busy".into())));
+        // The stop, the second request.
+        assert_eq!(got, Err((1, CallError::Failed("dev is busy".into()))));
         assert_eq!(fake.join().unwrap().len(), 2);
     }
 
