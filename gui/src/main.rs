@@ -222,6 +222,45 @@ impl Ui {
         self.toasts.add_toast(toast);
     }
 
+    /// A toast for an error. Its Details button shows the whole text,
+    /// which a toast would cut off, in a dialog.
+    fn fail(&self, f: &model::Failure) {
+        let toast = adw::Toast::builder()
+            .title(&f.title)
+            .use_markup(false)
+            .build();
+        if let Some(details) = f.details.clone() {
+            toast.set_button_label(Some("Details"));
+            let (window, heading) = (self.window.downgrade(), f.title.clone());
+            toast.connect_button_clicked(move |_| {
+                // Selectable, so it can be copied into a bug report. The
+                // Close button keeps it from being the only focusable widget.
+                let text = gtk::Label::builder()
+                    .label(&details)
+                    .use_markup(false)
+                    .selectable(true)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build();
+                text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                let scroll = gtk::ScrolledWindow::builder()
+                    .hscrollbar_policy(gtk::PolicyType::Never)
+                    .propagate_natural_height(true)
+                    .max_content_height(300)
+                    .child(&text)
+                    .build();
+                let dialog = adw::AlertDialog::builder()
+                    .heading(&heading)
+                    .heading_use_markup(false)
+                    .extra_child(&scroll)
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.present(window.upgrade().as_ref());
+            });
+        }
+        self.toasts.add_toast(toast);
+    }
+
     fn page(self: &Rc<Self>, page: &Onboarding) -> gtk::Widget {
         // Descriptions are Pango markup: only fixed text goes there. Anything
         // else goes into plain labels or rows with markup off.

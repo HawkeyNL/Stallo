@@ -307,35 +307,78 @@ pub fn kind(state: &str) -> Kind {
     }
 }
 
+/// A VM's state in plain words. Other QEMU states get the word for their
+/// [`Kind`]; the daemon's own word goes in the tooltip.
+pub fn state_word(state: &str) -> &'static str {
+    match state.strip_suffix(" (no network)").unwrap_or(state) {
+        "stopped" => "Stopped",
+        "running" => "Running",
+        "paused" => "Paused",
+        "paused (disk full)" => "Disk Full",
+        "io-error" | "internal-error" => "Error",
+        "guest-panicked" => "Crashed",
+        "unknown" => "Not Responding",
+        // On the way somewhere.
+        "save-vm" => "Saving",
+        "restore-vm" | "inmigrate" => "Restoring",
+        "prelaunch" => "Starting",
+        "shutdown" => "Shutting Down",
+        "suspended" => "Suspended",
+        _ => match kind(state) {
+            Kind::Stopped => "Stopped",
+            Kind::Running => "Running",
+            Kind::Paused => "Paused",
+            Kind::DiskFull => "Disk Full",
+            Kind::Failed => "Error",
+        },
+    }
+}
+
 /// A VM in the sidebar. Strings are safe to show in plain labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowVm {
     pub name: String,
-    pub state: String,
+    /// The state in plain words.
+    pub state: &'static str,
+    /// The daemon's own word for the state, for the tooltip.
+    pub raw: String,
     /// The libadwaita style class for the state, if any.
     pub tone: Option<&'static str>,
-    pub control_icon: &'static str,
-    pub control_tip: &'static str,
+    /// An agent may control the VM.
+    pub agent: bool,
+    /// The action that runs on the VM now, in words.
+    pub working: Option<&'static str>,
 }
 
-pub fn row(vm: &VmInfo) -> RowVm {
+impl RowVm {
+    /// What a screen reader says for the row.
+    pub fn label(&self) -> String {
+        let mut label = format!("{}, {}", self.name, self.state);
+        if self.agent {
+            label.push_str(", agent control on");
+        }
+        if let Some(w) = self.working {
+            label.push_str(", ");
+            label.push_str(w);
+        }
+        label
+    }
+}
+
+pub fn row(vm: &VmInfo, working: Option<&Action>) -> RowVm {
     let tone = match kind(&vm.state) {
         Kind::Stopped => None,
         Kind::Running => Some("success"),
         Kind::Paused | Kind::DiskFull => Some("warning"),
         Kind::Failed => Some("error"),
     };
-    let (control_icon, control_tip) = if vm.agent_control {
-        ("security-high-symbolic", "Agent control on")
-    } else {
-        ("avatar-default-symbolic", "Agent control off")
-    };
     RowVm {
         name: printable(&vm.name, 64),
-        state: printable(&vm.state, 64),
+        state: state_word(&vm.state),
+        raw: printable(&vm.state, 64),
         tone,
-        control_icon,
-        control_tip,
+        agent: vm.agent_control,
+        working: working.map(Action::progress),
     }
 }
 
@@ -379,17 +422,58 @@ impl Op {
             Op::Resume => "resume",
         }
     }
+}
 
-    /// The toast when it fails.
-    pub fn failed(self, vm: &str, e: &CallError) -> String {
-        let what = match self {
-            Op::Start => "start",
-            Op::Stop => "stop",
-            Op::ForceOff => "force off",
-            Op::Reset => "reset",
-            Op::Resume => "resume",
-        };
-        format!("Could not {what} {}: {e}", printable(vm, 64))
+/// An error for a toast: a short title, and the whole error with a next
+/// step behind its Details button. Safe for plain labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub title: String,
+    pub details: Option<String>,
+}
+
+/// A request that failed; `title` says what did not happen.
+pub fn failure(title: String, e: &CallError) -> Failure {
+    let text = match e {
+        CallError::Failed(m) => printable(m, 2000),
+        _ => e.to_string(),
+    };
+    let details = match next_step(e) {
+        Some(step) => format!("{text}\n\n{step}"),
+        None => text,
+    };
+    Failure {
+        title,
+        details: Some(details),
+    }
+}
+
+/// What to do about errors whose cause is known.
+// ponytail: matches the daemon's English text; give errors a code in the
+// API if more of them need a next step.
+fn next_step(e: &CallError) -> Option<&'static str> {
+    let msg = match e {
+        CallError::NotRunning => return Some("Start the Stallo service, then try again."),
+        CallError::Denied => return Some("Check that your account is in the stallo group."),
+        CallError::Timeout => {
+            return Some("Stallo may still be working on it. Look at the VM again in a moment.");
+        }
+        CallError::Failed(m) => m,
+    };
+    if msg.contains("guest agent") {
+        Some("Check that qemu-guest-agent is installed and running in the VM.")
+    } else if msg.contains("GiB floor") {
+        Some("Free up disk space on the host, then try again.")
+    } else if msg == "stallod is busy; try again" {
+        // The daemon itself has too many requests.
+        Some("Stallo is busy. Try again in a moment.")
+    } else if msg.contains(" is busy;")
+        || msg.contains(" is busy with")
+        || msg.contains("in use by `stallo run`")
+    {
+        Some("Something else is using this VM. Wait until it is done, then try again.")
+    } else {
+        None
     }
 }
 
@@ -439,28 +523,61 @@ impl Action {
 
     /// The toast when it fails. A snapshot action that timed out may
     /// still run in the daemon.
-    pub fn failed(&self, vm: &str, e: &CallError) -> String {
+    pub fn failed(&self, vm: &str, e: &CallError) -> Failure {
         let vm = printable(vm, 64);
         let (what, slow) = match self {
-            Action::Life(op) => return op.failed(&vm, e),
+            Action::Life(op) => {
+                let verb = match op {
+                    Op::Start => "start",
+                    Op::Stop => "stop",
+                    Op::ForceOff => "force off",
+                    Op::Reset => "reset",
+                    Op::Resume => "resume",
+                };
+                (format!("{verb} {vm}"), None)
+            }
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
-                format!("The snapshot of {vm}"),
+                Some(format!("Snapshot of {vm} still running")),
             ),
             Action::Restore(tag) => {
                 let tag = printable(tag, 64);
-                (format!("restore {tag}"), format!("Restoring {tag}"))
+                (
+                    format!("restore {tag}"),
+                    Some(format!("Restore of {tag} still running")),
+                )
             }
             Action::Delete(tag) => {
                 let tag = printable(tag, 64);
-                (format!("delete {tag}"), format!("Deleting {tag}"))
+                (
+                    format!("delete {tag}"),
+                    Some(format!("Deletion of {tag} still running")),
+                )
             }
         };
-        match e {
-            CallError::Timeout => {
-                format!("{slow} takes long and may still be running; check the list later")
-            }
-            _ => format!("Could not {what}: {e}"),
+        match (e, slow) {
+            (CallError::Timeout, Some(slow)) => Failure {
+                title: slow,
+                details: Some(
+                    "Stallo stopped waiting for an answer, but the job may still finish. Check the snapshot list later."
+                        .to_owned(),
+                ),
+            },
+            _ => failure(format!("Could not {what}"), e),
+        }
+    }
+
+    /// What the window says while it runs.
+    pub fn progress(&self) -> &'static str {
+        match self {
+            Action::Life(Op::Start) => "Starting…",
+            Action::Life(Op::Stop) => "Stopping…",
+            Action::Life(Op::ForceOff) => "Forcing off…",
+            Action::Life(Op::Reset) => "Resetting…",
+            Action::Life(Op::Resume) => "Resuming…",
+            Action::Take(_) => "Taking snapshot…",
+            Action::Restore(_) => "Restoring snapshot…",
+            Action::Delete(_) => "Deleting snapshot…",
         }
     }
 
@@ -481,17 +598,20 @@ impl Action {
 }
 
 /// Which actions a VM offers now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActionSet {
     pub start: bool,
     pub stop: bool,
     pub force_off: bool,
     pub reset: bool,
     pub resume: bool,
-    /// The VM exists as a process but does not run (paused, disk full,
-    /// io-error...): Resume and Force Off take the place of Stop, which
-    /// could not shut the guest down cleanly anyway.
-    pub halted: bool,
+    /// The one header button for the state: Start, the Stop split button
+    /// (Force Off, Reset), or the Resume split button (Force Off) for a VM
+    /// that exists but does not run (paused, disk full, io-error...).
+    pub primary: Op,
+    /// The primary button is the obvious next step (`suggested-action`):
+    /// not Resume of a VM that failed.
+    pub suggested: bool,
 }
 
 impl ActionSet {
@@ -507,27 +627,25 @@ impl ActionSet {
 }
 
 /// The actions for `vm`; none while `blocked`: one of its actions runs or
-/// just ran, or the daemon is out of reach.
+/// just ran, or the daemon is out of reach. The header keeps its layout.
 pub fn actions(vm: &VmInfo, blocked: bool) -> ActionSet {
     let k = kind(&vm.state);
-    let running = k == Kind::Running;
-    // The daemon stops a VM that does not run with a hard QMP quit.
-    let halted = !running && k != Kind::Stopped;
-    let set = ActionSet {
-        start: k == Kind::Stopped,
-        stop: running,
-        force_off: running || halted,
-        reset: running,
-        resume: halted,
-        halted,
+    let primary = match k {
+        Kind::Stopped => Op::Start,
+        Kind::Running => Op::Stop,
+        // The daemon stops a VM that does not run with a hard QMP quit,
+        // so it gets no plain Stop.
+        _ => Op::Resume,
     };
-    if blocked {
-        ActionSet {
-            halted,
-            ..ActionSet::default()
-        }
-    } else {
-        set
+    let on = !blocked;
+    ActionSet {
+        start: on && primary == Op::Start,
+        stop: on && primary == Op::Stop,
+        force_off: on && primary != Op::Start,
+        reset: on && primary == Op::Stop,
+        resume: on && primary == Op::Resume,
+        primary,
+        suggested: primary == Op::Start || (primary == Op::Resume && k != Kind::Failed),
     }
 }
 
@@ -562,31 +680,37 @@ pub fn confirm(op: Op, vm: &VmInfo) -> Option<Confirm> {
 /// a VM list that was asked for after it ended arrives (no second Start
 /// on a state from before the first).
 #[derive(Debug, Default)]
-pub struct Pending(HashMap<String, Option<Instant>>);
+pub struct Pending(HashMap<String, (Action, Option<Instant>)>);
 
 impl Pending {
-    /// Claims `vm` for an action; false if it has one already.
-    pub fn start(&mut self, vm: &str) -> bool {
+    /// Claims `vm` for `action`; false if it has one already.
+    pub fn start(&mut self, vm: &str, action: &Action) -> bool {
         if self.0.contains_key(vm) {
             return false;
         }
-        self.0.insert(vm.to_owned(), None);
+        self.0.insert(vm.to_owned(), (action.clone(), None));
         true
     }
 
     pub fn finish(&mut self, vm: &str, now: Instant) {
-        if let Some(end) = self.0.get_mut(vm) {
+        if let Some((_, end)) = self.0.get_mut(vm) {
             *end = Some(now);
         }
     }
 
     /// A VM list arrived that was asked for at `sent`.
     pub fn listed(&mut self, sent: Instant) {
-        self.0.retain(|_, end| end.is_none_or(|end| end > sent));
+        self.0
+            .retain(|_, (_, end)| end.is_none_or(|end| end > sent));
     }
 
     pub fn blocks(&self, vm: &str) -> bool {
         self.0.contains_key(vm)
+    }
+
+    /// The action that holds `vm`, if any.
+    pub fn action(&self, vm: &str) -> Option<&Action> {
+        self.0.get(vm).map(|(a, _)| a)
     }
 }
 
@@ -614,31 +738,49 @@ pub fn snaps_wait(stuck: Option<&(String, Instant)>, state: &str, now: Instant) 
 pub struct SnapRow {
     pub tag: String,
     pub name: String,
-    /// When it was taken, and the size of its saved memory.
+    /// When it was taken and what it holds, and why it cannot be restored
+    /// now, if so.
     pub subtitle: String,
-    /// It holds the VM's memory (RAM).
-    pub memory: bool,
     /// Why it cannot be restored now, whatever else runs.
     pub restore_block: Option<&'static str>,
+    /// An action on this snapshot runs now, in words.
+    pub working: Option<&'static str>,
 }
 
-/// The timeline: newest first. `now` is the host clock in Unix seconds.
-pub fn timeline(vm: &VmInfo, snaps: &[Snapshot], now: u64) -> Vec<SnapRow> {
+/// The timeline: newest first. `now` is the host clock in Unix seconds;
+/// `running` is the action that holds the VM, if any.
+pub fn timeline(
+    vm: &VmInfo,
+    snaps: &[Snapshot],
+    now: u64,
+    running: Option<&Action>,
+) -> Vec<SnapRow> {
     snaps
         .iter()
         .rev()
         .map(|s| {
             let mut subtitle = age(now.saturating_sub(s.created));
             if s.ram_bytes > 0 {
-                subtitle.push_str(" · ");
-                subtitle.push_str(&size(s.ram_bytes));
+                subtitle.push_str(&format!(" · Disk and memory ({})", size(s.ram_bytes)));
+            } else {
+                subtitle.push_str(" · Disk only");
             }
+            let restore_block = restore_block(vm, s);
+            if let Some(why) = restore_block {
+                subtitle.push('\n');
+                subtitle.push_str(why);
+            }
+            let working = match running {
+                Some(Action::Restore(t)) if *t == s.name => Some("Restoring…"),
+                Some(Action::Delete(t)) if *t == s.name => Some("Deleting…"),
+                _ => None,
+            };
             SnapRow {
                 tag: s.name.clone(),
                 name: printable(&s.name, 64),
                 subtitle,
-                memory: s.ram_bytes > 0,
-                restore_block: restore_block(vm, s),
+                restore_block,
+                working,
             }
         })
         .collect()
@@ -647,9 +789,9 @@ pub fn timeline(vm: &VmInfo, snaps: &[Snapshot], now: u64) -> Vec<SnapRow> {
 /// The daemon's restore rules, so the button is off where it would refuse.
 fn restore_block(vm: &VmInfo, snap: &Snapshot) -> Option<&'static str> {
     if stallo::snapshot::ram_missing(snap) {
-        Some("Its saved memory is missing, so it cannot be restored")
+        Some("Its saved memory is missing, so it cannot be restored.")
     } else if snap.ram_bytes == 0 && kind(&vm.state) != Kind::Stopped {
-        Some("Stop the VM to restore a snapshot without memory")
+        Some("Stop the VM to restore this snapshot.")
     } else {
         None
     }
@@ -698,15 +840,30 @@ pub fn take_note(vm: &VmInfo) -> &'static str {
 
 /// The name typed for a new snapshot: none (the daemon picks one), or one
 /// that the daemon's own check accepts and that is not taken yet.
+/// The prefilled suggestion counts as none: the daemon picks a free name
+/// itself, and may know names the list does not show.
 pub fn snapshot_name(typed: &str, snaps: Option<&[Snapshot]>) -> Result<Option<String>, String> {
-    if typed.is_empty() {
+    if typed.is_empty() || typed == suggested_name(snaps) {
         return Ok(None);
     }
-    stallo::config::validate_tag(typed).map_err(|e| printable(&e.to_string(), 200))?;
+    if stallo::config::validate_tag(typed).is_err() {
+        return Err(
+            "Use up to 64 letters, digits, '.', '_' or '-', starting with a letter.".to_owned(),
+        );
+    }
     if snaps.is_some_and(|s| s.iter().any(|s| s.name == typed)) {
         return Err("A snapshot with this name already exists".to_owned());
     }
     Ok(Some(typed.to_owned()))
+}
+
+/// The name a new snapshot gets unless the user types another: the next
+/// free `snapN`, or none while the list is not known yet.
+pub fn suggested_name(snaps: Option<&[Snapshot]>) -> String {
+    snaps.map_or_else(String::new, |s| {
+        let names: Vec<String> = s.iter().map(|s| s.name.clone()).collect();
+        stallo::snapshot::next_name(&names)
+    })
 }
 
 /// The question before restoring `snap`.
@@ -760,8 +917,12 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
         format!("{:.1} GiB", d.disk_used_bytes as f64 / BYTES_PER_GIB)
     });
     let net = match vm.net {
-        NetProfile::Offline => "Offline",
-        NetProfile::Internet => "Internet",
+        NetProfile::Offline => "Off",
+        // The daemon cut it: the network check failed.
+        NetProfile::Internet if vm.state.ends_with(" (no network)") => {
+            "Cut off until the VM restarts"
+        }
+        NetProfile::Internet => "On",
     };
     let forwards = if vm.forwards.is_empty() {
         "None".to_owned()
@@ -775,7 +936,7 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
     let addresses = match details.map(|d| &d.addresses) {
         _ if k == Kind::Stopped => "None".to_owned(),
         None => "Unknown".to_owned(),
-        Some(None) => "The guest agent does not answer".to_owned(),
+        Some(None) => "Unknown (install qemu-guest-agent in the VM to see addresses)".to_owned(),
         Some(Some(a)) if a.is_empty() => "None".to_owned(),
         Some(Some(a)) => a
             .iter()
@@ -788,7 +949,7 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
         (
             "Resources",
             vec![
-                ("State", printable(&vm.state, 64)),
+                ("State", state_word(&vm.state).to_owned()),
                 ("Processors", vm.vcpus.to_string()),
                 ("Memory", memory),
                 ("Disk Size", format!("{} GiB", vm.disk_gib)),
@@ -798,7 +959,7 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
         (
             "Network",
             vec![
-                ("Profile", net.to_owned()),
+                ("Internet Access", net.to_owned()),
                 ("Port Forwards", forwards),
                 ("Addresses", addresses),
             ],
@@ -824,21 +985,31 @@ pub fn meter(h: &HostInfo) -> Meter {
         b => (h.memory_used_mib as f64 / b as f64).min(1.0),
     };
     let disk_low = stallo::host::below_floor(h.disk_free_bytes, h.disk_floor_gib);
-    let free = h.disk_free_bytes as f64 / BYTES_PER_GIB;
+    // Rounded down: never "20 GiB free" while below a 20 GiB limit.
+    let free = (h.disk_free_bytes as f64 / BYTES_PER_GIB).floor();
+    // Whole GiB where it is one, else one decimal.
+    let gib = |mib: u64| {
+        let g = mib as f64 / MIB_PER_GIB;
+        if mib.is_multiple_of(1024) {
+            format!("{g:.0}")
+        } else {
+            format!("{g:.1}")
+        }
+    };
     Meter {
         memory_fraction: fraction,
         memory: format!(
-            "VM memory: {:.1} of {:.1} GiB",
-            h.memory_used_mib as f64 / MIB_PER_GIB,
-            h.memory_budget_mib as f64 / MIB_PER_GIB
+            "VM memory: {} of {} GiB",
+            gib(h.memory_used_mib),
+            gib(h.memory_budget_mib)
         ),
         disk: if disk_low {
             format!(
-                "Disk: {free:.1} GiB free, below the {} GiB floor",
+                "Disk: {free:.0} GiB free. VMs pause below {} GiB.",
                 h.disk_floor_gib
             )
         } else {
-            format!("Disk: {free:.1} GiB free, floor {} GiB", h.disk_floor_gib)
+            format!("Disk: {free:.0} GiB free")
         },
         disk_low,
     }
@@ -1171,28 +1342,65 @@ mod tests {
 
     #[test]
     fn rows() {
-        let r = row(&vm("running"));
+        let r = row(&vm("running"), None);
         assert_eq!(r.name, "dev");
+        assert_eq!((r.state, r.raw.as_str()), ("Running", "running"));
         assert_eq!(r.tone, Some("success"));
-        assert_eq!(r.control_icon, "avatar-default-symbolic");
-        assert_eq!(r.control_tip, "Agent control off");
+        assert!(!r.agent);
+        assert_eq!(r.working, None);
+        assert_eq!(r.label(), "dev, Running");
         let on = VmInfo {
             agent_control: true,
             ..vm("stopped")
         };
-        let r = row(&on);
+        let r = row(&on, Some(&Action::Take(None)));
         assert_eq!(r.tone, None);
-        assert_eq!(r.control_icon, "security-high-symbolic");
-        assert_eq!(row(&vm("paused (disk full)")).tone, Some("warning"));
-        assert_eq!(row(&vm("io-error")).tone, Some("error"));
+        assert!(r.agent);
+        assert_eq!(r.working, Some("Taking snapshot…"));
+        assert_eq!(
+            r.label(),
+            "dev, Stopped, agent control on, Taking snapshot…"
+        );
+        assert_eq!(row(&vm("paused (disk full)"), None).tone, Some("warning"));
+        assert_eq!(row(&vm("io-error"), None).tone, Some("error"));
         // Daemon text is cleaned and capped before it reaches a label.
         let odd = VmInfo {
             name: "a\u{202E}b\n".into(),
             ..vm(&"x".repeat(500))
         };
-        let r = row(&odd);
+        let r = row(&odd, None);
         assert_eq!(r.name, "ab");
-        assert_eq!(r.state.len(), 64);
+        assert_eq!(r.state, "Paused");
+        assert_eq!(r.raw.len(), 64);
+    }
+
+    #[test]
+    fn state_words() {
+        for (state, word) in [
+            ("stopped", "Stopped"),
+            ("running", "Running"),
+            ("running (no network)", "Running"),
+            ("paused", "Paused"),
+            ("paused (no network)", "Paused"),
+            ("paused (disk full)", "Disk Full"),
+            ("io-error", "Error"),
+            ("internal-error", "Error"),
+            ("guest-panicked", "Crashed"),
+            ("unknown", "Not Responding"),
+            // QEMU states on the way somewhere.
+            ("save-vm", "Saving"),
+            ("restore-vm", "Restoring"),
+            ("inmigrate", "Restoring"),
+            ("prelaunch", "Starting"),
+            ("shutdown", "Shutting Down"),
+            ("suspended (no network)", "Suspended"),
+            // Anything else: the word for its kind, never the raw text.
+            ("postmigrate", "Paused"),
+            ("odd\u{1b}[31m", "Paused"),
+            ("", "Paused"),
+        ] {
+            assert_eq!(state_word(state), word, "{state}");
+        }
     }
 
     #[test]
@@ -1203,7 +1411,8 @@ mod tests {
             force_off: false,
             reset: false,
             resume: false,
-            halted: false,
+            primary: Op::Start,
+            suggested: true,
         };
         const RUNNING: ActionSet = ActionSet {
             start: false,
@@ -1211,7 +1420,8 @@ mod tests {
             force_off: true,
             reset: true,
             resume: false,
-            halted: false,
+            primary: Op::Stop,
+            suggested: false,
         };
         // No plain Stop: the daemon would quit QEMU without a shutdown.
         const HALTED: ActionSet = ActionSet {
@@ -1220,7 +1430,13 @@ mod tests {
             force_off: true,
             reset: false,
             resume: true,
-            halted: true,
+            primary: Op::Resume,
+            suggested: true,
+        };
+        // Resume is no obvious next step for a VM that failed.
+        const FAILED: ActionSet = ActionSet {
+            suggested: false,
+            ..HALTED
         };
         for (state, want) in [
             ("stopped", STOPPED),
@@ -1229,14 +1445,17 @@ mod tests {
             ("paused", HALTED),
             ("paused (no network)", HALTED),
             ("paused (disk full)", HALTED),
-            ("io-error", HALTED),
-            ("unknown", HALTED),
+            ("save-vm", HALTED),
+            ("io-error", FAILED),
+            ("guest-panicked", FAILED),
+            ("unknown", FAILED),
         ] {
             assert_eq!(actions(&vm(state), false), want, "{state}");
             // Blocked: nothing, but the layout stays.
             let busy = actions(&vm(state), true);
             assert!(Op::ALL.iter().all(|&op| !busy.allows(op)), "{state}");
-            assert_eq!(busy.halted, want.halted, "{state}");
+            assert_eq!(busy.primary, want.primary, "{state}");
+            assert_eq!(busy.suggested, want.suggested, "{state}");
             for op in Op::ALL {
                 let field = match op {
                     Op::Start => want.start,
@@ -1270,14 +1489,6 @@ mod tests {
         for op in Op::ALL {
             assert_eq!(op.limit(), Duration::from_secs(150));
         }
-        assert_eq!(
-            Op::ForceOff.failed("dev", &CallError::Failed("no\u{1b}[31m way".into())),
-            "Could not force off dev: no[31m way"
-        );
-        assert_eq!(
-            Op::Start.failed("dev", &CallError::Timeout),
-            "Could not start dev: no answer in time"
-        );
     }
 
     #[test]
@@ -1313,10 +1524,16 @@ mod tests {
         let t0 = Instant::now();
         let s = Duration::from_secs(1);
         let mut p = Pending::default();
+        let take = Action::Take(None);
         assert!(!p.blocks("dev"));
-        assert!(p.start("dev"));
-        assert!(!p.start("dev"), "one action per VM");
-        assert!(p.start("web"));
+        assert_eq!(p.action("dev"), None);
+        assert!(p.start("dev", &take));
+        assert!(
+            !p.start("dev", &Action::Life(Op::Stop)),
+            "one action per VM"
+        );
+        assert_eq!(p.action("dev"), Some(&take));
+        assert!(p.start("web", &take));
         p.listed(t0 + s);
         assert!(p.blocks("dev"), "still running");
         p.finish("dev", t0 + 2 * s);
@@ -1324,8 +1541,9 @@ mod tests {
         assert!(p.blocks("dev"), "that list was asked for before the end");
         p.listed(t0 + 2 * s);
         assert!(!p.blocks("dev"));
+        assert_eq!(p.action("dev"), None);
         assert!(p.blocks("web"));
-        assert!(p.start("dev"));
+        assert!(p.start("dev", &take));
     }
 
     #[test]
@@ -1405,7 +1623,7 @@ mod tests {
         assert_eq!(
             values(stopped),
             [
-                "stopped", "2", "2 GiB", "20 GiB", "Unknown", "Offline", "None", "None"
+                "Stopped", "2", "2 GiB", "20 GiB", "Unknown", "Off", "None", "None"
             ]
         );
 
@@ -1443,12 +1661,12 @@ mod tests {
         assert_eq!(
             values(f),
             [
-                "running",
+                "Running",
                 "2",
                 "1536 MiB",
                 "20 GiB",
                 "1.5 GiB",
-                "Internet",
+                "On",
                 "127.0.0.1:8080 → 80\n[::1]:2222 → 22",
                 "eth0  10.0.2.15/24\nevil  fe80::1/64",
             ]
@@ -1458,7 +1676,23 @@ mod tests {
         assert_eq!(addresses(None, "running"), "Unknown");
         assert_eq!(
             addresses(Some(details(None)), "running"),
-            "The guest agent does not answer"
+            "Unknown (install qemu-guest-agent in the VM to see addresses)"
+        );
+        // The daemon cut the network of an internet VM.
+        let cut = VmInfo {
+            net: NetProfile::Internet,
+            ..vm("running (no network)")
+        };
+        assert_eq!(
+            values(facts(&cut, None))[..6],
+            [
+                "Running",
+                "2",
+                "2 GiB",
+                "20 GiB",
+                "Unknown",
+                "Cut off until the VM restarts"
+            ]
         );
         assert_eq!(addresses(Some(details(Some(vec![]))), "running"), "None");
         // Old addresses of a VM that stopped since are not shown.
@@ -1491,8 +1725,8 @@ mod tests {
         };
         let m = meter(&host);
         assert_eq!(m.memory_fraction, 0.25);
-        assert_eq!(m.memory, "VM memory: 6.0 of 24.0 GiB");
-        assert_eq!(m.disk, "Disk: 100.0 GiB free, floor 20 GiB");
+        assert_eq!(m.memory, "VM memory: 6 of 24 GiB");
+        assert_eq!(m.disk, "Disk: 100 GiB free");
         assert!(!m.disk_low);
         let low = meter(&HostInfo {
             disk_free_bytes: 10 << 30,
@@ -1500,7 +1734,14 @@ mod tests {
             ..host.clone()
         });
         assert!(low.disk_low);
-        assert_eq!(low.disk, "Disk: 10.0 GiB free, below the 20 GiB floor");
+        assert_eq!(low.disk, "Disk: 10 GiB free. VMs pause below 20 GiB.");
+        assert_eq!(low.memory, "VM memory: 29.3 of 24 GiB");
+        // Rounded down, so never at or above the limit while below it.
+        let edge = meter(&HostInfo {
+            disk_free_bytes: (20 << 30) - 1,
+            ..host.clone()
+        });
+        assert_eq!(edge.disk, "Disk: 19 GiB free. VMs pause below 20 GiB.");
         assert_eq!(low.memory_fraction, 1.0, "capped");
         let no_budget = |used| {
             meter(&HostInfo {
@@ -1531,7 +1772,7 @@ mod tests {
             snap("big", 3 << 29, 9_990, 1),
             snap("lost", 0, 9_999, 5_000),
         ];
-        let rows = timeline(&vm("stopped"), &snaps, 10_000);
+        let rows = timeline(&vm("stopped"), &snaps, 10_000, None);
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1542,15 +1783,11 @@ mod tests {
         assert_eq!(
             subtitles,
             [
-                "Just now",
-                "Just now · 1.5 GiB",
-                "16 minutes ago · 412 MiB",
-                "2 hours ago"
+                "Just now · Disk only\nIts saved memory is missing, so it cannot be restored.",
+                "Just now · Disk and memory (1.5 GiB)",
+                "16 minutes ago · Disk and memory (412 MiB)",
+                "2 hours ago · Disk only"
             ]
-        );
-        assert_eq!(
-            rows.iter().map(|r| r.memory).collect::<Vec<_>>(),
-            [false, true, true, false]
         );
         // Stopped: everything restores but a RAM snapshot whose RAM is gone.
         let blocks: Vec<_> = rows.iter().map(|r| r.restore_block).collect();
@@ -1558,7 +1795,7 @@ mod tests {
         assert_eq!(&blocks[1..], [None, None, None]);
         // Running: a disk-only snapshot needs the VM stopped first.
         for state in ["running", "paused", "paused (disk full)"] {
-            let rows = timeline(&vm(state), &snaps, 10_000);
+            let rows = timeline(&vm(state), &snaps, 10_000, None);
             assert!(
                 rows[0].restore_block.unwrap().contains("missing"),
                 "{state}"
@@ -1568,14 +1805,37 @@ mod tests {
                 rows[3].restore_block.unwrap().starts_with("Stop the VM"),
                 "{state}"
             );
+            // The reason is visible, not only on the greyed-out button.
+            assert!(
+                rows[3]
+                    .subtitle
+                    .ends_with("\nStop the VM to restore this snapshot."),
+                "{state}"
+            );
         }
+        // An action on one snapshot shows on its row only.
+        let working = |a: Action| {
+            timeline(&vm("running"), &snaps, 10_000, Some(&a))
+                .into_iter()
+                .map(|r| r.working)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            working(Action::Restore("big".into())),
+            [None, Some("Restoring…"), None, None]
+        );
+        assert_eq!(
+            working(Action::Delete("disk".into())),
+            [None, None, None, Some("Deleting…")]
+        );
+        assert_eq!(working(Action::Take(None)), [None; 4]);
         // Clock skew: never "in the future".
         assert_eq!(
-            timeline(&vm("stopped"), &snaps[..1], 0)[0].subtitle,
-            "Just now"
+            timeline(&vm("stopped"), &snaps[..1], 0, None)[0].subtitle,
+            "Just now · Disk only"
         );
         // Daemon text is cleaned; the raw name goes back to the daemon.
-        let odd = timeline(&vm("stopped"), &[snap("a\u{202E}b", 0, 0, 0)], 0);
+        let odd = timeline(&vm("stopped"), &[snap("a\u{202E}b", 0, 0, 0)], 0, None);
         assert_eq!(
             (odd[0].name.as_str(), odd[0].tag.as_str()),
             ("ab", "a\u{202E}b")
@@ -1615,17 +1875,39 @@ mod tests {
             Err("A snapshot with this name already exists".into())
         );
         assert_eq!(snapshot_name("s1", None), Ok(Some("s1".into())));
-        // The library's own check, passed through.
-        for bad in ["1st", "with space", "a/b", "-x", &"x".repeat(65), "é"] {
+        // The library's own check, in the window's words.
+        for bad in [
+            "1st",
+            "with space",
+            "a/b",
+            "-x",
+            &"x".repeat(65),
+            "é",
+            "a\u{1b}[31m",
+        ] {
             let e = snapshot_name(bad, some).unwrap_err();
-            assert!(e.starts_with("invalid snapshot name"), "{bad}: {e}");
+            assert!(e.starts_with("Use up to 64 letters"), "{bad}: {e}");
             assert!(stallo::config::validate_tag(bad).is_err());
         }
-        assert!(
-            !snapshot_name("a\u{1b}[31m", None)
-                .unwrap_err()
-                .contains('\u{1b}')
+
+        // Prefilled with the next free name, which the check accepts.
+        assert_eq!(suggested_name(None), "");
+        assert_eq!(suggested_name(Some(&[])), "snap1");
+        let taken = [snap("snap1", 0, 0, 0), snap("snap3", 0, 0, 0)];
+        assert_eq!(suggested_name(Some(&taken)), "snap2");
+        // Kept as suggested: the daemon picks the name.
+        assert_eq!(
+            snapshot_name(&suggested_name(Some(&taken)), Some(&taken)),
+            Ok(None)
         );
+        assert_eq!(
+            snapshot_name("snap4", Some(&taken)),
+            Ok(Some("snap4".into()))
+        );
+        assert_eq!(snapshot_name("snap1", None), Ok(Some("snap1".into())));
+        // The limit is shown as the group description (markup): no markup.
+        let why = take_block(Some(&full)).unwrap();
+        assert!(!why.contains(['<', '>', '&']), "{why}");
     }
 
     #[test]
@@ -1706,22 +1988,57 @@ mod tests {
         );
 
         let e = CallError::Timeout;
+        let title = |a: Action, e: &CallError| a.failed("dev", e).title;
         assert_eq!(
-            Action::Take(None).failed("dev", &e),
-            "The snapshot of dev takes long and may still be running; check the list later"
+            title(Action::Take(None), &e),
+            "Snapshot of dev still running"
+        );
+        assert!(
+            Action::Take(None)
+                .failed("dev", &e)
+                .details
+                .unwrap()
+                .contains("may still finish")
         );
         assert_eq!(
-            Action::Restore("s1".into()).failed("dev", &e),
-            "Restoring s1 takes long and may still be running; check the list later"
+            title(Action::Restore("s1".into()), &e),
+            "Restore of s1 still running"
+        );
+        assert_eq!(
+            title(Action::Delete("s1".into()), &e),
+            "Deletion of s1 still running"
         );
         assert_eq!(
             Action::Delete("s\u{1b}1".into()).failed("dev", &CallError::Denied),
-            "Could not delete s1: permission denied"
+            Failure {
+                title: "Could not delete s1".into(),
+                details: Some(
+                    "permission denied\n\nCheck that your account is in the stallo group.".into()
+                ),
+            }
         );
         assert_eq!(
             Action::Life(Op::Start).failed("dev", &e),
-            Op::Start.failed("dev", &e)
+            Failure {
+                title: "Could not start dev".into(),
+                details: Some(
+                    "no answer in time\n\nStallo may still be working on it. Look at the VM again in a moment."
+                        .into()
+                ),
+            }
         );
+        assert_eq!(
+            title(Action::Life(Op::ForceOff), &e),
+            "Could not force off dev"
+        );
+        for a in [
+            Action::Life(Op::Start),
+            Action::Take(None),
+            Action::Restore("s".into()),
+            Action::Delete("s".into()),
+        ] {
+            assert!(a.progress().ends_with('…'));
+        }
         let taken = serde_json::json!({"name": "snap3\u{1b}", "ram": true, "ms": 5});
         assert_eq!(
             Action::Take(None).done("dev", &taken).as_deref(),
@@ -1748,6 +2065,48 @@ mod tests {
         assert_eq!(
             Action::Life(Op::Start).done("dev", &serde_json::Value::Null),
             None
+        );
+    }
+
+    #[test]
+    fn failures_have_details_and_next_steps() {
+        let details = |m: &str| {
+            failure("Could not x".into(), &CallError::Failed(m.into()))
+                .details
+                .unwrap()
+        };
+        // Daemon text in full (up to a cap), cleaned, no markup involved.
+        let long = "a\u{202E}b".repeat(1500);
+        assert_eq!(details(&long).len(), 2000);
+        assert_eq!(details("no\u{1b}[31m way"), "no[31m way");
+        for (msg, step) in [
+            ("dev: guest agent not ready after 10s", "qemu-guest-agent"),
+            (
+                "the data disk is still below the 20 GiB floor; free space first",
+                "Free up disk space",
+            ),
+            ("dev is busy; try again", "Wait until it is done"),
+            ("dev is busy with a guest command; try again", "Wait until"),
+            ("dev is busy with other input", "Wait until"),
+            (
+                "dev is in use by `stallo run`; try again when it ends",
+                "Wait until",
+            ),
+            ("stallod is busy; try again", "Stallo is busy. Try again"),
+        ] {
+            let d = details(msg);
+            assert!(d.starts_with(msg), "{d}");
+            assert!(d.contains(step), "{msg}: {d}");
+        }
+        // "busy" alone, e.g. in a VM's name, is no known cause.
+        for msg in ["busybox: no such VM", "cannot start busy-vm: bad disk"] {
+            assert_eq!(details(msg), msg);
+        }
+        assert!(
+            failure("x".into(), &CallError::NotRunning)
+                .details
+                .unwrap()
+                .ends_with("Start the Stallo service, then try again.")
         );
     }
 
