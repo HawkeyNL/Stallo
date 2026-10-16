@@ -95,7 +95,9 @@ fn agent_session_over_mcp() {
         return;
     }
     let d = Daemon::start("mcp", "");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     d.assert_safe("dev");
     let mut m = Mcp::start(&d);
 
@@ -215,7 +217,9 @@ fn snapshots_over_mcp() {
         return;
     }
     let d = Daemon::start("mcp-snapshot", "");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     d.ok(&["agent", "dev", "on"]);
     let mut m = Mcp::start(&d);
     let sh = |m: &mut Mcp, cmd: &str| -> String {

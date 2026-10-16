@@ -18,7 +18,9 @@ fn perf() {
     }
     let d = Daemon::start("perf", "");
     let t = Instant::now();
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     let ready = t.elapsed();
     d.assert_safe("dev");
     d.ok(&["agent", "dev", "on"]);

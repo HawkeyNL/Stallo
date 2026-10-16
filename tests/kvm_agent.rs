@@ -18,7 +18,9 @@ fn agent_drives_the_console() {
         return;
     }
     let d = Daemon::start("agent", "");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     d.assert_safe("dev");
     // S8: with agent control off (the default), every VM tool is refused
     // to agents, before it reaches the VM.
@@ -115,7 +117,7 @@ fn agent_drives_the_console() {
         Request::Resume { name: "dev".into() },
         Request::New {
             name: "two".into(),
-            image: "ubuntu-26.04".into(),
+            image: d.image.clone(),
             vcpus: 1,
             memory_mib: 512,
             disk_gib: 10,
@@ -206,7 +208,8 @@ fn agent_drives_the_console() {
         let reader = scope.spawn(|| {
             d.ok(&[
                 "exec", "dev", "--admin", "--", "sh", "-c",
-                "ev=$(awk '/Virtio Tablet/{f=1} f && /^H:/{for(i=1;i<=NF;i++) if($i ~ /^event/) print $i; exit}' /proc/bus/input/devices); \
+                // `H: Handlers=mouse0 event3`, or `Handlers=event3 mouse0`.
+                "ev=$(awk '/Virtio Tablet/{f=1} f && /^H:/{for(i=2;i<=NF;i++){sub(/^Handlers=/, \"\", $i); if($i ~ /^event/) print $i}; exit}' /proc/bus/input/devices); \
                  timeout 3 cat /dev/input/$ev | od -An -v -tx1 -w24; true",
             ])
         });

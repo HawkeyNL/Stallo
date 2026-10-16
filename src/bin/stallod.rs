@@ -273,6 +273,7 @@ async fn handle(
 ) -> (Response, Option<(std::fs::File, audit::Entry)>) {
     let started = Instant::now();
     let (op, vm, args, argv0) = audit::describe(&env.request);
+    let image = audit::image(&env.request);
     let log = vm
         .filter(|n| validate_name(n).is_ok() && m.paths.vm_dir(n).is_dir())
         .unwrap_or(audit::DAEMON)
@@ -317,6 +318,7 @@ async fn handle(
             pid: peer.pid(),
             via: env.via,
             op,
+            image,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 0,
@@ -362,6 +364,8 @@ async fn dispatch(
                 net,
                 forwards,
                 agent_control: via == Via::Mcp,
+                // Pulls are for humans (Gate::Closed), also through `new`.
+                may_pull: via == Via::Cli,
             };
             let started = Instant::now();
             m.create(&new).await?;
@@ -566,15 +570,44 @@ async fn dispatch(
         Request::Images => json!(
             images::catalog()
                 .into_iter()
-                .map(|e| ImageInfo {
-                    cached: images::is_cached(&m.paths, &e),
-                    id: e.id,
-                    name: e.name,
+                .map(|e| {
+                    let cached = images::is_cached(&m.paths, &e);
+                    let size_bytes = std::fs::metadata(images::image_path(&m.paths, &e.id))
+                        .ok()
+                        .filter(|f| f.is_file())
+                        .map(|f| f.len());
+                    let mut notes = vec![];
+                    if size_bytes.is_some() && !cached {
+                        notes.push("guest-agent packages not downloaded yet".into());
+                    }
+                    if e.trust == images::Trust::Pinned {
+                        notes.push("pinned (upstream unsigned)".into());
+                    }
+                    if e.firmware == images::Firmware::Uefi {
+                        notes.push("no Secure Boot".into());
+                    }
+                    let sig_date = size_bytes
+                        .and_then(|_| images::pulled(&m.paths, &e.id))
+                        .and_then(|p| p.sig_date);
+                    ImageInfo {
+                        cached,
+                        os: Some(e.os),
+                        trust: Some(e.trust),
+                        size_bytes,
+                        sig_date,
+                        notes,
+                        id: e.id,
+                        name: e.name,
+                    }
                 })
                 .collect::<Vec<_>>()
         ),
         Request::Pull { image } => {
             m.pull(&image).await?;
+            Value::Null
+        }
+        Request::ImageRm { image } => {
+            m.remove_image(&image).await?;
             Value::Null
         }
     })
