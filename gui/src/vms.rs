@@ -1,7 +1,7 @@
 //! The connected window: the VM list with the host meter, and a VM's
-//! overview with its lifecycle actions and its snapshots. All text from
-//! the daemon goes through the view-model (`stallo::printable`) into plain
-//! labels.
+//! overview with its lifecycle actions, its screen and its snapshots. All
+//! text from the daemon goes through the view-model (`stallo::printable`)
+//! into plain labels.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -17,6 +17,7 @@ use stallo::snapshot::Snapshot;
 use crate::Ui;
 use crate::client;
 use crate::model::{self, Action, Op, Pending, Poll};
+use crate::screen::Screen;
 
 /// The pill around a VM's state in the sidebar.
 pub const CSS: &str = ".state-pill { border-radius: 999px; padding: 1px 8px; background-color: alpha(currentColor, 0.12); }";
@@ -96,7 +97,7 @@ impl Progress {
     }
 }
 
-/// The content pane for one VM: the Overview and Snapshots tabs.
+/// The content pane for one VM: the Overview, Screen and Snapshots tabs.
 struct Detail {
     name: String,
     vms: Weak<Vms>,
@@ -113,6 +114,7 @@ struct Detail {
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
     tabs: adw::ViewStack,
+    screen: Rc<Screen>,
     take: gtk::Button,
     snaps_group: adw::PreferencesGroup,
     /// First on the timeline while a snapshot is taken.
@@ -138,7 +140,8 @@ struct SnapWidgets {
     working: Progress,
 }
 
-/// The name of the Snapshots tab in [`Detail::tabs`].
+/// Names of tabs in [`Detail::tabs`].
+const SCREEN: &str = "screen";
 const SNAPSHOTS: &str = "snapshots";
 
 impl Vms {
@@ -300,6 +303,10 @@ impl Vms {
             self.tick();
         } else if let Some(t) = timer.take_if(|_| !on) {
             t.remove();
+            drop(timer);
+            if let Some(d) = self.detail.borrow().as_ref() {
+                d.screen.set_wanted(false);
+            }
         }
     }
 
@@ -346,10 +353,14 @@ impl Vms {
             return;
         };
         let visible = !self.split.is_collapsed() || self.split.shows_content();
+        let tab = detail.tabs.visible_child_name();
+        detail
+            .screen
+            .set_wanted(visible && tab.as_deref() == Some(SCREEN));
         // Not while an action on the VM runs: the daemon would make the
         // list wait for it. The action asks again when it is done.
         if visible
-            && detail.tabs.visible_child_name().as_deref() == Some(SNAPSHOTS)
+            && tab.as_deref() == Some(SNAPSHOTS)
             && !self.pending.borrow().blocks(&detail.name)
             && !model::snaps_wait(detail.snaps_stuck.borrow().as_ref(), &vm.state, now)
             && detail.snaps_poll.borrow_mut().due(now)
@@ -386,7 +397,17 @@ impl Vms {
                 }
             });
         }
-        let have = detail.details.borrow().is_some();
+        // Started or stopped since the last `info`: ask again now (the
+        // Screen tab waits for the socket in it).
+        let seen = detail
+            .details
+            .borrow()
+            .as_ref()
+            .map(|d| model::kind(&d.vm.state));
+        let have = seen == Some(model::kind(&vm.state));
+        if seen.is_some() && !have {
+            detail.poll.borrow_mut().soon();
+        }
         if model::wants_info(visible, model::kind(&vm.state), have)
             && detail.poll.borrow_mut().due(now)
         {
@@ -489,7 +510,7 @@ impl Vms {
     }
 
     /// Runs a lifecycle action, after a confirmation if it may lose data.
-    fn ask(self: &Rc<Self>, op: Op, name: &str) {
+    pub(crate) fn ask(self: &Rc<Self>, op: Op, name: &str) {
         let Some(vm) = self.vm(name) else {
             return;
         };
@@ -527,7 +548,7 @@ impl Vms {
     }
 
     /// Asks before `action`, with Cancel as the default.
-    fn confirm(self: &Rc<Self>, c: &model::Confirm, action: Action, name: &str) {
+    pub(crate) fn confirm(self: &Rc<Self>, c: &model::Confirm, action: Action, name: &str) {
         let dialog = adw::AlertDialog::builder()
             .heading(&c.heading)
             .heading_use_markup(false)
@@ -627,7 +648,7 @@ impl Vms {
     }
 
     /// Runs an action; one per VM at a time.
-    fn run(self: &Rc<Self>, action: Action, name: &str) {
+    pub(crate) fn run(self: &Rc<Self>, action: Action, name: &str) {
         if !self.online.get() || !self.pending.borrow_mut().start(name, &action) {
             return;
         }
@@ -661,6 +682,14 @@ impl Vms {
             }
             v.tick();
         });
+    }
+
+    /// Fresh VM list and details at the next tick.
+    pub(crate) fn poll_soon(self: &Rc<Self>) {
+        self.list_poll.borrow_mut().soon();
+        if let Some(d) = self.detail.borrow().as_ref() {
+            d.poll.borrow_mut().soon();
+        }
     }
 
     /// The Snapshots tab may have come into view: fresh data now.
@@ -870,8 +899,15 @@ impl Detail {
         let snapshots = adw::PreferencesPage::new();
         snapshots.add(&snaps_group);
 
+        let screen = Screen::new(vm, vms);
         let tabs = adw::ViewStack::new();
         tabs.add_titled_with_icon(&overview, Some("overview"), "Overview", "computer-symbolic");
+        tabs.add_titled_with_icon(
+            &screen.root,
+            Some(SCREEN),
+            "Screen",
+            "video-display-symbolic",
+        );
         tabs.add_titled_with_icon(
             &snapshots,
             Some(SNAPSHOTS),
@@ -934,6 +970,7 @@ impl Detail {
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
             tabs,
+            screen,
             take,
             snaps_group,
             taking,
@@ -967,6 +1004,8 @@ impl Detail {
             self.busy.set_tooltip_text(Some(text));
             name_spinner(&self.busy, text);
         }
+        self.screen
+            .update(vm, self.details.borrow().as_ref(), blocked);
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {

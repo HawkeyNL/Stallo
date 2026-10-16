@@ -122,7 +122,7 @@ pub async fn snapshots(socket: &Path, name: String) -> Result<Vec<Snapshot>, Cal
     get(socket, Request::Snapshots { name }, READ_TIMEOUT).await
 }
 
-/// Changes a VM: a lifecycle or snapshot action. Returns the answer.
+/// Changes a VM: a lifecycle or snapshot action. Returns the last answer.
 pub async fn act(
     socket: &Path,
     action: &Action,
@@ -130,11 +130,12 @@ pub async fn act(
 ) -> Result<serde_json::Value, CallError> {
     // ponytail: waiting for a slot still counts against the limit, so a
     // fifth snapshot action at once may time out unsent; fine for 4 slots.
-    let slots = match action {
-        Action::Life(_) => &ACTIONS,
-        _ => &SNAPS,
-    };
-    call_in(slots, socket, action.request(name), action.limit()).await
+    let slots = if action.lifecycle() { &ACTIONS } else { &SNAPS };
+    let mut answer = serde_json::Value::Null;
+    for request in action.requests(name) {
+        answer = call_in(slots, socket, request, action.limit()).await?;
+    }
+    Ok(answer)
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -364,6 +365,48 @@ mod tests {
                 "s2 has no RAM state; stop the VM first".into()
             ))
         );
+    }
+
+    #[test]
+    fn restart_sends_its_requests_in_turn() {
+        // Answers each connection with the next reply; returns the lines.
+        let daemon = |replies: Vec<&'static str>| {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("api.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let fake = std::thread::spawn(move || {
+                let mut lines = Vec::new();
+                for reply in replies {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    lines.push(line);
+                    stream.write_all(reply.as_bytes()).unwrap();
+                }
+                lines
+            });
+            (dir, socket, fake)
+        };
+        let ok = "{\"ok\":true}\n";
+        let (_d, s, fake) = daemon(vec![ok, ok, ok]);
+        let restart = Action::Restart { live_screen: true };
+        let got = run(async move { act(&s, &restart, "dev").await });
+        assert_eq!(got, Ok(serde_json::Value::Null));
+        let ops: Vec<String> = fake
+            .join()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["request"]["op"].to_string()
+            })
+            .collect();
+        assert_eq!(ops, ["\"set_vnc\"", "\"stop\"", "\"start\""]);
+        // A failed stop ends it: no start.
+        let (_d, s, fake) = daemon(vec![ok, "{\"ok\":false,\"error\":\"dev is busy\"}\n"]);
+        let restart = Action::Restart { live_screen: true };
+        let got = run(async move { act(&s, &restart, "dev").await });
+        assert_eq!(got, Err(CallError::Failed("dev is busy".into())));
+        assert_eq!(fake.join().unwrap().len(), 2);
     }
 
     #[test]

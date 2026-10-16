@@ -1,7 +1,7 @@
 //! Plain-Rust view-model: what the window should show, decided from facts
 //! gathered elsewhere (no GTK, no I/O), so every case is unit-testable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,6 +12,8 @@ use stallo::config::NetProfile;
 use stallo::host::HostInfo;
 use stallo::printable;
 use stallo::snapshot::Snapshot;
+
+use crate::rfb::Input;
 
 /// How often the window probes again while it shows an onboarding page.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -492,33 +494,60 @@ pub enum Action {
     Take(Option<String>),
     Restore(String),
     Delete(String),
+    /// Turns the live screen (VNC) on; it comes with the next start.
+    LiveScreen,
+    /// Stops the VM cleanly and starts it again, after turning the live
+    /// screen on if `live_screen`.
+    Restart {
+        live_screen: bool,
+    },
 }
 
 impl Action {
-    pub fn request(&self, vm: &str) -> Request {
+    /// The requests to send, in order; the first error ends the action.
+    pub fn requests(&self, vm: &str) -> Vec<Request> {
         let name = vm.to_owned();
+        let live_screen = || Request::SetVnc {
+            name: vm.to_owned(),
+            on: true,
+        };
         match self {
-            Action::Life(op) => op.request(vm),
-            Action::Take(tag) => Request::Snapshot {
+            Action::Life(op) => vec![op.request(vm)],
+            Action::Take(tag) => vec![Request::Snapshot {
                 name,
                 tag: tag.clone(),
-            },
-            Action::Restore(tag) => Request::Restore {
+            }],
+            Action::Restore(tag) => vec![Request::Restore {
                 name,
                 tag: Some(tag.clone()),
-            },
-            Action::Delete(tag) => Request::SnapshotDelete {
+            }],
+            Action::Delete(tag) => vec![Request::SnapshotDelete {
                 name,
                 tag: tag.clone(),
-            },
+            }],
+            Action::LiveScreen => vec![live_screen()],
+            Action::Restart { live_screen: on } => on
+                .then(live_screen)
+                .into_iter()
+                .chain([Op::Stop.request(vm), Op::Start.request(vm)])
+                .collect(),
         }
     }
 
+    /// The time limit of each request.
     pub fn limit(&self) -> Duration {
         match self {
-            Action::Life(op) => op.limit(),
-            _ => SNAP_LIMIT,
+            Action::Take(_) | Action::Restore(_) | Action::Delete(_) => SNAP_LIMIT,
+            _ => Op::Stop.limit(),
         }
+    }
+
+    /// Whether it waits for the lifecycle slots, not the snapshot ones.
+    pub fn lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Action::Life(_) | Action::LiveScreen | Action::Restart { .. }
+        )
     }
 
     /// The toast when it fails. A snapshot action that timed out may
@@ -536,6 +565,8 @@ impl Action {
                 };
                 (format!("{verb} {vm}"), None)
             }
+            Action::LiveScreen => (format!("turn on the live screen of {vm}"), None),
+            Action::Restart { .. } => (format!("restart {vm}"), None),
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
                 Some(format!("Snapshot of {vm} still running")),
@@ -578,6 +609,8 @@ impl Action {
             Action::Take(_) => "Taking snapshot…",
             Action::Restore(_) => "Restoring snapshot…",
             Action::Delete(_) => "Deleting snapshot…",
+            Action::LiveScreen => "Turning on live screen…",
+            Action::Restart { .. } => "Restarting…",
         }
     }
 
@@ -586,7 +619,8 @@ impl Action {
     pub fn done(&self, vm: &str, data: &serde_json::Value) -> Option<String> {
         let vm = printable(vm, 64);
         match self {
-            Action::Life(_) => None,
+            // The Screen tab shows the outcome.
+            Action::Life(_) | Action::LiveScreen | Action::Restart { .. } => None,
             Action::Take(_) => Some(match data.get("name").and_then(|n| n.as_str()) {
                 Some(n) => format!("Snapshot {} taken", printable(n, 64)),
                 None => "Snapshot taken".to_owned(),
@@ -715,7 +749,8 @@ impl Pending {
 }
 
 /// Whether to ask for an open VM's details: while its page is visible and
-/// it runs, and once for a stopped VM (disk use).
+/// it runs, and once for a stopped VM (disk use). `have`: details from
+/// the VM's current kind of state.
 pub fn wants_info(page_visible: bool, kind: Kind, have: bool) -> bool {
     page_visible && (kind == Kind::Running || !have)
 }
@@ -1013,6 +1048,338 @@ pub fn meter(h: &HostInfo) -> Meter {
         },
         disk_low,
     }
+}
+
+/// What the Screen tab shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenPage {
+    /// The VM does not run; its live screen is on.
+    Stopped,
+    /// No live screen. `on`: it is on, and comes with the next start.
+    /// `restart`: the VM runs, so a restart brings it now.
+    Off {
+        on: bool,
+        restart: bool,
+    },
+    /// Waiting for the socket, the connection or the first frame.
+    Connecting,
+    Live,
+    /// The connection ended; why, safe for a plain label.
+    Ended(String),
+}
+
+/// The connection to a VM's screen, as the tab keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    Idle,
+    Connecting,
+    /// The first frame is in.
+    Live,
+    /// Why it ended, as the client said (untrusted).
+    Ended(String),
+}
+
+/// What `info` said, if it saw the VM run: the list may already know it
+/// has stopped or started since.
+fn running_details<'a>(vm: &VmInfo, details: Option<&'a VmDetails>) -> Option<&'a VmDetails> {
+    details.filter(|d| kind(&vm.state) != Kind::Stopped && kind(&d.vm.state) != Kind::Stopped)
+}
+
+/// The VNC socket to connect to: the VM runs and has one now.
+pub fn screen_socket(vm: &VmInfo, details: Option<&VmDetails>) -> Option<PathBuf> {
+    running_details(vm, details)?.vnc_socket.clone()
+}
+
+pub fn screen_page(vm: &VmInfo, details: Option<&VmDetails>, link: &Link) -> ScreenPage {
+    let k = kind(&vm.state);
+    if k == Kind::Stopped {
+        return if vm.vnc {
+            ScreenPage::Stopped
+        } else {
+            ScreenPage::Off {
+                on: false,
+                restart: false,
+            }
+        };
+    }
+    match link {
+        Link::Live => return ScreenPage::Live,
+        Link::Ended(why) => return ScreenPage::Ended(printable(why, 300)),
+        Link::Connecting => return ScreenPage::Connecting,
+        Link::Idle => {}
+    }
+    match running_details(vm, details) {
+        Some(d) if d.vnc_socket.is_none() => ScreenPage::Off {
+            on: vm.vnc,
+            // A VM that does not run (paused...) gets no clean stop.
+            restart: k == Kind::Running,
+        },
+        // Connecting, or `info` is not in yet.
+        _ => ScreenPage::Connecting,
+    }
+}
+
+/// A Screen tab page without the live screen. Descriptions are markup:
+/// fixed text only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenStatus {
+    pub icon: Option<&'static str>,
+    pub title: &'static str,
+    pub description: &'static str,
+    /// The one action of the page, if any.
+    pub button: Option<&'static str>,
+}
+
+/// Said wherever the live screen is turned on (SECURITY.md).
+macro_rules! live_screen_risk {
+    () => {
+        "Everyone in the stallo group, and every program they run, can see and use a live screen, and what is typed there is not logged."
+    };
+}
+
+pub fn screen_status(page: &ScreenPage) -> ScreenStatus {
+    let (icon, title, description, button) = match page {
+        ScreenPage::Stopped => (
+            Some("video-display-symbolic"),
+            "The VM Is Stopped",
+            "Start the VM to see its screen.",
+            Some("Start"),
+        ),
+        ScreenPage::Off { on: false, restart } => (
+            Some("video-display-symbolic"),
+            "Live Screen Is Off",
+            if *restart {
+                concat!(
+                    "Turn on the live screen to see and use this VM here. The VM restarts for it. ",
+                    live_screen_risk!()
+                )
+            } else {
+                concat!(
+                    "Turn on the live screen to see and use this VM here. It comes on when the VM starts. ",
+                    live_screen_risk!()
+                )
+            },
+            Some(if *restart {
+                "Turn On Live Screen…"
+            } else {
+                "Turn On Live Screen"
+            }),
+        ),
+        ScreenPage::Off { on: true, restart } => (
+            Some("video-display-symbolic"),
+            "Live Screen Comes With a Restart",
+            "The live screen is on, but the VM started before that. It shows here once the VM has stopped and started again.",
+            restart.then_some("Restart…"),
+        ),
+        ScreenPage::Connecting => (None, "Connecting to the Screen", "", None),
+        ScreenPage::Live => (None, "", "", None),
+        ScreenPage::Ended(_) => (
+            Some("network-offline-symbolic"),
+            "Screen Disconnected",
+            "The connection to the VM's screen ended.",
+            Some("Reconnect"),
+        ),
+    };
+    ScreenStatus {
+        icon,
+        title,
+        description,
+        button,
+    }
+}
+
+/// The question before turning the live screen on in a running VM. Its
+/// second answer turns it on without the restart.
+pub fn confirm_live_screen(vm: &VmInfo) -> Confirm {
+    Confirm {
+        heading: "Turn On Live Screen?".to_owned(),
+        body: format!(
+            concat!(
+                "The live screen comes with the VM's next start. Restart now to see it: {} shuts down and starts again, so save your work in it first. ",
+                live_screen_risk!()
+            ),
+            printable(&vm.name, 64)
+        ),
+        button: "Restart Now",
+    }
+}
+
+pub const LATER: &str = "At Next Start";
+
+/// The question before a restart that brings the live screen.
+pub fn confirm_restart(vm: &VmInfo) -> Confirm {
+    let name = printable(&vm.name, 64);
+    Confirm {
+        heading: format!("Restart {name}?"),
+        body: format!("{name} shuts down and starts again, so save your work in it first."),
+        button: "Restart",
+    }
+}
+
+/// Whether the screen is view-only: it turns on when agent control does
+/// (or is on when the tab opens), so a human and an agent do not fight
+/// over the mouse. Otherwise the user's choice stays. `agent_before` is
+/// `None` the first time.
+pub fn view_only(now: bool, agent_before: Option<bool>, agent: bool) -> bool {
+    now || (agent && agent_before != Some(true))
+}
+
+/// Where the framebuffer sits in the widget: its top-left corner and its
+/// scale. Fit scales it to the widget; 1:1 never scales it up. Centred,
+/// so the rest is letterbox.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub x: f64,
+    pub y: f64,
+    pub scale: f64,
+}
+
+pub fn placement(widget: (f64, f64), fb: (u16, u16), fit: bool) -> Placement {
+    let (w, h) = (f64::from(fb.0), f64::from(fb.1));
+    let mut scale = (widget.0 / w).min(widget.1 / h);
+    if !fit {
+        scale = scale.min(1.0);
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        scale = 1.0;
+    }
+    Placement {
+        x: (widget.0 - w * scale) / 2.0,
+        y: (widget.1 - h * scale) / 2.0,
+        scale,
+    }
+}
+
+/// The framebuffer pixel under widget point (`x`, `y`), kept on the
+/// screen, and whether the point is on it (not on the letterbox).
+pub fn to_guest(p: Placement, fb: (u16, u16), x: f64, y: f64) -> (u16, u16, bool) {
+    let gx = ((x - p.x) / p.scale).floor();
+    let gy = ((y - p.y) / p.scale).floor();
+    let (w, h) = (f64::from(fb.0), f64::from(fb.1));
+    let inside = (0.0..w).contains(&gx) && (0.0..h).contains(&gy);
+    // `as` saturates; NaN becomes 0.
+    let clamp = |v: f64, max: u16| (v.clamp(0.0, f64::from(max.saturating_sub(1)))) as u16;
+    (clamp(gx, fb.0), clamp(gy, fb.1), inside)
+}
+
+/// The RFB button bit for a GDK button: left, middle, right.
+pub fn button_bit(button: u32) -> Option<u8> {
+    match button {
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(4),
+        _ => None,
+    }
+}
+
+/// RFB wheel buttons: up, down.
+pub const WHEEL_UP: u8 = 8;
+pub const WHEEL_DOWN: u8 = 16;
+/// Touchpad scrolling in pixels per wheel click.
+// ponytail: a guess that feels right on one touchpad; tune when reported.
+pub const SCROLL_PIXELS: f64 = 20.0;
+/// Wheel clicks sent for one scroll event at most: each is a button
+/// change the input queue must keep.
+const MAX_CLICKS: f64 = 5.0;
+
+/// Whole wheel clicks in `acc` + `delta` (wheel steps, negative is up);
+/// the rest stays in `acc` for the next event.
+pub fn wheel_clicks(acc: &mut f64, delta: f64) -> i32 {
+    *acc += delta;
+    let clicks = acc.trunc().clamp(-MAX_CLICKS, MAX_CLICKS);
+    *acc = if clicks.abs() == MAX_CLICKS {
+        0.0
+    } else {
+        *acc - clicks
+    };
+    clicks as i32
+}
+
+/// Whether a frame may update the texture shown (`shown`: its serial and
+/// size) in place, by its damage only: it is the very next frame, at the
+/// same size. Otherwise it is drawn whole.
+pub fn partial_redraw(shown: Option<(u64, u16, u16)>, serial: u64, size: (u16, u16)) -> bool {
+    shown.is_some_and(|s| Some(s) == serial.checked_sub(1).map(|p| (p, size.0, size.1)))
+}
+
+pub const RELEASE_HINT: &str = "Ctrl+Alt+Esc releases the keyboard";
+pub const GRAB_HINT: &str = "Click the screen to use it";
+
+/// X keysyms the window looks for or sends.
+const XK_ESCAPE: u32 = 0xff1b;
+const XK_CONTROL_L: u32 = 0xffe3;
+const XK_ALT_L: u32 = 0xffe9;
+const XK_DELETE: u32 = 0xffff;
+/// GTK hardware keycodes (evdev + 8) of left Ctrl, left Alt and Delete.
+const KC_CONTROL_L: u32 = 37;
+const KC_ALT_L: u32 = 64;
+const KC_DELETE: u32 = 119;
+
+/// What to do with a key press while the keyboard is grabbed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPress {
+    Send(Input),
+    /// Ctrl+Alt+Esc: let go of the keyboard, after letting the guest go
+    /// of the keys it holds. Esc itself never reaches the guest.
+    Release(Vec<Input>),
+}
+
+/// The keys the guest holds down, by GTK keycode.
+#[derive(Debug, Default)]
+pub struct Keys(BTreeSet<u32>);
+
+impl Keys {
+    /// A key went down with Ctrl and Alt held (`ctrl`, `alt`) or not.
+    pub fn press(&mut self, keycode: u32, keysym: u32, ctrl: bool, alt: bool) -> KeyPress {
+        if keysym == XK_ESCAPE && ctrl && alt {
+            return KeyPress::Release(self.release_all());
+        }
+        self.0.insert(keycode);
+        KeyPress::Send(Input::Key {
+            keycode,
+            keysym,
+            down: true,
+        })
+    }
+
+    /// A key went up; `None` if the guest never saw it go down.
+    pub fn release(&mut self, keycode: u32, keysym: u32) -> Option<Input> {
+        self.0.remove(&keycode).then_some(Input::Key {
+            keycode,
+            keysym,
+            down: false,
+        })
+    }
+
+    /// Key-ups for every key the guest holds.
+    pub fn release_all(&mut self) -> Vec<Input> {
+        std::mem::take(&mut self.0)
+            .into_iter()
+            .map(|keycode| Input::Key {
+                keycode,
+                keysym: 0,
+                down: false,
+            })
+            .collect()
+    }
+}
+
+/// Ctrl+Alt+Del for the guest: down in order, up in reverse.
+pub fn ctrl_alt_del() -> Vec<Input> {
+    let keys = [
+        (KC_CONTROL_L, XK_CONTROL_L),
+        (KC_ALT_L, XK_ALT_L),
+        (KC_DELETE, XK_DELETE),
+    ];
+    let key = |(keycode, keysym): (u32, u32), down| Input::Key {
+        keycode,
+        keysym,
+        down,
+    };
+    keys.iter()
+        .map(|&k| key(k, true))
+        .chain(keys.iter().rev().map(|&k| key(k, false)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1958,7 +2325,10 @@ mod tests {
 
     #[test]
     fn snapshot_actions() {
-        let wire = |a: Action| serde_json::to_string(&a.request("dev")).unwrap();
+        let wire = |a: Action| match a.requests("dev").as_slice() {
+            [r] => serde_json::to_string(r).unwrap(),
+            more => panic!("{more:?}"),
+        };
         assert_eq!(
             wire(Action::Take(None)),
             r#"{"op":"snapshot","name":"dev","tag":null}"#
@@ -2120,5 +2490,351 @@ mod tests {
                 .len(),
             300
         );
+    }
+
+    fn details(vm: &VmInfo, state: &str, socket: Option<&str>) -> VmDetails {
+        VmDetails {
+            vm: VmInfo {
+                state: state.into(),
+                ..vm.clone()
+            },
+            addresses: None,
+            disk_used_bytes: 0,
+            vnc_socket: socket.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn screen_pages() {
+        let sock = "/run/stallo/vnc/dev/vnc.sock";
+        let on = |state: &str| VmInfo {
+            vnc: true,
+            ..vm(state)
+        };
+        let page = |vm: &VmInfo, d: Option<&VmDetails>, link: &Link| screen_page(vm, d, link);
+        let off = |on, restart| ScreenPage::Off { on, restart };
+
+        // Stopped wins over any connection.
+        assert_eq!(page(&on("stopped"), None, &Link::Live), ScreenPage::Stopped);
+        assert_eq!(page(&vm("stopped"), None, &Link::Idle), off(false, false));
+        let running = on("running");
+        let live = details(&running, "running", Some(sock));
+        assert_eq!(screen_socket(&running, Some(&live)), Some(sock.into()));
+        assert_eq!(screen_socket(&on("stopped"), Some(&live)), None);
+        assert_eq!(
+            page(&running, Some(&live), &Link::Idle),
+            ScreenPage::Connecting
+        );
+        assert_eq!(
+            page(&running, Some(&live), &Link::Connecting),
+            ScreenPage::Connecting
+        );
+        assert_eq!(page(&running, Some(&live), &Link::Live), ScreenPage::Live);
+        assert_eq!(
+            page(
+                &running,
+                Some(&live),
+                &Link::Ended("early eof\u{1b}[2J".into())
+            ),
+            ScreenPage::Ended("early eof[2J".into())
+        );
+        // `info` from before the start: wait for a fresh one.
+        let old = details(&running, "stopped", None);
+        assert_eq!(screen_socket(&running, Some(&old)), None);
+        assert_eq!(
+            page(&running, Some(&old), &Link::Idle),
+            ScreenPage::Connecting
+        );
+        assert_eq!(page(&running, None, &Link::Idle), ScreenPage::Connecting);
+        // Runs without a live screen: off, or on from the next start.
+        let plain = vm("running");
+        let none = details(&plain, "running", None);
+        assert_eq!(page(&plain, Some(&none), &Link::Idle), off(false, true));
+        assert_eq!(page(&running, Some(&none), &Link::Idle), off(true, true));
+        // Paused: no clean restart.
+        let paused = vm("paused");
+        let none = details(&paused, "paused", None);
+        assert_eq!(page(&paused, Some(&none), &Link::Idle), off(false, false));
+        // Paused with a socket: the frozen screen.
+        let paused = on("paused");
+        let live = details(&paused, "paused", Some(sock));
+        assert_eq!(screen_socket(&paused, Some(&live)), Some(sock.into()));
+        // Turned off while running: the socket still serves until the stop.
+        let plain = vm("running");
+        let live = details(&plain, "running", Some(sock));
+        assert_eq!(screen_socket(&plain, Some(&live)), Some(sock.into()));
+    }
+
+    #[test]
+    fn screen_wording() {
+        let status = |p: ScreenPage| screen_status(&p);
+        assert_eq!(status(ScreenPage::Stopped).button, Some("Start"));
+        assert!(
+            status(ScreenPage::Stopped)
+                .description
+                .contains("Start the VM to see its screen")
+        );
+        for restart in [false, true] {
+            let s = status(ScreenPage::Off { on: false, restart });
+            assert!(s.description.contains("not logged"), "{restart}");
+            assert!(s.button.unwrap().starts_with("Turn On Live Screen"));
+        }
+        assert!(
+            status(ScreenPage::Off {
+                on: false,
+                restart: true
+            })
+            .description
+            .contains("restarts")
+        );
+        assert_eq!(
+            status(ScreenPage::Off {
+                on: true,
+                restart: true
+            })
+            .button,
+            Some("Restart…")
+        );
+        assert_eq!(
+            status(ScreenPage::Off {
+                on: true,
+                restart: false
+            })
+            .button,
+            None
+        );
+        assert_eq!(status(ScreenPage::Connecting).button, None);
+        assert_eq!(
+            status(ScreenPage::Ended("x".into())).button,
+            Some("Reconnect")
+        );
+        // Descriptions are markup.
+        for p in [
+            ScreenPage::Stopped,
+            ScreenPage::Off {
+                on: false,
+                restart: false,
+            },
+            ScreenPage::Off {
+                on: false,
+                restart: true,
+            },
+            ScreenPage::Off {
+                on: true,
+                restart: true,
+            },
+            ScreenPage::Connecting,
+            ScreenPage::Ended("<b>&".into()),
+        ] {
+            let d = status(p).description;
+            assert!(!d.contains(['<', '&']), "{d}");
+        }
+
+        let odd = VmInfo {
+            name: "de\u{1b}v".into(),
+            ..vm("running")
+        };
+        let c = confirm_live_screen(&odd);
+        assert_eq!(c.heading, "Turn On Live Screen?");
+        assert!(
+            c.body.contains("dev shuts down and starts again"),
+            "{}",
+            c.body
+        );
+        assert!(c.body.contains("not logged"));
+        assert_eq!(c.button, "Restart Now");
+        let c = confirm_restart(&odd);
+        assert_eq!(c.heading, "Restart dev?");
+        assert_eq!(c.button, "Restart");
+    }
+
+    #[test]
+    fn view_only_follows_agent_control() {
+        // Opened with agent control on: view-only; off: not.
+        assert!(view_only(false, None, true));
+        assert!(!view_only(false, None, false));
+        // The user turned it off: it stays off while agent control stays on.
+        assert!(!view_only(false, Some(true), true));
+        // Agent control turned on later: view-only again.
+        assert!(view_only(false, Some(false), true));
+        // The user's own choice stays when agent control goes off.
+        assert!(view_only(true, Some(true), false));
+        assert!(!view_only(false, Some(true), false));
+    }
+
+    #[test]
+    fn pointer_mapping() {
+        let fb = (1280, 800);
+        // Fit, wider widget: scaled 0.5, letterbox left and right.
+        let p = placement((1000.0, 400.0), fb, true);
+        assert_eq!(
+            p,
+            Placement {
+                x: 180.0,
+                y: 0.0,
+                scale: 0.5
+            }
+        );
+        assert_eq!(to_guest(p, fb, 180.0, 0.0), (0, 0, true));
+        assert_eq!(to_guest(p, fb, 500.0, 200.0), (640, 400, true));
+        assert_eq!(to_guest(p, fb, 819.9, 399.9), (1279, 799, true));
+        // On the letterbox: kept on the edge, but not on the screen.
+        assert_eq!(to_guest(p, fb, 100.0, 50.0), (0, 100, false));
+        assert_eq!(to_guest(p, fb, 990.0, 50.0), (1279, 100, false));
+        // Fit, taller widget: letterbox above and below; scales up too.
+        let p = placement((2560.0, 2000.0), fb, true);
+        assert_eq!((p.x, p.y, p.scale), (0.0, 200.0, 2.0));
+        assert_eq!(to_guest(p, fb, 2559.0, 1799.0), (1279, 799, true));
+        assert_eq!(to_guest(p, fb, 10.0, 100.0), (5, 0, false));
+        // 1:1 in a larger widget: not scaled, centred.
+        let p = placement((1480.0, 1000.0), fb, false);
+        assert_eq!((p.x, p.y, p.scale), (100.0, 100.0, 1.0));
+        assert_eq!(to_guest(p, fb, 100.0, 100.0), (0, 0, true));
+        assert_eq!(to_guest(p, fb, 740.5, 500.5), (640, 400, true));
+        assert_eq!(to_guest(p, fb, 99.0, 100.0), (0, 0, false));
+        // 1:1 never scales up, but down if it must.
+        assert_eq!(placement((640.0, 400.0), fb, false).scale, 0.5);
+        // No size yet: no division by zero.
+        let p = placement((0.0, 0.0), fb, true);
+        assert!(p.scale.is_finite());
+        assert!(!to_guest(p, fb, f64::NAN, 5.0).2);
+    }
+
+    #[test]
+    fn buttons_and_wheel() {
+        assert_eq!(button_bit(1), Some(1));
+        assert_eq!(button_bit(2), Some(2));
+        assert_eq!(button_bit(3), Some(4));
+        assert_eq!(button_bit(8), None);
+        let mut acc = 0.0;
+        assert_eq!(wheel_clicks(&mut acc, 1.0), 1);
+        assert_eq!(wheel_clicks(&mut acc, -1.0), -1);
+        // A touchpad: fractions add up to a click.
+        assert_eq!(wheel_clicks(&mut acc, 0.4), 0);
+        assert_eq!(wheel_clicks(&mut acc, 0.4), 0);
+        assert_eq!(wheel_clicks(&mut acc, 0.4), 1);
+        assert!((acc - 0.2).abs() < 1e-9);
+        // A fling is capped, and its rest dropped.
+        assert_eq!(wheel_clicks(&mut acc, -40.0), -5);
+        assert_eq!(acc, 0.0);
+    }
+
+    #[test]
+    fn partial_redraws() {
+        assert!(partial_redraw(Some((4, 1280, 800)), 5, (1280, 800)));
+        // A skipped frame, a resize, a new session or nothing shown yet.
+        assert!(!partial_redraw(Some((3, 1280, 800)), 5, (1280, 800)));
+        assert!(!partial_redraw(Some((4, 1280, 800)), 5, (1024, 768)));
+        assert!(!partial_redraw(Some((9, 1280, 800)), 1, (1280, 800)));
+        assert!(!partial_redraw(None, 1, (1280, 800)));
+        assert!(!partial_redraw(Some((0, 1, 1)), 0, (1, 1)));
+    }
+
+    #[test]
+    fn keys_and_the_release_combination() {
+        let key = |keycode, keysym, down| Input::Key {
+            keycode,
+            keysym,
+            down,
+        };
+        let mut k = Keys::default();
+        // Plain Esc, Ctrl+Esc and Alt+Esc go to the guest.
+        assert_eq!(
+            k.press(9, XK_ESCAPE, false, false),
+            KeyPress::Send(key(9, XK_ESCAPE, true))
+        );
+        assert_eq!(k.release(9, XK_ESCAPE), Some(key(9, XK_ESCAPE, false)));
+        assert_eq!(
+            k.press(9, XK_ESCAPE, true, false),
+            KeyPress::Send(key(9, XK_ESCAPE, true))
+        );
+        assert_eq!(
+            k.press(9, XK_ESCAPE, false, true),
+            KeyPress::Send(key(9, XK_ESCAPE, true))
+        );
+        let _ = k.release_all();
+        // Ctrl and Alt go down to the guest, then Esc with both held lets
+        // go: the guest gets Ctrl and Alt up, never Esc.
+        assert_eq!(
+            k.press(KC_CONTROL_L, XK_CONTROL_L, false, false),
+            KeyPress::Send(key(KC_CONTROL_L, XK_CONTROL_L, true))
+        );
+        assert!(matches!(
+            k.press(KC_ALT_L, XK_ALT_L, true, false),
+            KeyPress::Send(_)
+        ));
+        assert_eq!(
+            k.press(9, XK_ESCAPE, true, true),
+            KeyPress::Release(vec![key(KC_CONTROL_L, 0, false), key(KC_ALT_L, 0, false)])
+        );
+        // Their key-ups come after the release: nothing left to send.
+        assert_eq!(k.release(9, XK_ESCAPE), None);
+        assert_eq!(k.release(KC_CONTROL_L, XK_CONTROL_L), None);
+        assert!(k.release_all().is_empty());
+    }
+
+    #[test]
+    fn ctrl_alt_del_order() {
+        let keys: Vec<(u32, bool)> = ctrl_alt_del()
+            .into_iter()
+            .map(|i| match i {
+                Input::Key { keycode, down, .. } => (keycode, down),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (37, true),
+                (64, true),
+                (119, true),
+                (119, false),
+                (64, false),
+                (37, false)
+            ]
+        );
+        // The rfb client's table knows them (evdev = keycode - 8).
+        for (keycode, _) in keys {
+            assert!(crate::rfb::qemu_scancode(keycode - 8).is_some());
+        }
+    }
+
+    #[test]
+    fn live_screen_actions() {
+        let wire = |a: Action| {
+            a.requests("dev")
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let set = r#"{"op":"set_vnc","name":"dev","on":true}"#;
+        let stop = r#"{"op":"stop","name":"dev","force":false}"#;
+        let start = r#"{"op":"start","name":"dev","wait":false}"#;
+        assert_eq!(wire(Action::LiveScreen), [set]);
+        assert_eq!(
+            wire(Action::Restart { live_screen: true }),
+            [set, stop, start]
+        );
+        assert_eq!(wire(Action::Restart { live_screen: false }), [stop, start]);
+        for a in [Action::LiveScreen, Action::Restart { live_screen: true }] {
+            assert!(a.lifecycle());
+            assert_eq!(a.limit(), Op::Stop.limit());
+            assert!(a.progress().ends_with('…'));
+            assert_eq!(a.done("dev", &serde_json::Value::Null), None);
+        }
+        assert!(!Action::Take(None).lifecycle());
+        assert_eq!(
+            Action::LiveScreen.failed("dev", &CallError::Timeout).title,
+            "Could not turn on the live screen of dev"
+        );
+        assert_eq!(
+            Action::Restart { live_screen: false }
+                .failed("dev", &CallError::Timeout)
+                .title,
+            "Could not restart dev"
+        );
+        // An action on the VM holds its row and its buttons.
+        let r = row(&vm("running"), Some(&Action::Restart { live_screen: true }));
+        assert_eq!(r.working, Some("Restarting…"));
     }
 }

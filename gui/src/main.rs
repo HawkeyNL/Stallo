@@ -1,10 +1,12 @@
 //! stallo-gui: the desktop app for Stallo. It finds the daemon, walks the
 //! user through anything that stops it from connecting, and then lists the
-//! VMs, starts and stops them, and takes and restores snapshots.
+//! VMs, starts and stops them, shows their screens, and takes and restores
+//! snapshots.
 
 mod client;
 mod model;
 mod rfb;
+mod screen;
 mod vms;
 
 use std::cell::{Cell, RefCell};
@@ -117,7 +119,7 @@ impl Ui {
             .content(&toasts)
             .build();
         let css = gtk::CssProvider::new();
-        css.load_from_string(vms::CSS);
+        css.load_from_string(&[vms::CSS, screen::CSS].join("\n"));
         gtk::style_context_add_provider_for_display(
             &WidgetExt::display(&window),
             &css,

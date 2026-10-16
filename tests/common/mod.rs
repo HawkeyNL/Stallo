@@ -17,7 +17,8 @@
 //!   `AF_UNIX`/`AF_NETLINK` sockets (no IP at all), and
 //!   `RuntimeMaxSec=900` as a dead-man switch if the test process dies;
 //! - every QEMU in the unit must be offline (`-nic none`, no network
-//!   device or host listener), with at most 2 vCPUs and 2 GiB (one
+//!   device or host listener but a VNC Unix socket), with at most 2 vCPUs
+//!   and 2 GiB (one
 //!   measurement may ask for 4 GiB with [`Daemon::start_sized`], and only
 //!   while the host keeps 6 GiB available besides);
 //! - data lives in `$HOME/.cache/stallo-it/<test>/`, runtime files in
@@ -374,8 +375,14 @@ fn check_argv_max(argv: &[String], max_memory_mib: u64) {
         "unexpected process {argv:?}"
     );
     assert_eq!(after("-nic"), ["none"], "VM must be offline: {argv:?}");
-    for name in ["-netdev", "-net", "-vnc", "-gdb", "-spice"] {
+    for name in ["-netdev", "-net", "-gdb", "-spice"] {
         assert!(after(name).is_empty(), "VM must have no {name}: {argv:?}");
+    }
+    for vnc in after("-vnc") {
+        assert!(
+            vnc.starts_with("unix:"),
+            "VNC only on a Unix socket: {argv:?}"
+        );
     }
     for bad in [
         "netdev=",

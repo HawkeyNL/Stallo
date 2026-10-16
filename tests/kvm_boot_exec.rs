@@ -261,6 +261,7 @@ fn harness_rejects_unsafe_argv() {
         std::panic::catch_unwind(|| common::check_argv(&v)).is_ok()
     };
     assert!(ok(&["-cpu", "host,-svm,-vmx"]));
+    assert!(ok(&["-vnc", "unix:/r/vnc/dev/vnc.sock"]));
     for bad in [
         &["-netdev", "user,id=n0"][..],
         &["--netdev", "user,id=n0"],
@@ -268,6 +269,7 @@ fn harness_rejects_unsafe_argv() {
         &["-device", "rtl8139,netdev=n0"],
         &["-nic", "user"],
         &["-vnc", ":0"],
+        &["-vnc", "tcp:127.0.0.1:5900"],
         &["-gdb", "tcp::1234"],
         &["-chardev", "socket,id=c,host=0.0.0.0,port=1"],
         &["-smp", "8"],
