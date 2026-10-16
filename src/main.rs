@@ -458,30 +458,36 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Set { vm, vnc, cpus, mem } => {
             // First, so a running VM is refused before VNC changes.
-            if cpus.is_some() || mem.is_some() {
+            let resources = if cpus.is_some() || mem.is_some() {
                 let v = call(Request::SetResources {
                     name: vm.clone(),
                     vcpus: cpus,
                     memory_mib: mem,
                 })
                 .await?;
-                if json {
-                    print_json(&v);
-                } else {
-                    let info: VmInfo = serde_json::from_value(v)?;
+                if !json {
+                    let info: VmInfo = serde_json::from_value(v.clone())?;
                     println!("{vm}  {}", summary(&info));
                 }
-            }
+                Some(v)
+            } else {
+                None
+            };
+            let mut vnc_result = None;
             if let Some(vnc) = vnc {
                 let on = matches!(vnc, OnOff::On);
                 let v = call(Request::SetVnc {
                     name: vm.clone(),
                     on,
                 })
-                .await?;
-                if json {
-                    print_json(&v);
-                } else {
+                .await
+                .map_err(|e| match resources {
+                    Some(_) => e.context(format!(
+                        "the CPU/memory change of {vm} was applied, VNC was not"
+                    )),
+                    None => e,
+                })?;
+                if !json {
                     let when = if v["running"] == true {
                         " from the next start"
                     } else {
@@ -492,6 +498,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         println!("socket: {sock}");
                     }
                 }
+                vnc_result = Some(v);
+            }
+            if json {
+                print_json(&serde_json::json!({"resources": resources, "vnc": vnc_result}));
             }
         }
         Cmd::Agent { vm, state } => {

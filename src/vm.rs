@@ -853,11 +853,10 @@ impl Manager {
             cfg.throwaway_of.is_none(),
             "{name} is a `stallo run` clone; change the VM it was made from"
         );
+        let old = (cfg.vcpus, cfg.memory_mib);
         cfg.vcpus = vcpus.unwrap_or(cfg.vcpus);
         cfg.memory_mib = memory_mib.unwrap_or(cfg.memory_mib);
         cfg.validate()?;
-        // As `new` (no new disk): would it start next to the running VMs?
-        self.admit(&cfg, 0)?;
         let ram: Vec<String> = self
             .list_snapshots(name)
             .await?
@@ -870,6 +869,12 @@ impl Manager {
             "{name} has RAM snapshots ({}) that only restore at its current size; delete them first: stallo snap {name} --delete <name>",
             ram.join(", ")
         );
+        // As `new` (no new disk): would it start next to the running VMs?
+        // Only for growth: shrinking never makes it fit worse, and every
+        // start checks again.
+        if cfg.vcpus > old.0 || cfg.memory_mib > old.1 {
+            self.admit(&cfg, 0)?;
+        }
         cfg.save(&self.paths.vm_dir(name))?;
         Ok(cfg)
     }
@@ -2193,8 +2198,6 @@ mod tests {
         assert!(err(m.set_resources("nope", Some(1), None).await).contains("nope"));
         assert!(err(m.set_resources("dev", Some(0), None).await).contains("vcpus must be"));
         assert!(err(m.set_resources("dev", None, Some(255)).await).contains("memory must be"));
-        let over = m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await;
-        assert!(err(over).contains("over the VM memory budget"));
         let e = err(m.set_resources("run-0a1b2c3d", Some(2), None).await);
         assert!(e.contains("clone"), "{e}");
         m.running
@@ -2236,12 +2239,38 @@ mod tests {
             "nothing else changed"
         );
 
-        // A RAM snapshot only loads at the size it was taken at.
+        // Growth must fit the host; shrinking is always allowed (start
+        // checks again), even for a VM that does not fit now.
+        let over = m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await;
+        assert!(err(over).contains("over the VM memory budget"));
+        assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
+        let huge = VmConfig {
+            vcpus: 255,
+            memory_mib: MAX_MEMORY_MIB,
+            ..cfg.clone()
+        };
+        huge.save(&dir).unwrap();
+        let shrunk = m
+            .set_resources("dev", Some(254), Some(MAX_MEMORY_MIB - 1024))
+            .await
+            .unwrap();
+        assert_eq!(
+            (shrunk.vcpus, shrunk.memory_mib),
+            (254, MAX_MEMORY_MIB - 1024)
+        );
+        let e = err(m.set_resources("dev", Some(255), None).await);
+        assert!(e.contains("too many"), "{e}");
+        cfg.save(&dir).unwrap();
+
+        // A RAM snapshot only loads at the size it was taken at; checked
+        // before the host (a growth names the snapshots, not the budget).
         crate::snapshot::create_offline(&dir, "s1").await.unwrap();
         ensure_private_dir(&dir.join(qemu::STATES)).unwrap();
         fs::write(crate::snapshot::state_file(&dir, "s1"), b"ram").unwrap();
         let e = err(m.set_resources("dev", Some(1), None).await);
         assert!(e.contains("RAM snapshots (s1)"), "{e}");
         assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
+        let e = err(m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await);
+        assert!(e.contains("RAM snapshots (s1)"), "{e}");
     }
 }

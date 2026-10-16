@@ -60,7 +60,11 @@ pub type Described<'a> = (
 pub fn describe(r: &Request) -> Described<'_> {
     let len = |s: &str| s.len() as u64;
     match r {
-        Request::New { name, vnc, .. } => ("new", Some(name), vec![("vnc", u64::from(*vnc))], None),
+        // `vnc` only when on, so older lines keep their shape.
+        Request::New { name, vnc, .. } => {
+            let args = if *vnc { vec![("vnc", 1)] } else { vec![] };
+            ("new", Some(name), args, None)
+        }
         Request::List => ("list", None, vec![], None),
         Request::Start { name, .. } => ("start", Some(name), vec![], None),
         Request::Stop { name, .. } => ("stop", Some(name), vec![], None),
@@ -368,7 +372,7 @@ mod tests {
         let (op, vm, args, argv0) = describe(&resize);
         assert_eq!((op, vm, argv0), ("set_resources", Some("dev"), None));
         assert_eq!(args, [("memory_mib", 0), ("vcpus", 4)]);
-        let new = Request::New {
+        let mut new = Request::New {
             name: "dev".into(),
             image: "arch".into(),
             vcpus: 1,
@@ -380,6 +384,11 @@ mod tests {
             vnc: true,
         };
         assert!(entry(&new).contains(r#""op":"new","args":{"vnc":1}"#));
+        let Request::New { vnc, .. } = &mut new else {
+            unreachable!()
+        };
+        *vnc = false;
+        assert!(entry(&new).contains(r#""op":"new","args":{}"#));
     }
 
     /// `pull` and `image_rm` name their image; invalid ids are left out.

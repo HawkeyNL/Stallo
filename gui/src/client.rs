@@ -414,6 +414,7 @@ mod tests {
             net: stallo::config::NetProfile::Offline,
             forwards: vec![],
             wait: true,
+            vnc: false,
         };
         assert_eq!(
             run(async move { create(&s, new).await }),
