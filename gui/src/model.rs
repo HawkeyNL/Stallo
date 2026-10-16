@@ -393,9 +393,11 @@ impl Op {
     }
 }
 
-/// The time limit of a snapshot action: the daemon gives a snapshot job
-/// 600 s. Also the longest any action may take.
-pub const SNAP_LIMIT: Duration = Duration::from_secs(600);
+/// The time limit of a snapshot action. The daemon gives the snapshot job
+/// alone 600 s; around it, it waits for the VM's lock, may start the VM,
+/// waits up to 10 s for the guest agent or stops the VM again. Also the
+/// longest any action may take.
+pub const SNAP_LIMIT: Duration = Duration::from_secs(900);
 
 /// Anything that changes a VM: a lifecycle [`Op`] or a snapshot action.
 /// Snapshot names are raw, as the daemon listed them.
@@ -435,14 +437,30 @@ impl Action {
         }
     }
 
-    /// The toast when it fails.
+    /// The toast when it fails. A snapshot action that timed out may
+    /// still run in the daemon.
     pub fn failed(&self, vm: &str, e: &CallError) -> String {
         let vm = printable(vm, 64);
-        match self {
-            Action::Life(op) => op.failed(&vm, e),
-            Action::Take(_) => format!("Could not take a snapshot of {vm}: {e}"),
-            Action::Restore(tag) => format!("Could not restore {}: {e}", printable(tag, 64)),
-            Action::Delete(tag) => format!("Could not delete {}: {e}", printable(tag, 64)),
+        let (what, slow) = match self {
+            Action::Life(op) => return op.failed(&vm, e),
+            Action::Take(_) => (
+                format!("take a snapshot of {vm}"),
+                format!("The snapshot of {vm}"),
+            ),
+            Action::Restore(tag) => {
+                let tag = printable(tag, 64);
+                (format!("restore {tag}"), format!("Restoring {tag}"))
+            }
+            Action::Delete(tag) => {
+                let tag = printable(tag, 64);
+                (format!("delete {tag}"), format!("Deleting {tag}"))
+            }
+        };
+        match e {
+            CallError::Timeout => {
+                format!("{slow} takes long and may still be running; check the list later")
+            }
+            _ => format!("Could not {what}: {e}"),
         }
     }
 
@@ -581,6 +599,15 @@ pub fn wants_info(page_visible: bool, kind: Kind, have: bool) -> bool {
 /// How often an open Snapshots tab asks for the list.
 pub const SNAPS_EVERY: Duration = Duration::from_secs(15);
 
+/// Whether the Snapshots tab leaves the daemon alone. `stuck` is the VM
+/// state and time of a snapshot list that timed out: its connection may
+/// still wait in the daemon for the VM's lock, behind a job of up to
+/// [`SNAP_LIMIT`], and every new list would queue one more. So no new list
+/// until the VM's state changes or that time is up.
+pub fn snaps_wait(stuck: Option<&(String, Instant)>, state: &str, now: Instant) -> bool {
+    stuck.is_some_and(|(s, at)| s == state && now < *at + SNAP_LIMIT)
+}
+
 /// One snapshot on the timeline. Display strings are safe for plain
 /// labels; `tag` is the raw name to send back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -687,7 +714,9 @@ pub fn confirm_restore(vm: &VmInfo, snap: &Snapshot) -> Confirm {
     let (vm_name, tag) = (printable(&vm.name, 64), printable(&snap.name, 64));
     let then = match (snap.ram_bytes > 0, kind(&vm.state)) {
         (true, Kind::Stopped) => "The VM starts from that moment.",
-        (true, _) => "The VM carries on from that moment.",
+        (true, Kind::Running) => "The VM carries on from that moment.",
+        // The daemon resumes only a VM that was running.
+        (true, _) => "The VM stays paused at that moment.",
         (false, _) => "The VM stays stopped.",
     };
     Confirm {
@@ -1600,6 +1629,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_list_waits_after_a_timeout() {
+        let t0 = Instant::now();
+        let stuck = ("running".to_owned(), t0);
+        assert!(!snaps_wait(None, "running", t0));
+        assert!(snaps_wait(Some(&stuck), "running", t0 + BACKOFF));
+        assert!(!snaps_wait(Some(&stuck), "stopped", t0), "state changed");
+        assert!(!snaps_wait(Some(&stuck), "running", t0 + SNAP_LIMIT));
+    }
+
+    #[test]
     fn snapshot_confirmations() {
         let ram = snap("s1", 1 << 20, 0, 1);
         let disk = snap("s2", 0, 0, 0);
@@ -1619,6 +1658,14 @@ mod tests {
                 .body
                 .ends_with("The VM stays stopped.")
         );
+        for state in ["paused", "paused (disk full)", "io-error"] {
+            assert!(
+                confirm_restore(&vm(state), &ram)
+                    .body
+                    .ends_with("The VM stays paused at that moment."),
+                "{state}"
+            );
+        }
         let c = confirm_delete(&vm("running"), "s\u{202E}1");
         assert_eq!((c.heading.as_str(), c.button), ("Delete s1?", "Delete"));
         assert_eq!(
@@ -1650,7 +1697,7 @@ mod tests {
             wire(Action::Life(Op::Reset)),
             r#"{"op":"reset","name":"dev"}"#
         );
-        assert_eq!(Action::Take(None).limit(), Duration::from_secs(600));
+        assert_eq!(Action::Take(None).limit(), Duration::from_secs(900));
         assert_eq!(Action::Delete("s".into()).limit(), SNAP_LIMIT);
         assert_eq!(Action::Life(Op::Stop).limit(), Op::Stop.limit());
         assert!(
@@ -1661,11 +1708,15 @@ mod tests {
         let e = CallError::Timeout;
         assert_eq!(
             Action::Take(None).failed("dev", &e),
-            "Could not take a snapshot of dev: no answer in time"
+            "The snapshot of dev takes long and may still be running; check the list later"
         );
         assert_eq!(
             Action::Restore("s1".into()).failed("dev", &e),
-            "Could not restore s1: no answer in time"
+            "Restoring s1 takes long and may still be running; check the list later"
+        );
+        assert_eq!(
+            Action::Delete("s\u{1b}1".into()).failed("dev", &CallError::Denied),
+            "Could not delete s1: permission denied"
         );
         assert_eq!(
             Action::Life(Op::Start).failed("dev", &e),

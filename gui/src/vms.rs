@@ -79,6 +79,8 @@ struct Detail {
     /// Oldest first, as the daemon lists them.
     snaps: RefCell<Option<Vec<Snapshot>>>,
     snaps_poll: RefCell<Poll>,
+    /// The VM state and time of the last snapshot list that timed out.
+    snaps_stuck: RefCell<Option<(String, Instant)>>,
 }
 
 /// One snapshot on the timeline.
@@ -305,25 +307,36 @@ impl Vms {
         if visible
             && detail.tabs.visible_child_name().as_deref() == Some(SNAPSHOTS)
             && !self.pending.borrow().blocks(&detail.name)
+            && !model::snaps_wait(detail.snaps_stuck.borrow().as_ref(), &vm.state, now)
             && detail.snaps_poll.borrow_mut().due(now)
         {
             let (v, socket, name) = (self.clone(), self.socket.clone(), detail.name.clone());
-            let detail = detail.clone();
+            let (detail, state) = (detail.clone(), vm.state.clone());
             glib::spawn_future_local(async move {
                 let got =
                     client::spawn(async move { client::snapshots(&socket, name).await }).await;
                 let ok = matches!(got, Ok(Ok(_)));
                 detail.snaps_poll.borrow_mut().done(Instant::now(), ok);
+                if let Ok(Err(model::CallError::Timeout)) = got {
+                    *detail.snaps_stuck.borrow_mut() = Some((state, Instant::now()));
+                }
                 match got {
                     Ok(Ok(list)) => {
+                        detail.snaps_stuck.take();
                         *detail.snaps.borrow_mut() = Some(list);
                         v.refresh(&detail);
                     }
-                    // Only the first time: later the old list stays.
-                    Ok(Err(e)) if detail.snaps.borrow().is_none() => v.ui.toast(&format!(
-                        "Could not list the snapshots of {}: {e}",
-                        stallo::printable(&detail.name, 64)
-                    )),
+                    // Only the first time: later the old list or the
+                    // error stays.
+                    Ok(Err(e))
+                        if detail.snaps_view.visible_child_name().as_deref() == Some("loading") =>
+                    {
+                        detail.snaps_view.set_visible_child_name("failed");
+                        v.ui.toast(&format!(
+                            "Could not list the snapshots of {}: {e}",
+                            stallo::printable(&detail.name, 64)
+                        ))
+                    }
                     _ => {}
                 }
             });
@@ -569,6 +582,7 @@ impl Vms {
             let got = client::spawn(async move { client::act(&socket, &sent, &vm).await }).await;
             // Its buttons stay off until a list asked for from now on.
             v.pending.borrow_mut().finish(&name, Instant::now());
+            let ok = matches!(got, Ok(Ok(_)));
             match got {
                 Ok(Ok(data)) => {
                     if let Some(text) = action.done(&name, &data) {
@@ -583,6 +597,10 @@ impl Vms {
             if let Some(d) = v.detail.borrow().as_ref() {
                 d.poll.borrow_mut().soon();
                 d.snaps_poll.borrow_mut().soon();
+                // The action got the VM's lock, so no list waits for it now.
+                if ok && d.name == name {
+                    d.snaps_stuck.take();
+                }
             }
             v.tick();
         });
@@ -761,6 +779,16 @@ impl Detail {
         let snaps_view = gtk::Stack::new();
         snaps_view.add_named(&adw::Spinner::new(), Some("loading"));
         snaps_view.add_named(&timeline, Some("list"));
+        snaps_view.add_named(
+            &gtk::Label::builder()
+                .label("The snapshots could not be listed. Stallo tries again later.")
+                .wrap(true)
+                .margin_top(12)
+                .margin_bottom(12)
+                .css_classes(["dim-label"])
+                .build(),
+            Some("failed"),
+        );
         // Fixed text only: descriptions are markup.
         let snaps_group = adw::PreferencesGroup::builder()
             .title("Timeline")
@@ -842,6 +870,7 @@ impl Detail {
             snap_rows: RefCell::default(),
             snaps: RefCell::default(),
             snaps_poll: RefCell::new(Poll::new(model::SNAPS_EVERY)),
+            snaps_stuck: RefCell::default(),
         })
     }
 

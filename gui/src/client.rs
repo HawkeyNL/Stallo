@@ -20,13 +20,16 @@ use crate::model::{self, Action, CallError, Probe, Production};
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide: 8, in two pools. Actions may
-/// take up to 150 s each (snapshot actions 10 min), so they have their own
-/// slots and reads (polls, the probe) never wait behind them.
+/// Requests in flight at once, app-wide: 12, in three pools. Lifecycle
+/// actions may take up to 150 s each and snapshot actions 15 min, so each
+/// kind has its own slots: reads (polls, the probe) never wait behind an
+/// action, and a start or stop never waits behind a snapshot job.
 const READ_SLOTS: usize = 4;
 const ACTION_SLOTS: usize = 4;
+const SNAP_SLOTS: usize = 4;
 static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
 static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
+static SNAPS: Semaphore = Semaphore::const_new(SNAP_SLOTS);
 
 fn runtime() -> &'static Handle {
     static RT: OnceLock<Handle> = OnceLock::new();
@@ -125,7 +128,13 @@ pub async fn act(
     action: &Action,
     name: &str,
 ) -> Result<serde_json::Value, CallError> {
-    call_in(&ACTIONS, socket, action.request(name), action.limit()).await
+    // ponytail: waiting for a slot still counts against the limit, so a
+    // fifth snapshot action at once may time out unsent; fine for 4 slots.
+    let slots = match action {
+        Action::Life(_) => &ACTIONS,
+        _ => &SNAPS,
+    };
+    call_in(slots, socket, action.request(name), action.limit()).await
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -451,6 +460,31 @@ mod tests {
             .await
         });
         assert_eq!(wait, Err(CallError::Timeout), "actions still queue");
+        drop(held);
+    }
+
+    #[test]
+    fn lifecycle_passes_busy_snapshots() {
+        // Every snapshot slot taken, e.g. by RAM snapshots of big VMs.
+        let held = runtime()
+            .block_on(SNAPS.acquire_many(SNAP_SLOTS as u32))
+            .unwrap();
+        let (_d, s, fake) = serve(
+            r#"{"op":"stop","name":"dev","force":false}"#,
+            answer("{\"ok\":true}\n"),
+        );
+        let stop = run(async move { act(&s, &Action::Life(Op::Stop), "dev").await });
+        fake.join().unwrap();
+        assert_eq!(stop, Ok(serde_json::Value::Null));
+        let (_d, s, _) = serve(
+            r#"{"op":"snapshot_delete","name":"dev","tag":"s1"}"#,
+            answer("{\"ok\":true}\n"),
+        );
+        let queued = run(async move {
+            let delete = Action::Delete("s1".into());
+            tokio::time::timeout(Duration::from_millis(200), act(&s, &delete, "dev")).await
+        });
+        assert!(queued.is_err(), "snapshot actions still queue");
         drop(held);
     }
 
