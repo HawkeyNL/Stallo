@@ -140,8 +140,6 @@ struct SnapWidgets {
 
 /// The name of the Snapshots tab in [`Detail::tabs`].
 const SNAPSHOTS: &str = "snapshots";
-/// Under the name of a new snapshot.
-const NAME_HINT: &str = "Leave it empty to let Stallo pick a name.";
 
 impl Vms {
     pub fn new(ui: &Rc<Ui>, socket: PathBuf) -> Rc<Self> {
@@ -567,13 +565,13 @@ impl Vms {
             .css_classes(["boxed-list"])
             .build();
         names.append(&entry);
+        // Shown only while the name is refused, and read out with the entry.
         let hint = gtk::Label::builder()
-            .label(NAME_HINT)
             .wrap(true)
             .xalign(0.0)
-            .css_classes(["caption", "dim-label"])
+            .visible(false)
+            .css_classes(["caption", "error"])
             .build();
-        // Read out with the entry: the hint, or why the name is refused.
         entry
             .upcast_ref::<gtk::Widget>()
             .update_relation(&[gtk::accessible::Relation::DescribedBy(&[hint.upcast_ref()])]);
@@ -604,15 +602,12 @@ impl Vms {
             match checked {
                 Ok(_) => {
                     e.remove_css_class("error");
-                    hint.remove_css_class("error");
-                    hint.add_css_class("dim-label");
-                    hint.set_label(NAME_HINT);
+                    hint.set_visible(false);
                 }
                 Err(why) => {
                     e.add_css_class("error");
-                    hint.remove_css_class("dim-label");
-                    hint.add_css_class("error");
                     hint.set_label(&why);
+                    hint.set_visible(true);
                 }
             }
         });
@@ -625,10 +620,10 @@ impl Vms {
                 v.run(Action::Take(tag), &name);
             }
         });
-        dialog.present(Some(&self.root));
         // The suggested name is selected: typing replaces it.
-        entry.grab_focus();
+        dialog.set_focus(Some(&entry));
         entry.select_region(0, -1);
+        dialog.present(Some(&self.root));
     }
 
     /// Runs an action; one per VM at a time.
@@ -712,20 +707,18 @@ impl Row {
             .css_classes(["caption", "state-pill", "warning"])
             .build();
         agent.update_property(&[gtk::accessible::Property::Label("Agent control on")]);
-        let line = gtk::Box::builder().spacing(8).build();
-        line.append(&label);
-        line.append(&state);
-        line.append(&agent);
-        let working = Progress::new();
-        let lines = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
+        let line = gtk::Box::builder()
+            .spacing(8)
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        lines.append(&line);
-        lines.append(&working.root);
-        let row = gtk::ListBoxRow::builder().child(&lines).build();
+        // While an action runs, its spinner and text take the pill's place.
+        let working = Progress::new();
+        line.append(&label);
+        line.append(&state);
+        line.append(&working.root);
+        line.append(&agent);
+        let row = gtk::ListBoxRow::builder().child(&line).build();
         Self {
             name: name.to_owned(),
             row,
@@ -746,7 +739,8 @@ impl Row {
         if let Some(tone) = r.tone {
             self.state.add_css_class(tone);
         }
-        self.state.set_label(&r.state);
+        self.state.set_label(r.state);
+        self.state.set_visible(r.working.is_none());
         self.state.set_tooltip_text(Some(&r.raw));
         self.agent.set_visible(r.agent);
         self.working.show(r.working);
@@ -909,7 +903,7 @@ impl Detail {
             .child(&view)
             .build();
         let narrow = adw::Breakpoint::new(
-            adw::BreakpointCondition::parse("max-width: 550sp").expect("a valid condition"),
+            adw::BreakpointCondition::parse("max-width: 700sp").expect("a valid condition"),
         );
         narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
         narrow.add_setter(&title, "visible", Some(&true.to_value()));
@@ -963,6 +957,11 @@ impl Detail {
         self.start.set_visible(set.primary == Op::Start);
         self.stop.set_visible(set.primary == Op::Stop);
         self.resume.set_visible(set.primary == Op::Resume);
+        if set.suggested {
+            self.resume.add_css_class("suggested-action");
+        } else {
+            self.resume.remove_css_class("suggested-action");
+        }
         self.busy.set_visible(working.is_some());
         if let Some(text) = working.map(Action::progress) {
             self.busy.set_tooltip_text(Some(text));
