@@ -1023,8 +1023,10 @@ pub const NEW_DISK_GIB: u64 = 20;
 /// The smallest disk offered: above the virtual size of every catalog
 /// image, which the daemon requires.
 pub const MIN_DISK_GIB: u64 = 10;
-/// The time limit of a download and of a create: a first pull of a few GiB
-/// on a slow line, or a first boot that waits for the guest agent.
+/// The largest disk the daemon accepts (`VmConfig::validate`).
+pub const MAX_DISK_GIB: u64 = 16384;
+/// The time limit of a create: a first download of a few GiB on a slow
+/// line, then a first boot that waits for the guest agent.
 pub const CREATE_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// An image in the New VM dialog. Display strings are safe for plain
@@ -1032,14 +1034,31 @@ pub const CREATE_LIMIT: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageChoice {
     pub id: String,
+    /// The short name, e.g. "Ubuntu 26.04 LTS server".
     pub title: String,
+    /// The rest of the name, the OS and whether it is downloaded.
     pub subtitle: String,
-    /// Downloaded and verified: Create needs no pull.
+    /// Downloaded and verified: Create needs no download.
     pub cached: bool,
-    /// Disk space a pull may still take, at most.
+    /// Disk space a download may still take, at most.
     pub download_bytes: u64,
     /// The internet profile was verified with this image.
     pub internet: bool,
+}
+
+/// "Ubuntu 26.04 LTS server (cloud image)" as ("Ubuntu 26.04 LTS server",
+/// "cloud image"). Both safe for plain labels.
+fn split_name(name: &str) -> (String, Option<String>) {
+    let Some((short, rest)) = name.split_once(" (") else {
+        return (printable(name, 64), None);
+    };
+    let rest = format!("({rest}");
+    let detail = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .filter(|r| !r.contains(['(', ')']))
+        .unwrap_or(&rest);
+    (printable(short, 64), Some(printable(detail, 64)))
 }
 
 pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
@@ -1054,22 +1073,27 @@ pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
                 (Some(e), false) => e.max_size,
                 _ => 0,
             };
-            let mut subtitle = match i.os {
-                Some(stallo::images::Os::Linux) => "Linux · ".to_owned(),
-                Some(stallo::images::Os::Windows) => "Windows · ".to_owned(),
-                None => String::new(),
-            };
-            match (i.cached, i.size_bytes) {
-                (true, Some(b)) => subtitle.push_str(&format!("Downloaded ({})", size(b))),
-                (true, None) => subtitle.push_str("Downloaded"),
+            let (title, detail) = split_name(&i.name);
+            let os = i.os.map(|os| match os {
+                stallo::images::Os::Linux => "Linux".to_owned(),
+                stallo::images::Os::Windows => "Windows".to_owned(),
+            });
+            let state = match (i.cached, i.size_bytes) {
+                (true, Some(b)) => format!("Downloaded ({})", size(b)),
+                (true, None) => "Downloaded".to_owned(),
                 _ if download_bytes > 0 => {
-                    subtitle.push_str(&format!("Download needed (up to {})", size(download_bytes)))
+                    format!("Download needed (up to {})", size(download_bytes))
                 }
-                _ => subtitle.push_str("Download needed"),
-            }
+                _ => "Download needed".to_owned(),
+            };
+            let subtitle = [os, detail, Some(state)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
             ImageChoice {
                 id: i.id.clone(),
-                title: printable(&i.name, 64),
+                title,
                 subtitle,
                 cached: i.cached,
                 download_bytes,
@@ -1097,6 +1121,8 @@ pub struct Limits {
     pub vcpus: u32,
     pub memory_gib: u64,
     pub disk_gib: u64,
+    /// The download fits above the disk floor, as the daemon checks it.
+    pub download_fits: bool,
 }
 
 /// What `host` leaves for a new VM, after a download of `download_bytes`.
@@ -1118,15 +1144,15 @@ pub fn limits(host: &HostInfo, download_bytes: u64) -> Limits {
     while memory_gib > 0 && !fits(memory_gib) {
         memory_gib -= 1;
     }
-    let floor = host.disk_floor_gib.saturating_mul(1 << 30);
+    let above_floor = host
+        .disk_free_bytes
+        .saturating_sub(host.disk_floor_gib.saturating_mul(1 << 30));
     Limits {
         vcpus: host.cores.saturating_sub(cfg.reserved_cores),
         memory_gib,
-        disk_gib: host
-            .disk_free_bytes
-            .saturating_sub(floor)
-            .saturating_sub(download_bytes)
-            >> 30,
+        disk_gib: (above_floor.saturating_sub(download_bytes) >> 30).min(MAX_DISK_GIB),
+        // `host::check_pull_space`: room for the download twice.
+        download_fits: above_floor >= download_bytes.saturating_mul(2),
     }
 }
 
@@ -1146,6 +1172,8 @@ impl Limits {
             Some("This computer has too few processor cores for a VM.")
         } else if self.memory_gib < 1 {
             Some("Not enough free memory for another VM. Stop a VM first.")
+        } else if !self.download_fits {
+            Some("Not enough free disk space to download this image. Free up space first.")
         } else if self.disk_gib < MIN_DISK_GIB {
             Some("Not enough free disk space for this VM. Free up space first.")
         } else {
@@ -1206,7 +1234,7 @@ pub fn vm_name(typed: &str, taken: &[String]) -> Result<String, String> {
         ));
     }
     if taken.iter().any(|t| t == typed) {
-        return Err("A VM with this name already exists".to_owned());
+        return Err("A VM with this name already exists.".to_owned());
     }
     Ok(typed.to_owned())
 }
@@ -1223,8 +1251,10 @@ pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64, internet: bo
 pub struct NewVm {
     pub name: String,
     pub image: String,
-    /// Safe for plain labels.
+    /// The image's short name, safe for plain labels.
     pub image_title: String,
+    /// The image is downloaded already.
+    pub cached: bool,
     pub vcpus: u32,
     pub memory_gib: u64,
     pub disk_gib: u64,
@@ -1232,12 +1262,8 @@ pub struct NewVm {
 }
 
 impl NewVm {
-    pub fn pull(&self) -> Request {
-        Request::Pull {
-            image: self.image.clone(),
-        }
-    }
-
+    /// One `new`: the daemon checks that the VM fits, downloads the image
+    /// if needed (humans only), creates and starts the VM.
     pub fn request(&self) -> Request {
         Request::New {
             name: self.name.clone(),
@@ -1255,33 +1281,22 @@ impl NewVm {
         }
     }
 
-    /// No progress from the daemon: say that it is slow.
-    pub fn downloading(&self) -> String {
-        format!(
-            "Downloading {}… this can take a few minutes",
-            self.image_title
-        )
-    }
-
-    pub fn starting(&self) -> String {
-        format!("Starting {}…", printable(&self.name, 64))
+    /// What the window says while it runs. No progress from the daemon:
+    /// a download says that it is slow.
+    pub fn progress(&self) -> String {
+        let name = printable(&self.name, 64);
+        if self.cached {
+            format!("Starting {name}…")
+        } else {
+            format!(
+                "Downloading {} and starting {name}… this can take a few minutes",
+                self.image_title
+            )
+        }
     }
 
     pub fn done(&self) -> String {
         format!("{} is ready", printable(&self.name, 64))
-    }
-
-    pub fn pull_failed(&self, e: &CallError) -> Failure {
-        match e {
-            CallError::Timeout => Failure {
-                title: format!("Download of {} still running", self.image_title),
-                details: Some(
-                    "Stallo stopped waiting for an answer, but the download may still finish. Try again later."
-                        .to_owned(),
-                ),
-            },
-            _ => failure(format!("Could not download {}", self.image_title), e),
-        }
     }
 
     /// A failed `new` leaves no VM behind, except one still on its way.
@@ -2450,7 +2465,8 @@ mod tests {
             Limits {
                 vcpus: 14,
                 memory_gib: 15,
-                disk_gib: 180
+                disk_gib: 180,
+                download_fits: true,
             }
         );
         assert_eq!(l.block(), None);
@@ -2479,6 +2495,12 @@ mod tests {
             ..host.clone()
         };
         assert_eq!(limits(&tight, 0).memory_gib, 1);
+        // No disk beyond the daemon's largest.
+        let huge = HostInfo {
+            disk_free_bytes: 1 << 50,
+            ..host.clone()
+        };
+        assert_eq!(limits(&huge, 0).disk_gib, MAX_DISK_GIB);
         // Nothing fits: Create says why.
         let small = HostInfo {
             cores: 2,
@@ -2495,7 +2517,17 @@ mod tests {
             ..host.clone()
         };
         assert_eq!(limits(&disk, 0).disk_gib, 9);
-        assert!(limits(&disk, 0).block().unwrap().contains("disk"));
+        assert!(limits(&disk, 0).block().unwrap().contains("for this VM"));
+        // The daemon wants room for a download twice above the floor.
+        let edge = HostInfo {
+            disk_free_bytes: 40 << 30,
+            ..host.clone()
+        };
+        assert!(limits(&edge, 10 << 30).download_fits);
+        assert_eq!(limits(&edge, 10 << 30).block(), None);
+        let short = limits(&edge, (10 << 30) + 1);
+        assert!(!short.download_fits);
+        assert!(short.block().unwrap().contains("download this image"));
         // Below the floor: no underflow.
         let below = HostInfo {
             disk_free_bytes: 1 << 30,
@@ -2509,9 +2541,58 @@ mod tests {
             Limits {
                 vcpus: 0,
                 memory_gib: 0,
-                disk_gib: 0
+                disk_gib: 0,
+                download_fits: false,
             }
         );
+    }
+
+    /// The caps are what the daemon's admission allows: the limit fits,
+    /// one more of anything does not.
+    #[test]
+    fn limits_match_admission() {
+        let cfg = stallo::config::HostConfig::default();
+        let roomy = roomy_host();
+        let hosts = [
+            roomy.clone(),
+            HostInfo {
+                memory_used_mib: 13000,
+                ..roomy.clone()
+            },
+            HostInfo {
+                memory_available_mib: 4096 + 5000,
+                ..roomy.clone()
+            },
+            HostInfo {
+                cores: 7,
+                memory_budget_mib: 12345,
+                memory_used_mib: 1000,
+                memory_available_mib: 50000,
+                disk_free_bytes: (55 << 30) + 12345,
+                ..roomy
+            },
+        ];
+        for host in hosts {
+            let l = limits(&host, 0);
+            assert_eq!(l.block(), None, "{host:?}");
+            // With the internet profile: the most overhead there is.
+            let admit = |vcpus: u32, gib: u64, disk_gib: u64| {
+                let mib = gib << 10;
+                let ask = stallo::host::Ask {
+                    vcpus,
+                    memory_mib: mib,
+                    overhead_mib: stallo::vm::overhead_mib(cfg.qemu_overhead_mib, mib)
+                        + stallo::net::PASST_MEMORY_MIB,
+                    disk_bytes: disk_gib << 30,
+                };
+                stallo::host::admit(&host, &ask, &cfg)
+            };
+            let (v, m, d) = (l.vcpus, l.memory_gib, l.disk_gib);
+            assert!(admit(v, m, d).is_ok(), "{host:?}");
+            assert!(admit(v + 1, m, d).is_err(), "{host:?}");
+            assert!(admit(v, m + 1, d).is_err(), "{host:?}");
+            assert!(admit(v, m, d + 1).is_err(), "{host:?}");
+        }
     }
 
     #[test]
@@ -2539,8 +2620,12 @@ mod tests {
         assert!(vm_name("run-1", &[]).unwrap_err().contains("run-"));
         assert_eq!(
             vm_name("dev", &taken(&["dev"])),
-            Err("A VM with this name already exists".to_owned())
+            Err("A VM with this name already exists.".to_owned())
         );
+        // Every reason is a sentence.
+        for bad in ["", "run-1", "dev"] {
+            assert!(vm_name(bad, &taken(&["dev"])).unwrap_err().ends_with('.'));
+        }
     }
 
     #[test]
@@ -2575,6 +2660,36 @@ mod tests {
         assert_eq!(internet, [true, false, false, false]);
         assert_eq!(rows[1].id, "arch");
         assert!(rows[0].cached && !rows[1].cached);
+
+        // Short titles; the rest of the name goes in the subtitle.
+        let named = |name: &str| {
+            let row = image_choices(&[ImageInfo {
+                name: name.into(),
+                ..image("ubuntu-26.04", true, None)
+            }])
+            .remove(0);
+            (row.title, row.subtitle)
+        };
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            named("Ubuntu 26.04 LTS server (cloud image)"),
+            pair(
+                "Ubuntu 26.04 LTS server",
+                "Linux · cloud image · Downloaded"
+            )
+        );
+        assert_eq!(
+            named("Debian 13 (trixie) generic cloud image (20261015-2632)"),
+            pair(
+                "Debian 13",
+                "Linux · (trixie) generic cloud image (20261015-2632) · Downloaded"
+            )
+        );
+        assert_eq!(
+            named("Arch Linux"),
+            pair("Arch Linux", "Linux · Downloaded")
+        );
+        assert_eq!(named("Odd ("), pair("Odd", "Linux · ( · Downloaded"));
     }
 
     #[test]
@@ -2617,6 +2732,7 @@ mod tests {
             name: "web".into(),
             image: "ubuntu-26.04".into(),
             image_title: "Ubuntu".into(),
+            cached: false,
             vcpus: 4,
             memory_gib: 3,
             disk_gib: 30,
@@ -2627,18 +2743,18 @@ mod tests {
             json(plan.request()),
             r#"{"op":"new","name":"web","image":"ubuntu-26.04","vcpus":4,"memory_mib":3072,"disk_gib":30,"net":"internet","wait":true}"#
         );
-        assert_eq!(json(plan.pull()), r#"{"op":"pull","image":"ubuntu-26.04"}"#);
-        let offline = NewVm {
+        let cached = NewVm {
             internet: false,
+            cached: true,
             ..plan.clone()
         };
-        assert!(json(offline.request()).contains(r#""net":"offline""#));
+        assert!(json(cached.request()).contains(r#""net":"offline""#));
 
         assert_eq!(
-            plan.downloading(),
-            "Downloading Ubuntu… this can take a few minutes"
+            plan.progress(),
+            "Downloading Ubuntu and starting web… this can take a few minutes"
         );
-        assert_eq!(plan.starting(), "Starting web…");
+        assert_eq!(cached.progress(), "Starting web…");
         assert_eq!(plan.done(), "web is ready");
         assert_eq!(
             plan.failed(&CallError::Failed("a VM named web already exists".into())),
@@ -2650,14 +2766,6 @@ mod tests {
         assert_eq!(
             plan.failed(&CallError::Timeout).title,
             "web is still being created"
-        );
-        assert_eq!(
-            plan.pull_failed(&CallError::NotRunning).title,
-            "Could not download Ubuntu"
-        );
-        assert_eq!(
-            plan.pull_failed(&CallError::Timeout).title,
-            "Download of Ubuntu still running"
         );
         assert_eq!(
             advanced_summary(2, 2, 20, false),

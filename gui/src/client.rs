@@ -20,15 +20,16 @@ use crate::model::{self, Action, CallError, Probe, Production};
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide: 14, in four pools. Lifecycle
-/// actions may take up to 150 s each, snapshot actions 15 min and image
-/// downloads and creates 30 min, so each kind has its own slots: reads
+/// Requests in flight at once, app-wide: 13, in four pools. Lifecycle
+/// actions may take up to 150 s each, snapshot actions 15 min and creates
+/// (with an image download) 30 min, so each kind has its own slots: reads
 /// (polls, the probe) never wait behind an action, a start or stop never
-/// waits behind a snapshot job, and nothing waits behind a download.
+/// waits behind a snapshot job, and nothing waits behind a create. The
+/// window runs one create at a time.
 const READ_SLOTS: usize = 4;
 const ACTION_SLOTS: usize = 4;
 const SNAP_SLOTS: usize = 4;
-const CREATE_SLOTS: usize = 2;
+const CREATE_SLOTS: usize = 1;
 static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
 static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
 static SNAPS: Semaphore = Semaphore::const_new(SNAP_SLOTS);
@@ -145,7 +146,7 @@ pub async fn images(socket: &Path) -> Result<Vec<ImageInfo>, CallError> {
     get(socket, Request::Images, READ_TIMEOUT).await
 }
 
-/// Downloads an image or creates a VM: a `pull` or `new` request.
+/// Creates a VM (`new`), downloading its image first if needed.
 pub async fn create(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
     call_in(&CREATES, socket, request, model::CREATE_LIMIT).await
 }
@@ -394,13 +395,23 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!((list[1].cached, list[1].size_bytes), (true, Some(7)));
 
-        let (_d, s, fake) = serve(r#"{"op":"pull","image":"arch"}"#, answer("{\"ok\":true}\n"));
-        let pull = Request::Pull {
+        let (_d, s, fake) = serve(
+            r#"{"op":"new","name":"web","image":"arch","vcpus":2,"memory_mib":2048,"disk_gib":20,"net":"offline","wait":true}"#,
+            answer("{\"ok\":true,\"data\":{\"ready_ms\":9}}\n"),
+        );
+        let new = Request::New {
+            name: "web".into(),
             image: "arch".into(),
+            vcpus: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            net: stallo::config::NetProfile::Offline,
+            forwards: vec![],
+            wait: true,
         };
         assert_eq!(
-            run(async move { create(&s, pull).await }),
-            Ok(serde_json::Value::Null)
+            run(async move { create(&s, new).await }),
+            Ok(serde_json::json!({"ready_ms": 9}))
         );
         fake.join().unwrap();
     }

@@ -104,16 +104,15 @@ pub(super) fn connect(vms: &Rc<Vms>) {
 
 /// The New VM dialog: a spinner until the images and the host are known.
 fn ask(vms: &Rc<Vms>) {
+    let loading = adw::Spinner::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .width_request(32)
+        .height_request(32)
+        .build();
+    name_spinner(&loading, "Loading images");
     let stack = gtk::Stack::new();
-    stack.add_named(
-        &adw::Spinner::builder()
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .width_request(32)
-            .height_request(32)
-            .build(),
-        Some("loading"),
-    );
+    stack.add_named(&loading, Some("loading"));
     let cancel = gtk::Button::with_label("Cancel");
     let create = gtk::Button::builder()
         .label("Create")
@@ -197,6 +196,11 @@ struct Form {
     production: bool,
     /// The name last suggested: it follows the image until edited.
     suggested: RefCell<String>,
+    /// Processors, memory and disk as last chosen, before any cap: a
+    /// lower cap for one image is undone on switching back.
+    wanted: [Cell<f64>; 3],
+    /// The values are being fitted to the caps, not chosen.
+    fitting: Cell<bool>,
 }
 
 impl Form {
@@ -229,6 +233,9 @@ impl Form {
                 .activatable_widget(&check)
                 .build();
             row.add_prefix(&check);
+            // Through `Widget`: the binding does not mark rows as `Accessible`.
+            let label = row.upcast_ref::<gtk::Widget>().upcast_ref();
+            check.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label])]);
             image_group.add(&row);
             checks.push(check);
         }
@@ -248,6 +255,7 @@ impl Form {
             .build();
         name.upcast_ref::<gtk::Widget>()
             .update_relation(&[gtk::accessible::Relation::DescribedBy(&[hint.upcast_ref()])]);
+        // The Live Screen switch joins this group once `new` takes `vnc`.
         let name_group = adw::PreferencesGroup::new();
         name_group.add(&name);
         name_group.add(&hint);
@@ -311,6 +319,12 @@ impl Form {
             host,
             taken,
             suggested: RefCell::new(suggested),
+            wanted: [
+                Cell::new(model::NEW_VCPUS.into()),
+                Cell::new(model::NEW_MEMORY_GIB as f64),
+                Cell::new(model::NEW_DISK_GIB as f64),
+            ],
+            fitting: Cell::new(false),
         });
         // Fit the values to the first image before any handler runs.
         form.update();
@@ -328,10 +342,16 @@ impl Form {
                 f.update();
             }
         });
-        for spin in [&form.vcpus, &form.memory, &form.disk] {
+        for (i, spin) in [&form.vcpus, &form.memory, &form.disk]
+            .into_iter()
+            .enumerate()
+        {
             let f = Rc::downgrade(&form);
-            spin.connect_value_notify(move |_| {
+            spin.connect_value_notify(move |row| {
                 if let Some(f) = f.upgrade() {
+                    if !f.fitting.get() {
+                        f.wanted[i].set(row.value());
+                    }
                     f.update();
                 }
             });
@@ -372,18 +392,22 @@ impl Form {
         let image = &self.images[self.selected()];
         let limits = model::limits(&self.host, image.download_bytes);
         let notes = limits.notes();
-        for ((row, upper), note) in [
+        for (((row, upper), note), wanted) in [
             (&self.vcpus, u64::from(limits.vcpus)),
             (&self.memory, limits.memory_gib),
             (&self.disk, limits.disk_gib),
         ]
         .into_iter()
         .zip(&notes)
+        .zip(&self.wanted)
         {
             let a = row.adjustment();
             let upper = (upper as f64).max(a.lower());
-            if a.upper() != upper {
-                a.configure(a.value().min(upper), a.lower(), upper, 1.0, 4.0, 0.0);
+            let value = wanted.get().clamp(a.lower(), upper);
+            if a.upper() != upper || a.value() != value {
+                self.fitting.set(true);
+                a.configure(value, a.lower(), upper, 1.0, 4.0, 0.0);
+                self.fitting.set(false);
             }
             if row.subtitle().as_deref() != Some(note.as_str()) {
                 row.set_subtitle(note);
@@ -407,8 +431,14 @@ impl Form {
         // Fixed text only: descriptions are markup.
         let full = limits.block();
         self.advanced_group.set_description(full);
-        let name = model::vm_name(&self.name.text(), &self.taken);
+        let text = self.name.text();
+        let name = model::vm_name(&text, &self.taken);
         match &name {
+            // Nothing typed yet is no mistake; Create just waits.
+            Err(_) if text.is_empty() => {
+                self.name.remove_css_class("error");
+                self.hint.set_visible(false);
+            }
             Ok(_) => {
                 self.name.remove_css_class("error");
                 self.hint.set_visible(false);
@@ -446,6 +476,7 @@ impl Form {
             name,
             image: image.id.clone(),
             image_title: image.title.clone(),
+            cached: image.cached,
             vcpus,
             memory_gib,
             disk_gib,
@@ -455,60 +486,36 @@ impl Form {
             d.close();
         }
         if let Some(v) = self.vms.upgrade() {
-            v.create_vm(plan, image.cached);
+            v.create_vm(plan);
         }
     }
 }
 
 impl Vms {
-    /// Downloads the image if needed, then creates and starts the VM and
-    /// shows it.
-    fn create_vm(self: &Rc<Self>, plan: NewVm, cached: bool) {
+    /// The VM open in the content pane, if any.
+    fn open_name(&self) -> Option<String> {
+        self.detail.borrow().as_ref().map(|d| d.name.clone())
+    }
+
+    /// Creates and starts the VM (the daemon downloads its image first if
+    /// needed), then shows it, unless the user moved on meanwhile.
+    fn create_vm(self: &Rc<Self>, plan: NewVm) {
         if self.create.busy.get() {
             return;
         }
-        let first = if cached {
-            plan.starting()
-        } else {
-            plan.downloading()
-        };
-        self.create.show(Some(&first));
+        self.create.show(Some(&plan.progress()));
+        // Its row says it starts, and its buttons stay off until done.
+        let claimed = self
+            .pending
+            .borrow_mut()
+            .start(&plan.name, &Action::Life(Op::Start));
+        self.refresh_rows();
+        let before = self.open_name();
         // Weak: a download may take longer than the page stays.
         let (v, ui, socket) = (Rc::downgrade(self), self.ui.clone(), self.socket.clone());
         glib::spawn_future_local(async move {
-            if !cached {
-                let (s, pull) = (socket.clone(), plan.pull());
-                let got = client::spawn(async move { client::create(&s, pull).await }).await;
-                if let Ok(Err(e)) = &got {
-                    ui.fail(&plan.pull_failed(e));
-                }
-                if !matches!(got, Ok(Ok(_))) {
-                    if let Some(v) = v.upgrade() {
-                        v.create.show(None);
-                    }
-                    return;
-                }
-                if let Some(v) = v.upgrade() {
-                    v.create.show(Some(&plan.starting()));
-                }
-            }
-            // Its row says it starts, and its buttons stay off until done.
-            let claimed = v.upgrade().is_some_and(|v| {
-                let claimed = v
-                    .pending
-                    .borrow_mut()
-                    .start(&plan.name, &Action::Life(Op::Start));
-                v.refresh_rows();
-                claimed
-            });
             let (s, new) = (socket.clone(), plan.request());
             let got = client::spawn(async move { client::create(&s, new).await }).await;
-            let ok = matches!(got, Ok(Ok(_)));
-            match &got {
-                Ok(Ok(_)) => ui.toast(&plan.done()),
-                Ok(Err(e)) => ui.fail(&plan.failed(e)),
-                Err(_) => {}
-            }
             if let Some(v) = v.upgrade() {
                 v.create.show(None);
                 if claimed {
@@ -516,22 +523,40 @@ impl Vms {
                 }
                 v.list_poll.borrow_mut().soon();
             }
-            if !ok {
-                return;
+            match got {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return ui.fail(&plan.failed(&e)),
+                Err(_) => return,
             }
             // Now, not at the next poll: the new VM is what to show.
             let sent = Instant::now();
             let list =
                 client::spawn(async move { client::list(&socket, client::READ_TIMEOUT).await })
                     .await;
-            if let (Some(v), Ok(Ok(list))) = (v.upgrade(), list) {
-                v.pending.borrow_mut().listed(sent);
-                v.show(list);
+            let (Some(v), Ok(Ok(list))) = (v.upgrade(), list) else {
+                return ui.toast(&plan.done());
+            };
+            v.pending.borrow_mut().listed(sent);
+            v.show(list);
+            if v.open_name() == before {
                 v.select_new(&plan.name);
+                return ui.toast(&plan.done());
             }
+            // The user looks at another VM: do not pull the view away.
+            let toast = adw::Toast::builder()
+                .title(plan.done())
+                .use_markup(false)
+                .button_label("Open")
+                .build();
+            let (w, name) = (Rc::downgrade(&v), plan.name.clone());
+            toast.connect_button_clicked(move |_| {
+                if let Some(v) = w.upgrade() {
+                    v.select_new(&name);
+                }
+            });
+            ui.toasts.add_toast(toast);
         });
     }
-
     /// Selects VM `name` and opens it on its first tab.
     fn select_new(self: &Rc<Self>, name: &str) {
         let row = self
