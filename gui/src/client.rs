@@ -20,20 +20,23 @@ use crate::model::{self, Action, CallError, Probe, Production};
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide: 13, in four pools. Lifecycle
-/// actions may take up to 150 s each, snapshot actions 15 min and creates
-/// (with an image download) 30 min, so each kind has its own slots: reads
-/// (polls, the probe) never wait behind an action, a start or stop never
-/// waits behind a snapshot job, and nothing waits behind a create. The
-/// window runs one create at a time.
+/// Requests in flight at once, app-wide: 15, in five pools. Lifecycle
+/// actions may take up to 150 s each, snapshot actions 15 min, creates
+/// (with an image download) 30 min and file copies one request per chunk,
+/// so each kind has its own slots: reads (polls, the probe) never wait
+/// behind an action, a start or stop never waits behind a snapshot job or
+/// a copy, and nothing waits behind a create. The window runs one create
+/// at a time.
 const READ_SLOTS: usize = 4;
 const ACTION_SLOTS: usize = 4;
 const SNAP_SLOTS: usize = 4;
 const CREATE_SLOTS: usize = 1;
+const FILE_SLOTS: usize = 2;
 static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
 static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
 static SNAPS: Semaphore = Semaphore::const_new(SNAP_SLOTS);
 static CREATES: Semaphore = Semaphore::const_new(CREATE_SLOTS);
+static FILES: Semaphore = Semaphore::const_new(FILE_SLOTS);
 
 fn runtime() -> &'static Handle {
     static RT: OnceLock<Handle> = OnceLock::new();
@@ -154,6 +157,23 @@ pub async fn images(socket: &Path) -> Result<Vec<ImageInfo>, CallError> {
 /// Creates a VM (`new`), downloading its image first if needed.
 pub async fn create(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
     call_in(&CREATES, socket, request, model::CREATE_LIMIT).await
+}
+
+/// One part of a file copy (`file_read`, `file_write`).
+pub async fn file(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
+    call_in(&FILES, socket, request, model::FILE_LIMIT).await
+}
+
+/// Runs host file work off the I/O thread; `what` names it in the error.
+pub async fn blocking<T: Send + 'static>(
+    what: String,
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Result<T, CallError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(e)) => Err(CallError::Failed(format!("cannot {what}: {e}"))),
+        Err(e) => Err(CallError::Failed(format!("cannot {what}: {e}"))),
+    }
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -421,6 +441,31 @@ mod tests {
             Ok(serde_json::json!({"ready_ms": 9}))
         );
         fake.join().unwrap();
+    }
+
+    #[test]
+    fn file_requests() {
+        let (_d, s, fake) = serve(
+            r#"{"op":"file_read","name":"dev","path":"/tmp/a","offset":0,"max_bytes":8388608,"admin":false}"#,
+            answer("{\"ok\":true,\"data\":{\"data_base64\":\"aGk=\",\"size\":2,\"more\":false}}\n"),
+        );
+        let data =
+            run(async move { file(&s, model::read_request("dev", "/tmp/a", 0, false)).await });
+        fake.join().unwrap();
+        assert_eq!(
+            model::read_answer(data.unwrap(), 0),
+            Ok((b"hi".to_vec(), false))
+        );
+        // Host file errors read like daemon ones.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let got = run(async move {
+            blocking("open it".into(), move || std::fs::File::open(&missing)).await
+        });
+        match got {
+            Err(CallError::Failed(e)) => assert!(e.starts_with("cannot open it: "), "{e}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

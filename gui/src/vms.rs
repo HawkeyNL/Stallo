@@ -1,9 +1,11 @@
 //! The connected window: the VM list with the host meter, and a VM's
-//! overview with its lifecycle actions, its screen and its snapshots. All
+//! overview with its lifecycle actions, its screen, its files and its
+//! snapshots. All
 //! text from the daemon goes through the view-model (`stallo::printable`)
 //! into plain labels.
 
 mod create;
+mod files;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -14,11 +16,12 @@ use adw::prelude::*;
 use adw::{gio, glib, gtk};
 use libadwaita as adw;
 use stallo::api::{VmDetails, VmInfo};
+use stallo::host::HostInfo;
 use stallo::snapshot::Snapshot;
 
 use crate::Ui;
 use crate::client;
-use crate::model::{self, Action, Op, Pending, Poll};
+use crate::model::{self, Action, Op, Pending, Poll, Setting};
 use crate::screen::Screen;
 
 /// The pill around a VM's state in the sidebar.
@@ -100,7 +103,8 @@ impl Progress {
     }
 }
 
-/// The content pane for one VM: the Overview, Screen and Snapshots tabs.
+/// The content pane for one VM: the Overview, Screen, Files and Snapshots
+/// tabs.
 struct Detail {
     name: String,
     vms: Weak<Vms>,
@@ -116,10 +120,22 @@ struct Detail {
     values: Vec<adw::ActionRow>,
     /// VNC on or off from the next start.
     live_screen: adw::SwitchRow,
+    agent: adw::SwitchRow,
+    /// How to connect an agent; shown while agent control is on.
+    connect_agent: adw::ActionRow,
+    remove_row: adw::ActionRow,
+    remove: gtk::Button,
+    /// In the Delete VM row while the VM is not stopped.
+    remove_stop: gtk::Button,
+    resources: adw::PreferencesGroup,
+    resize: gtk::Button,
+    /// In place of Edit while the VM is not stopped.
+    resize_stop: gtk::Button,
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
     tabs: adw::ViewStack,
     screen: Rc<Screen>,
+    files: Rc<files::Files>,
     take: gtk::Button,
     snaps_group: adw::PreferencesGroup,
     /// First on the timeline while a snapshot is taken.
@@ -704,17 +720,18 @@ impl Vms {
         });
     }
 
-    /// The Overview switch moved: off at once, on after the risk is
+    /// An Overview switch moved: off at once, on after the risk is
     /// spelled out. A move that matches the VM (an update) does nothing.
-    fn switch_live_screen(self: &Rc<Self>, row: &adw::SwitchRow, name: &str) {
-        let on = row.is_active();
-        let Some(vm) = self.vm(name).filter(|vm| vm.vnc != on) else {
+    fn switch(self: &Rc<Self>, setting: Setting, row: &adw::SwitchRow, name: &str) {
+        let Some(vm) = self.vm(name) else {
             return;
         };
-        if !on {
-            return self.run(Action::LiveScreen(false), name);
+        match setting.moved(&vm, row.is_active()) {
+            None => return,
+            Some(Some(off)) => return self.run(off, name),
+            Some(None) => {}
         }
-        let c = model::confirm_live_screen_switch(&vm);
+        let c = setting.confirm(&vm);
         let dialog = adw::AlertDialog::builder()
             .heading(&c.heading)
             .heading_use_markup(false)
@@ -723,23 +740,175 @@ impl Vms {
             .build();
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("confirm", c.button);
+        if setting.destructive() {
+            dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+        }
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
         let (v, name, row) = (Rc::downgrade(self), name.to_owned(), row.downgrade());
         dialog.connect_response(None, move |_, response| match response {
             "confirm" => {
                 if let Some(v) = v.upgrade() {
-                    v.run(Action::LiveScreen(true), &name);
+                    v.run(setting.action(true), &name);
                 }
             }
             // Back to what the VM has now: it may have been turned on
             // elsewhere meanwhile.
             _ => {
                 if let (Some(v), Some(row)) = (v.upgrade(), row.upgrade())
-                    && let Some(on) = v.vm(&name).map(|vm| vm.vnc)
+                    && let Some(vm) = v.vm(&name)
                 {
-                    row.set_active(on);
+                    row.set_active(setting.of(&vm));
                 }
+            }
+        });
+        dialog.present(Some(&self.root));
+    }
+
+    /// Asks before deleting a stopped VM; the name must be typed.
+    fn ask_remove(self: &Rc<Self>, name: &str) {
+        let Some(vm) = self
+            .vm(name)
+            .filter(|vm| model::kind(&vm.state) == model::Kind::Stopped)
+        else {
+            return;
+        };
+        let c = model::confirm_remove(&vm);
+        let entry = adw::EntryRow::builder().title("VM name").build();
+        let names = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        names.append(&entry);
+        let dialog = adw::AlertDialog::builder()
+            .heading(&c.heading)
+            .heading_use_markup(false)
+            .body(&c.body)
+            .body_use_markup(false)
+            .extra_child(&names)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", c.button);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_response_enabled("delete", false);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        // Weak: the dialog owns the entry and so this handler.
+        let (d, vm_name) = (dialog.downgrade(), vm.name.clone());
+        entry.connect_changed(move |e| {
+            if let Some(d) = d.upgrade() {
+                d.set_response_enabled("delete", model::remove_typed(&e.text(), &vm_name));
+            }
+        });
+        let (v, name, typed) = (Rc::downgrade(self), vm.name, entry.clone());
+        dialog.connect_response(Some("delete"), move |_, _| {
+            if let Some(v) = v.upgrade()
+                && model::remove_typed(&typed.text(), &name)
+            {
+                v.run(Action::Remove, &name);
+            }
+        });
+        dialog.set_focus(Some(&entry));
+        dialog.present(Some(&self.root));
+    }
+
+    /// Asks for new processors and memory, capped by what the host has
+    /// free now.
+    fn ask_resize(self: &Rc<Self>, name: &str) {
+        let (v, socket, name) = (Rc::downgrade(self), self.socket.clone(), name.to_owned());
+        glib::spawn_future_local(async move {
+            let got = client::spawn(async move { client::host(&socket).await }).await;
+            let Some(v) = v.upgrade() else {
+                return;
+            };
+            match got {
+                Ok(Ok(host)) => v.resize_dialog(&name, &host),
+                Ok(Err(e)) => v.ui.fail(&model::failure(
+                    "Could not look up the host's free resources".to_owned(),
+                    &e,
+                )),
+                Err(_) => {}
+            }
+        });
+    }
+
+    fn resize_dialog(self: &Rc<Self>, name: &str, host: &HostInfo) {
+        let Some(vm) = self.vm(name).filter(|vm| model::resize_block(vm).is_none()) else {
+            return;
+        };
+        let form = model::resize_form(&vm, host);
+        let [vcpus_note, memory_note] = form.notes();
+        let spin = |title: &str, value: u64, max: u64, note: &str| {
+            adw::SpinRow::builder()
+                .title(title)
+                .subtitle(note)
+                .use_markup(false)
+                .adjustment(&gtk::Adjustment::new(
+                    value as f64,
+                    1.0,
+                    max as f64,
+                    1.0,
+                    4.0,
+                    0.0,
+                ))
+                .numeric(true)
+                .build()
+        };
+        let vcpus = spin(
+            "Processors",
+            form.vcpus.into(),
+            form.max_vcpus.into(),
+            &vcpus_note,
+        );
+        let memory = spin(
+            "Memory (GiB)",
+            form.memory_gib,
+            form.max_memory_gib,
+            &memory_note,
+        );
+        let rows = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        rows.append(&vcpus);
+        rows.append(&memory);
+        let dialog = adw::AlertDialog::builder()
+            .heading("Change Resources")
+            .body(format!(
+                "{} gets them when it starts next.",
+                stallo::printable(&vm.name, 64)
+            ))
+            .body_use_markup(false)
+            .extra_child(&rows)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("save", "Save");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_response_enabled("save", false);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        // Weak: the dialog owns the rows and so these handlers.
+        let chosen = {
+            let (vcpus, memory) = (vcpus.downgrade(), memory.downgrade());
+            move || {
+                form.action(
+                    vcpus.upgrade()?.value() as u32,
+                    memory.upgrade()?.value() as u64,
+                )
+            }
+        };
+        for row in [&vcpus, &memory] {
+            let (d, chosen) = (dialog.downgrade(), chosen.clone());
+            row.connect_value_notify(move |_| {
+                if let Some(d) = d.upgrade() {
+                    d.set_response_enabled("save", chosen().is_some());
+                }
+            });
+        }
+        let (v, name) = (Rc::downgrade(self), vm.name);
+        dialog.connect_response(Some("save"), move |_, _| {
+            if let (Some(v), Some(action)) = (v.upgrade(), chosen()) {
+                v.run(action, &name);
             }
         });
         dialog.present(Some(&self.root));
@@ -893,9 +1062,32 @@ impl Detail {
         header.pack_end(&busy);
 
         let overview = adw::PreferencesPage::new();
+        let resize = gtk::Button::builder()
+            .label("Edit…")
+            .valign(gtk::Align::Center)
+            .build();
+        resize.update_property(&[gtk::accessible::Property::Label("Edit Resources")]);
+        let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+        resize.connect_clicked(move |_| {
+            if let Some(v) = v.upgrade() {
+                v.ask_resize(&name);
+            }
+        });
+        let resize_stop = gtk::Button::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let resize_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        resize_buttons.append(&resize_stop);
+        resize_buttons.append(&resize);
         let mut values = Vec::new();
+        let mut resources = None;
         for (title, rows) in model::facts(vm, None) {
             let group = adw::PreferencesGroup::builder().title(title).build();
+            if title == "Resources" {
+                group.set_header_suffix(Some(&resize_buttons));
+                resources = Some(group.clone());
+            }
             for (title, _) in rows {
                 let row = adw::ActionRow::builder()
                     .title(title)
@@ -917,15 +1109,68 @@ impl Detail {
             .use_markup(false)
             .active(vm.vnc)
             .build();
-        let (v, name) = (Rc::downgrade(vms), vm.name.clone());
-        live_screen.connect_active_notify(move |row| {
-            if let Some(v) = v.upgrade() {
-                v.switch_live_screen(row, &name);
-            }
-        });
         let screen_group = adw::PreferencesGroup::builder().title("Screen").build();
         screen_group.add(&live_screen);
         overview.add(&screen_group);
+
+        let agent = adw::SwitchRow::builder()
+            .title("Agent Control")
+            .subtitle("Lets AI agents connected to Stallo use this VM.")
+            .use_markup(false)
+            .active(vm.agent_control)
+            .build();
+        for (row, setting) in [
+            (&live_screen, Setting::LiveScreen),
+            (&agent, Setting::Agent),
+        ] {
+            let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+            row.connect_active_notify(move |row| {
+                if let Some(v) = v.upgrade() {
+                    v.switch(setting, row, &name);
+                }
+            });
+        }
+        let connect_agent = adw::ActionRow::builder()
+            .title("Connect an AI Agent")
+            .subtitle(format!(
+                "Run {} in a terminal to set up Claude Code.",
+                model::MCP_INSTALL
+            ))
+            .use_markup(false)
+            .subtitle_selectable(true)
+            .visible(vm.agent_control)
+            .build();
+        connect_agent.add_suffix(&vms.ui.copy_button(model::MCP_INSTALL));
+        let agents = adw::PreferencesGroup::builder().title("Agents").build();
+        agents.add(&agent);
+        agents.add(&connect_agent);
+        overview.add(&agents);
+
+        let remove = gtk::Button::builder()
+            .label("Delete…")
+            .valign(gtk::Align::Center)
+            .css_classes(["destructive-action"])
+            .build();
+        remove.update_property(&[gtk::accessible::Property::Label("Delete VM")]);
+        let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+        remove.connect_clicked(move |_| {
+            if let Some(v) = v.upgrade() {
+                v.ask_remove(&name);
+            }
+        });
+        let remove_stop = gtk::Button::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let remove_row = adw::ActionRow::builder()
+            .title("Delete VM")
+            .use_markup(false)
+            .build();
+        remove_row.add_suffix(&remove_stop);
+        remove_row.add_suffix(&remove);
+        let remove_group = adw::PreferencesGroup::new();
+        remove_group.add(&remove_row);
+        overview.add(&remove_group);
 
         let take = gtk::Button::builder()
             .label("Take Snapshot")
@@ -979,6 +1224,7 @@ impl Detail {
         snapshots.add(&snaps_group);
 
         let screen = Screen::new(vm, vms);
+        let files = files::Files::new(vm, vms);
         let tabs = adw::ViewStack::new();
         tabs.add_titled_with_icon(&overview, Some("overview"), "Overview", "computer-symbolic");
         tabs.add_titled_with_icon(
@@ -987,6 +1233,7 @@ impl Detail {
             "Screen",
             "video-display-symbolic",
         );
+        tabs.add_titled_with_icon(&files.root, Some("files"), "Files", "folder-symbolic");
         tabs.add_titled_with_icon(
             &snapshots,
             Some(SNAPSHOTS),
@@ -1047,10 +1294,19 @@ impl Detail {
             busy,
             values,
             live_screen,
+            agent,
+            connect_agent,
+            remove_row,
+            remove,
+            remove_stop,
+            resources: resources.expect("a Resources group"),
+            resize,
+            resize_stop,
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
             tabs,
             screen,
+            files,
             take,
             snaps_group,
             taking,
@@ -1086,11 +1342,28 @@ impl Detail {
         }
         self.screen
             .update(vm, self.details.borrow().as_ref(), blocked);
-        // Not while an action runs: it may be this switch's own.
-        self.live_screen.set_sensitive(!blocked);
-        if !blocked {
-            self.live_screen.set_active(vm.vnc);
+        self.files.update(vm, blocked);
+        for (row, setting) in [
+            (&self.live_screen, Setting::LiveScreen),
+            (&self.agent, Setting::Agent),
+        ] {
+            row.set_sensitive(!blocked);
+            if let Some(on) = setting.shown(vm, blocked) {
+                row.set_active(on);
+            }
         }
+        self.connect_agent.set_visible(vm.agent_control);
+        // Both need the VM stopped: until then each offers the stop.
+        let stopped = model::stop_offer(vm).is_none();
+        self.remove_row.set_subtitle(model::remove_note(vm));
+        self.remove.set_visible(stopped);
+        self.remove.set_sensitive(!blocked);
+        offer_stop(&self.remove_stop, vm);
+        // Fixed text only: descriptions are markup.
+        self.resources.set_description(model::resize_block(vm));
+        self.resize.set_visible(stopped);
+        self.resize.set_sensitive(!blocked);
+        offer_stop(&self.resize_stop, vm);
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {
@@ -1196,6 +1469,17 @@ impl Detail {
             delete,
             working,
         }
+    }
+}
+
+/// Shows `button` as the stop a change needs first, if it does; its
+/// action decides whether it is enabled.
+fn offer_stop(button: &gtk::Button, vm: &VmInfo) {
+    let stop = model::stop_offer(vm);
+    button.set_visible(stop.is_some());
+    if let Some((op, label)) = stop {
+        button.set_label(label);
+        button.set_action_name(Some(&format!("vm.{}", op.action())));
     }
 }
 
