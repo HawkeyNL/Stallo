@@ -606,6 +606,9 @@ async fn read_message<R: AsyncRead + Unpin>(
             let rects = r.read_u16().await?;
             let mut resized = false;
             for _ in 0..rects {
+                // Rects can come from the buffer without a read that waits:
+                // give the I/O thread (and MESSAGE_TIMEOUT) a turn.
+                tokio::task::consume_budget().await;
                 let rect = Rect {
                     x: r.read_u16().await?,
                     y: r.read_u16().await?,
@@ -613,6 +616,8 @@ async fn read_message<R: AsyncRead + Unpin>(
                     h: r.read_u16().await?,
                 };
                 match r.read_i32().await? {
+                    // Nothing to read or draw.
+                    ENC_RAW if rect.w == 0 || rect.h == 0 => {}
                     ENC_RAW => {
                         read_raw(r, screen, frames, rect).await?;
                         screen.damage.push(rect);
@@ -1012,6 +1017,97 @@ mod tests {
                 buttons: 1,
             });
             assert_eq!(read_n(&mut server, 6).await, [5, 1, 1, 44, 0, 200]);
+        });
+    }
+
+    #[test]
+    fn empty_rects_are_skipped() {
+        rt().block_on(async {
+            let (_session, rx, mut server) = connected(4, 3).await;
+            let mut m = vec![0, 0, 0xff, 0xff];
+            for i in 0..0xffff_u32 {
+                let r = if i % 2 == 0 {
+                    rect(1, 1, 0, 3)
+                } else {
+                    rect(9, 9, 4, 0)
+                };
+                m.extend_from_slice(&update(&[(r, ENC_RAW, &[])])[4..]);
+            }
+            let started = std::time::Instant::now();
+            server.write_all(&m).await.unwrap();
+            assert_eq!(read_n(&mut server, 10).await, update_request(true, 4, 3));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            // No content: nothing published.
+            assert!(!rx.has_changed().unwrap());
+        });
+    }
+
+    #[test]
+    fn resize_to_other_shape() {
+        rt().block_on(async {
+            let (_session, mut rx, mut server) = connected(4, 3).await;
+            let f = |x: u16, y: u16, w: u16, h: u16, v: u8| {
+                let r = rect(x, y, w, h);
+                update(&[(r, ENC_RAW, &vec![v; usize::from(w * h) * 4])])
+            };
+            server.write_all(&f(0, 0, 4, 3, 1)).await.unwrap();
+            assert_eq!(read_n(&mut server, 10).await, update_request(true, 4, 3));
+            // 4x3 to 3x4: the same number of bytes, other rows.
+            let mut m = update(&[(rect(0, 0, 3, 4), ENC_DESKTOP_SIZE, &[])]);
+            m.extend(f(0, 0, 3, 1, 2));
+            server.write_all(&m).await.unwrap();
+            assert_eq!(read_n(&mut server, 10).await, update_request(false, 3, 4));
+            assert_eq!(read_n(&mut server, 10).await, update_request(true, 3, 4));
+            let a = rx.borrow_and_update().clone();
+            server.write_all(&f(2, 3, 1, 1, 3)).await.unwrap();
+            assert_eq!(read_n(&mut server, 10).await, update_request(true, 3, 4));
+            let b = rx.borrow_and_update().clone();
+            // Rows of 3 pixels: 2 2 2 / 0 0 0 / 0 0 0 / 0 0 0, then 3 at
+            // (2, 3).
+            let mut want = [[2; 4]; 3].concat();
+            want.extend_from_slice(&[0; 9 * 4]);
+            assert_eq!((a.width, a.height, a.serial), (3, 4, 2));
+            assert_eq!(*a.pixels, want);
+            want[44..48].copy_from_slice(&[3; 4]);
+            assert_eq!((b.width, b.height, b.serial), (3, 4, 3));
+            assert_eq!(*b.pixels, want);
+            assert_eq!(b.damage, [rect(2, 3, 1, 1)]);
+        });
+    }
+
+    #[test]
+    fn no_release_after_a_cut_off_write() {
+        rt().block_on(async {
+            // A server that never reads: the writer ends up blocked.
+            let (session, _rx, mut server) = connected(4, 3).await;
+            session.send(Input::Key {
+                keycode: 38,
+                keysym: 0x61,
+                down: true,
+            });
+            for i in 0..100_000_u32 {
+                session.send(Input::Pointer {
+                    x: (i % 4) as u16,
+                    y: 0,
+                    buttons: 0,
+                });
+                if i % 64 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            drop(session);
+            let mut got = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), server.read_to_end(&mut got))
+                .await
+                .expect("the session did not end")
+                .unwrap();
+            // The key-down, then pointer events only (the last one maybe
+            // cut off): no release written after a partial message.
+            assert_eq!(got[..8], [4, 1, 0, 0, 0, 0, 0, 0x61]);
+            assert!(got.len() > 1000, "{}", got.len());
+            for m in got[8..].chunks(6) {
+                assert_eq!(m[0], 5, "{m:?}");
+            }
         });
     }
 
