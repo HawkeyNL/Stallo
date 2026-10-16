@@ -337,20 +337,26 @@ impl Screen {
         });
         self.picture.add_controller(focus);
 
-        // F11 anywhere in the window while the screen shows.
+        // F11 while the focus is in this tab (local scope) and the screen
+        // shows; never under a dialog.
         let s = weak();
         let toggle = gtk::CallbackAction::new(move |_, _| {
             let Some(s) = s.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            if !s.root.is_mapped() || s.page() != Some(ScreenPage::Live) {
+            let dialog = s
+                .root
+                .root()
+                .and_downcast::<adw::ApplicationWindow>()
+                .is_some_and(|w| w.visible_dialog().is_some());
+            if dialog || !s.root.is_mapped() || s.page() != Some(ScreenPage::Live) {
                 return glib::Propagation::Proceed;
             }
             s.fullscreen();
             glib::Propagation::Stop
         });
         let shortcuts = gtk::ShortcutController::new();
-        shortcuts.set_scope(gtk::ShortcutScope::Managed);
+        shortcuts.set_scope(gtk::ShortcutScope::Local);
         shortcuts.add_shortcut(gtk::Shortcut::new(
             Some(gtk::KeyvalTrigger::new(
                 gdk::Key::F11,

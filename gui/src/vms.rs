@@ -714,9 +714,13 @@ impl Vms {
                     v.run(Action::LiveScreen(true), &name);
                 }
             }
+            // Back to what the VM has now: it may have been turned on
+            // elsewhere meanwhile.
             _ => {
-                if let Some(row) = row.upgrade() {
-                    row.set_active(false);
+                if let (Some(v), Some(row)) = (v.upgrade(), row.upgrade())
+                    && let Some(on) = v.vm(&name).map(|vm| vm.vnc)
+                {
+                    row.set_active(on);
                 }
             }
         });
