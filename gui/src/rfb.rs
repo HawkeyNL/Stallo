@@ -4,8 +4,6 @@
 //! through [`Session::send`]. Everything the server sends is untrusted: sizes
 //! are capped and checked, and anything unexpected ends the session.
 
-#![expect(dead_code, reason = "the Screen tab (GUI-8) is the first user")]
-
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
