@@ -222,6 +222,30 @@ impl Ui {
         self.toasts.add_toast(toast);
     }
 
+    /// A toast for an error. Its Details button shows the whole text,
+    /// which a toast would cut off, in a dialog.
+    fn fail(&self, f: &model::Failure) {
+        let toast = adw::Toast::builder()
+            .title(&f.title)
+            .use_markup(false)
+            .build();
+        if let Some(details) = f.details.clone() {
+            toast.set_button_label(Some("Details"));
+            let (window, heading) = (self.window.downgrade(), f.title.clone());
+            toast.connect_button_clicked(move |_| {
+                let dialog = adw::AlertDialog::builder()
+                    .heading(&heading)
+                    .heading_use_markup(false)
+                    .body(&details)
+                    .body_use_markup(false)
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.present(window.upgrade().as_ref());
+            });
+        }
+        self.toasts.add_toast(toast);
+    }
+
     fn page(self: &Rc<Self>, page: &Onboarding) -> gtk::Widget {
         // Descriptions are Pango markup: only fixed text goes there. Anything
         // else goes into plain labels or rows with markup off.

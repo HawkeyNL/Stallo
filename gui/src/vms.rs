@@ -51,8 +51,49 @@ struct Row {
     name: String,
     row: gtk::ListBoxRow,
     state: gtk::Label,
-    control: gtk::Image,
+    /// Shown while an agent may control the VM.
+    agent: gtk::Label,
+    working: Progress,
     shown: RefCell<Option<model::RowVm>>,
+}
+
+/// A spinner with a caption, for an action that runs.
+struct Progress {
+    root: gtk::Box,
+    spinner: adw::Spinner,
+    label: gtk::Label,
+}
+
+impl Progress {
+    fn new() -> Self {
+        let spinner = adw::Spinner::new();
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let root = gtk::Box::builder()
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        root.append(&spinner);
+        root.append(&label);
+        Self {
+            root,
+            spinner,
+            label,
+        }
+    }
+
+    /// Shows `text` with the spinner, or hides both.
+    fn show(&self, text: Option<&str>) {
+        self.root.set_visible(text.is_some());
+        if let Some(text) = text {
+            self.label.set_label(text);
+            name_spinner(&self.spinner, text);
+        }
+    }
 }
 
 /// The content pane for one VM: the Overview and Snapshots tabs.
@@ -62,9 +103,10 @@ struct Detail {
     page: adw::NavigationPage,
     /// In [`Op::ALL`] order.
     actions: Vec<gio::SimpleAction>,
-    resume: gtk::Button,
+    /// The header shows one of these, for the VM's state.
+    start: gtk::Button,
     stop: adw::SplitButton,
-    force_off: gtk::Button,
+    resume: adw::SplitButton,
     /// Shown while an action on this VM runs.
     busy: adw::Spinner,
     values: Vec<adw::ActionRow>,
@@ -72,6 +114,9 @@ struct Detail {
     poll: RefCell<Poll>,
     tabs: adw::ViewStack,
     take: gtk::Button,
+    snaps_group: adw::PreferencesGroup,
+    /// First on the timeline while a snapshot is taken.
+    taking: adw::ActionRow,
     /// A spinner until the first snapshot list, then the timeline.
     snaps_view: gtk::Stack,
     timeline: gtk::ListBox,
@@ -87,15 +132,16 @@ struct Detail {
 struct SnapWidgets {
     tag: String,
     row: adw::ActionRow,
-    chip: gtk::Label,
     restore: gtk::Button,
     delete: gtk::Button,
+    /// In place of the buttons while it is restored or deleted.
+    working: Progress,
 }
 
 /// The name of the Snapshots tab in [`Detail::tabs`].
 const SNAPSHOTS: &str = "snapshots";
 /// Under the name of a new snapshot.
-const NAME_HINT: &str = "Optional. Without a name it is called snap1, snap2 and so on.";
+const NAME_HINT: &str = "Leave it empty to let Stallo pick a name.";
 
 impl Vms {
     pub fn new(ui: &Rc<Ui>, socket: PathBuf) -> Rc<Self> {
@@ -332,10 +378,11 @@ impl Vms {
                         if detail.snaps_view.visible_child_name().as_deref() == Some("loading") =>
                     {
                         detail.snaps_view.set_visible_child_name("failed");
-                        v.ui.toast(&format!(
-                            "Could not list the snapshots of {}: {e}",
+                        let title = format!(
+                            "Could not list the snapshots of {}",
                             stallo::printable(&detail.name, 64)
-                        ))
+                        );
+                        v.ui.fail(&model::failure(title, &e));
                     }
                     _ => {}
                 }
@@ -373,9 +420,7 @@ impl Vms {
         if !same {
             self.rebuild(&vms);
         }
-        for (r, vm) in self.rows.borrow().iter().zip(&vms) {
-            r.update(model::row(vm));
-        }
+        self.refresh_rows();
         let detail = self.detail.borrow().clone();
         if let Some(d) = detail {
             if self.vm(&d.name).is_some() {
@@ -423,11 +468,19 @@ impl Vms {
         self.tick();
     }
 
+    /// Updates the sidebar rows from what is known now.
+    fn refresh_rows(&self) {
+        let pending = self.pending.borrow();
+        for (r, vm) in self.rows.borrow().iter().zip(self.vms.borrow().iter()) {
+            r.update(model::row(vm, pending.action(&vm.name)));
+        }
+    }
+
     /// Updates the open VM's page from what is known now.
     fn refresh(&self, detail: &Detail) {
         if let Some(vm) = self.vm(&detail.name) {
-            let busy = self.pending.borrow().blocks(&detail.name);
-            detail.update(&vm, self.online.get(), busy);
+            let working = self.pending.borrow().action(&detail.name).cloned();
+            detail.update(&vm, self.online.get(), working.as_ref());
         }
     }
 
@@ -506,6 +559,7 @@ impl Vms {
         let snaps = detail.snaps.borrow().clone();
         let entry = adw::EntryRow::builder()
             .title("Name")
+            .text(model::suggested_name(snaps.as_deref()))
             .activates_default(true)
             .build();
         let names = gtk::ListBox::builder()
@@ -550,31 +604,39 @@ impl Vms {
             match checked {
                 Ok(_) => {
                     e.remove_css_class("error");
+                    hint.remove_css_class("error");
+                    hint.add_css_class("dim-label");
                     hint.set_label(NAME_HINT);
                 }
                 Err(why) => {
                     e.add_css_class("error");
+                    hint.remove_css_class("dim-label");
+                    hint.add_css_class("error");
                     hint.set_label(&why);
                 }
             }
         });
-        let (v, name) = (Rc::downgrade(self), name.to_owned());
+        let (v, name, typed) = (Rc::downgrade(self), name.to_owned(), entry.clone());
         dialog.connect_response(Some("take"), move |_, _| {
             if let (Some(v), Ok(tag)) = (
                 v.upgrade(),
-                model::snapshot_name(&entry.text(), snaps.as_deref()),
+                model::snapshot_name(&typed.text(), snaps.as_deref()),
             ) {
                 v.run(Action::Take(tag), &name);
             }
         });
         dialog.present(Some(&self.root));
+        // The suggested name is selected: typing replaces it.
+        entry.grab_focus();
+        entry.select_region(0, -1);
     }
 
     /// Runs an action; one per VM at a time.
     fn run(self: &Rc<Self>, action: Action, name: &str) {
-        if !self.online.get() || !self.pending.borrow_mut().start(name) {
+        if !self.online.get() || !self.pending.borrow_mut().start(name, &action) {
             return;
         }
+        self.refresh_rows();
         self.refresh_open();
         let (v, socket, name) = (self.clone(), self.socket.clone(), name.to_owned());
         glib::spawn_future_local(async move {
@@ -589,7 +651,7 @@ impl Vms {
                         v.ui.toast(&text);
                     }
                 }
-                Ok(Err(e)) => v.ui.toast(&action.failed(&name, &e)),
+                Ok(Err(e)) => v.ui.fail(&action.failed(&name, &e)),
                 Err(_) => {}
             }
             v.refresh_open();
@@ -641,21 +703,35 @@ impl Row {
             .valign(gtk::Align::Center)
             .css_classes(["caption", "state-pill"])
             .build();
-        let control = gtk::Image::new();
-        let line = gtk::Box::builder()
-            .spacing(8)
+        // Text, not an icon: someone else may drive this VM.
+        let agent = gtk::Label::builder()
+            .label("Agent")
+            .tooltip_text("Agent control on")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .css_classes(["caption", "state-pill", "warning"])
+            .build();
+        agent.update_property(&[gtk::accessible::Property::Label("Agent control on")]);
+        let line = gtk::Box::builder().spacing(8).build();
+        line.append(&label);
+        line.append(&state);
+        line.append(&agent);
+        let working = Progress::new();
+        let lines = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
             .margin_top(6)
             .margin_bottom(6)
             .build();
-        line.append(&label);
-        line.append(&state);
-        line.append(&control);
-        let row = gtk::ListBoxRow::builder().child(&line).build();
+        lines.append(&line);
+        lines.append(&working.root);
+        let row = gtk::ListBoxRow::builder().child(&lines).build();
         Self {
             name: name.to_owned(),
             row,
             state,
-            control,
+            agent,
+            working,
             shown: RefCell::default(),
         }
     }
@@ -671,13 +747,11 @@ impl Row {
             self.state.add_css_class(tone);
         }
         self.state.set_label(&r.state);
-        self.control.set_icon_name(Some(r.control_icon));
-        self.control.set_tooltip_text(Some(r.control_tip));
-        self.control
-            .update_property(&[gtk::accessible::Property::Label(r.control_tip)]);
-        let label = format!("{}, {}, {}", r.name, r.state, r.control_tip);
+        self.state.set_tooltip_text(Some(&r.raw));
+        self.agent.set_visible(r.agent);
+        self.working.show(r.working);
         self.row
-            .update_property(&[gtk::accessible::Property::Label(&label)]);
+            .update_property(&[gtk::accessible::Property::Label(&r.label())]);
         *self.shown.borrow_mut() = Some(r);
     }
 }
@@ -699,9 +773,12 @@ impl Detail {
                 a
             })
             .collect();
+        // One of these shows at a time; the risky ones sit in a menu.
         let start = gtk::Button::builder()
             .label("Start")
             .action_name("vm.start")
+            .css_classes(["suggested-action"])
+            .visible(false)
             .build();
         let menu = gio::Menu::new();
         menu.append(Some("Force Off"), Some("vm.force-off"));
@@ -711,29 +788,23 @@ impl Detail {
             .action_name("vm.stop")
             .menu_model(&menu)
             .dropdown_tooltip("More Ways to Stop")
+            .visible(false)
             .build();
-        // For a VM that does not run, in place of Stop.
-        let resume = gtk::Button::builder()
+        // For a VM that does not run: Stop could not shut it down cleanly.
+        let menu = gio::Menu::new();
+        menu.append(Some("Force Off"), Some("vm.force-off"));
+        let resume = adw::SplitButton::builder()
             .label("Resume")
             .action_name("vm.resume")
+            .menu_model(&menu)
+            .dropdown_tooltip("More Ways to Stop")
             .css_classes(["suggested-action"])
             .visible(false)
             .build();
-        let force_off = gtk::Button::builder()
-            .label("Force Off")
-            .action_name("vm.force-off")
-            .tooltip_text("The VM does not run, so it cannot shut down cleanly")
-            .css_classes(["destructive-action"])
-            .visible(false)
-            .build();
-        let busy = adw::Spinner::builder()
-            .tooltip_text("Working")
-            .visible(false)
-            .build();
+        let busy = adw::Spinner::builder().visible(false).build();
         let header = adw::HeaderBar::new();
-        header.pack_end(&stop);
-        header.pack_end(&force_off);
         header.pack_end(&start);
+        header.pack_end(&stop);
         header.pack_end(&resume);
         header.pack_end(&busy);
 
@@ -768,6 +839,14 @@ impl Detail {
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .build();
+        let taking_spinner = adw::Spinner::new();
+        let taking = adw::ActionRow::builder()
+            .title(Action::Take(None).progress())
+            .visible(false)
+            .build();
+        name_spinner(&taking_spinner, Action::Take(None).progress());
+        taking.add_prefix(&taking_spinner);
+        timeline.append(&taking);
         timeline.set_placeholder(Some(
             &gtk::Label::builder()
                 .label("No snapshots yet")
@@ -789,12 +868,8 @@ impl Detail {
                 .build(),
             Some("failed"),
         );
-        // Fixed text only: descriptions are markup.
         let snaps_group = adw::PreferencesGroup::builder()
-            .title("Timeline")
-            .description(
-                "Newest first. A snapshot saves the disk, and the memory unless the VM is stopped.",
-            )
+            .title("Snapshots")
             .header_suffix(&take)
             .build();
         snaps_group.add(&snaps_view);
@@ -809,13 +884,15 @@ impl Detail {
             "Snapshots",
             "camera-photo-symbolic",
         );
-        // Tabs in the header bar, or at the bottom when narrow.
+        // Tabs in the header bar, or at the bottom with the VM's name in
+        // the header when this pane (not the window) is narrow.
         let switcher = adw::ViewSwitcher::builder()
             .stack(&tabs)
             .policy(adw::ViewSwitcherPolicy::Wide)
             .build();
         let title = gtk::Label::builder()
             .label(stallo::printable(&vm.name, 64))
+            .visible(false)
             .css_classes(["title"])
             .build();
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -824,21 +901,20 @@ impl Detail {
         titles.append(&title);
         header.set_title_widget(Some(&titles));
         let bar = adw::ViewSwitcherBar::builder().stack(&tabs).build();
-        vms.split
-            .bind_property("collapsed", &switcher, "visible")
-            .invert_boolean()
-            .sync_create()
-            .build();
-        vms.split
-            .bind_property("collapsed", &title, "visible")
-            .sync_create()
-            .build();
-        vms.split
-            .bind_property("collapsed", &bar, "reveal")
-            .sync_create()
-            .build();
         let view = toolbar(&header, &tabs);
         view.add_bottom_bar(&bar);
+        let pane = adw::BreakpointBin::builder()
+            .width_request(360)
+            .height_request(294)
+            .child(&view)
+            .build();
+        let narrow = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 550sp").expect("a valid condition"),
+        );
+        narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
+        narrow.add_setter(&title, "visible", Some(&true.to_value()));
+        narrow.add_setter(&bar, "reveal", Some(&true.to_value()));
+        pane.add_breakpoint(narrow);
         let v = Rc::downgrade(vms);
         tabs.connect_visible_child_name_notify(move |_| {
             if let Some(v) = v.upgrade() {
@@ -848,7 +924,7 @@ impl Detail {
 
         let page = adw::NavigationPage::builder()
             .title(stallo::printable(&vm.name, 64))
-            .child(&view)
+            .child(&pane)
             .build();
         page.insert_action_group("vm", Some(&group));
         Rc::new(Self {
@@ -856,15 +932,17 @@ impl Detail {
             vms: Rc::downgrade(vms),
             page,
             actions,
-            resume,
+            start,
             stop,
-            force_off,
+            resume,
             busy,
             values,
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
             tabs,
             take,
+            snaps_group,
+            taking,
             snaps_view,
             timeline,
             snap_rows: RefCell::default(),
@@ -874,18 +952,22 @@ impl Detail {
         })
     }
 
-    /// Shows `vm` as it is now. No actions while offline or `busy` (an
-    /// action on it runs or just ran).
-    fn update(&self, vm: &VmInfo, online: bool, busy: bool) {
-        let blocked = !online || busy;
+    /// Shows `vm` as it is now. No actions while offline or while an
+    /// action on it runs or just ran (`working`).
+    fn update(&self, vm: &VmInfo, online: bool, working: Option<&Action>) {
+        let blocked = !online || working.is_some();
         let set = model::actions(vm, blocked);
         for (action, op) in self.actions.iter().zip(Op::ALL) {
             action.set_enabled(set.allows(op));
         }
-        self.resume.set_visible(set.halted);
-        self.force_off.set_visible(set.halted);
-        self.stop.set_visible(!set.halted);
-        self.busy.set_visible(busy);
+        self.start.set_visible(set.primary == Op::Start);
+        self.stop.set_visible(set.primary == Op::Stop);
+        self.resume.set_visible(set.primary == Op::Resume);
+        self.busy.set_visible(working.is_some());
+        if let Some(text) = working.map(Action::progress) {
+            self.busy.set_tooltip_text(Some(text));
+            name_spinner(&self.busy, text);
+        }
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {
@@ -897,21 +979,32 @@ impl Detail {
         let snaps = self.snaps.borrow();
         let full = model::take_block(snaps.as_deref());
         self.take.set_sensitive(!blocked && full.is_none());
-        self.take.set_tooltip_text(full.as_deref());
+        // Fixed text only: descriptions are markup.
+        self.snaps_group.set_description(full.as_deref());
+        self.taking
+            .set_visible(matches!(working, Some(Action::Take(_))));
         let Some(snaps) = snaps.as_ref() else {
             return;
         };
+        // The one thing to do on an empty timeline.
+        if snaps.is_empty() {
+            self.take.add_css_class("suggested-action");
+        } else {
+            self.take.remove_css_class("suggested-action");
+        }
         self.snaps_view.set_visible_child_name("list");
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let rows = model::timeline(vm, snaps, now);
+        let rows = model::timeline(vm, snaps, now, working);
         let same = {
             let shown = self.snap_rows.borrow();
             shown.len() == rows.len() && shown.iter().zip(&rows).all(|(w, r)| w.tag == r.tag)
         };
         if !same {
-            self.timeline.remove_all();
+            for w in self.snap_rows.borrow().iter() {
+                self.timeline.remove(&w.row);
+            }
             let widgets: Vec<SnapWidgets> = rows.iter().map(|r| self.snap_row(r)).collect();
             for w in &widgets {
                 self.timeline.append(&w.row);
@@ -922,11 +1015,12 @@ impl Detail {
             if w.row.subtitle().as_deref() != Some(r.subtitle.as_str()) {
                 w.row.set_subtitle(&r.subtitle);
             }
-            w.chip.set_visible(r.memory);
             w.restore
                 .set_sensitive(!blocked && r.restore_block.is_none());
-            w.restore.set_tooltip_text(r.restore_block);
             w.delete.set_sensitive(!blocked);
+            w.restore.set_visible(r.working.is_none());
+            w.delete.set_visible(r.working.is_none());
+            w.working.show(r.working);
         }
     }
 
@@ -935,14 +1029,10 @@ impl Detail {
             .title(&r.name)
             .use_markup(false)
             .build();
-        let chip = gtk::Label::builder()
-            .label("With memory")
-            .valign(gtk::Align::Center)
-            .css_classes(["caption", "state-pill", "accent"])
-            .build();
         let restore = gtk::Button::builder()
             .label("Restore")
             .valign(gtk::Align::Center)
+            .css_classes(["flat"])
             .build();
         let delete = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
@@ -960,7 +1050,8 @@ impl Detail {
             "Delete {}",
             r.name
         ))]);
-        row.add_suffix(&chip);
+        let working = Progress::new();
+        row.add_suffix(&working.root);
         row.add_suffix(&restore);
         row.add_suffix(&delete);
         let (v, name, tag) = (self.vms.clone(), self.name.clone(), r.tag.clone());
@@ -978,11 +1069,19 @@ impl Detail {
         SnapWidgets {
             tag: r.tag.clone(),
             row,
-            chip,
             restore,
             delete,
+            working,
         }
     }
+}
+
+/// What a screen reader says for a spinner. Through `Widget`: the binding
+/// does not mark `adw::Spinner` as `Accessible`.
+fn name_spinner(spinner: &adw::Spinner, text: &str) {
+    spinner
+        .upcast_ref::<gtk::Widget>()
+        .update_property(&[gtk::accessible::Property::Label(text)]);
 }
 
 fn toolbar(header: &adw::HeaderBar, content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
