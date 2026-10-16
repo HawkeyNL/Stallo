@@ -544,7 +544,8 @@ fn step(v: &Weak<Vms>, vm: &str, f: impl FnOnce(&mut Copies)) -> bool {
 fn finish(v: &Weak<Vms>, ui: &crate::Ui, vm: &str, t: &Transfer, end: Result<bool, CallError>) {
     if let Some(v) = v.upgrade() {
         v.copies.borrow_mut().finish(vm);
-        v.show_copy(vm);
+        // All of the page: a VM that stopped meanwhile shows its status.
+        v.refresh_open();
     }
     match end {
         Ok(true) => ui.toast(&t.done_text(vm)),
@@ -566,17 +567,23 @@ fn host_error(what: &str, path: &Path, e: io::Error) -> CallError {
     CallError::Failed(format!("cannot {what} {}: {e}", path.display()))
 }
 
-/// Opens a host file to upload, with its size. Regular files only, and
-/// checked before opening: a FIFO would block the open, a device never
-/// ends.
+/// Opens a host file to upload, with its size. Regular files only, as
+/// the open file says (no race with a path swapped meanwhile): a device
+/// never ends. Non-blocking, so opening a FIFO returns at once; reads of
+/// a regular file ignore the flag.
 fn open_upload(path: &Path) -> Result<(Arc<File>, u64), CallError> {
-    let meta = std::fs::metadata(path).map_err(|e| host_error("open", path, e))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+        .map_err(|e| host_error("open", path, e))?;
+    let meta = file.metadata().map_err(|e| host_error("open", path, e))?;
     if !meta.is_file() {
         return Err(CallError::Failed(
             "Only regular files can be uploaded.".to_owned(),
         ));
     }
-    let file = File::open(path).map_err(|e| host_error("open", path, e))?;
     Ok((Arc::new(file), meta.len()))
 }
 
@@ -665,7 +672,17 @@ mod tests {
         assert_eq!(read_chunk(&file).unwrap().len(), FILE_WRITE_CHUNK);
         assert_eq!(read_chunk(&file).unwrap().len(), 10);
         assert!(read_chunk(&file).unwrap().is_empty());
-        for not_regular in [dir.path(), Path::new("/dev/null")] {
+        // A FIFO with no writer: refused at once, not a hang in open().
+        let fifo = dir.path().join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        for not_regular in [dir.path(), Path::new("/dev/null"), &fifo] {
             assert_eq!(
                 open_upload(not_regular).err(),
                 Some(CallError::Failed(
