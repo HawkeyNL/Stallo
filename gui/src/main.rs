@@ -1,10 +1,12 @@
 //! stallo-gui: the desktop app for Stallo. It finds the daemon, walks the
 //! user through anything that stops it from connecting, and then lists the
-//! VMs, creates, starts and stops them, and takes and restores snapshots.
+//! VMs, creates, starts and stops them, shows their screens, and takes and
+//! restores snapshots.
 
 mod client;
 mod model;
 mod rfb;
+mod screen;
 mod vms;
 
 use std::cell::{Cell, RefCell};

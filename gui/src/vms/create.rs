@@ -435,18 +435,14 @@ impl Form {
         let name = model::vm_name(&text, &self.taken);
         match &name {
             // Nothing typed yet is no mistake; Create just waits.
-            Err(_) if text.is_empty() => {
-                self.name.remove_css_class("error");
-                self.hint.set_visible(false);
-            }
-            Ok(_) => {
-                self.name.remove_css_class("error");
-                self.hint.set_visible(false);
-            }
-            Err(why) => {
+            Err(why) if !text.is_empty() => {
                 self.name.add_css_class("error");
                 self.hint.set_label(why);
                 self.hint.set_visible(true);
+            }
+            _ => {
+                self.name.remove_css_class("error");
+                self.hint.set_visible(false);
             }
         }
         self.create.set_sensitive(name.is_ok() && full.is_none());

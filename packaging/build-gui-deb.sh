@@ -22,7 +22,7 @@ size=$(stat -c %s "$root/usr/bin/stallo-gui")
 echo "stallo-gui: $size bytes stripped (budget 15000000)"
 [ "$size" -le 15000000 ] || { echo "stallo-gui is over its 15 MB size budget" >&2 && exit 1; }
 
-depends="stallo (= $version), libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.7), libglib2.0-0t64, libgcc-s1, libc6"
+depends="stallo (= $version), libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.7), libglib2.0-0t64, libcairo2, libgraphene-1.0-0, libgcc-s1, libc6"
 # Every library the binary links must come from a package in Depends;
 # dpkg -S finds that package on the build system.
 dump=$(objdump -p "$root/usr/bin/stallo-gui")
@@ -44,7 +44,7 @@ Priority: optional
 Depends: $depends
 Description: Desktop app for Stallo (preview)
  A GNOME app for the VMs that stallod runs. This early preview lists
- the VMs, starts and stops them, takes and restores snapshots, and
- helps set up access to stallod.
+ the VMs, starts and stops them, shows their screens, takes and restores
+ snapshots, and helps set up access to stallod.
 CONTROL
 dpkg-deb --root-owner-group -Zxz --build "$root" "target/deb/stallo-gui_${version}_amd64.deb"
