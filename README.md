@@ -97,6 +97,19 @@ stallo images pull ubuntu-26.04
 
 What the package installs, and how to remove it: [docs/production.md](docs/production.md).
 
+To give a VM more (or fewer) CPUs or memory, stop it first; the new size is
+checked against the host like `stallo new` and applies from the next start:
+
+```sh
+stallo stop dev
+stallo set dev --cpus 4 --mem 4G
+stallo start dev
+```
+
+A VM with RAM snapshots keeps its size until they are deleted (a RAM
+snapshot only restores into a VM of the size it was taken at). Disks
+cannot be grown yet.
+
 ## How it fits together
 
 - `stallod` is the daemon. It is the only process that talks to QEMU (QMP),
@@ -206,7 +219,8 @@ Every push to `main` (channel `edge`) and every release tag (channel
 
 ## Viewing a VM's screen
 
-`stallo set <vm> --vnc on` gives the VM a VNC server from its next start,
+`stallo set <vm> --vnc on` gives the VM a VNC server from its next start
+(`stallo new <vm> --vnc` from its first),
 on a Unix socket only (never TCP): `<runtime>/vnc/<vm>/vnc.sock`, in
 production `/run/stallo/vnc/<vm>/vnc.sock`, for members of group
 `stallo`. From another machine, forward it over SSH. VNC has no password

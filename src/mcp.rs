@@ -436,6 +436,7 @@ impl Server {
             net: crate::config::NetProfile::Offline,
             forwards: vec![],
             wait: true,
+            vnc: false,
         };
         // First boot. (Agents never trigger an image download.)
         self.text(request, Duration::from_secs(1200)).await

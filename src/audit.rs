@@ -60,7 +60,7 @@ pub type Described<'a> = (
 pub fn describe(r: &Request) -> Described<'_> {
     let len = |s: &str| s.len() as u64;
     match r {
-        Request::New { name, .. } => ("new", Some(name), vec![], None),
+        Request::New { name, vnc, .. } => ("new", Some(name), vec![("vnc", u64::from(*vnc))], None),
         Request::List => ("list", None, vec![], None),
         Request::Start { name, .. } => ("start", Some(name), vec![], None),
         Request::Stop { name, .. } => ("stop", Some(name), vec![], None),
@@ -153,6 +153,20 @@ pub fn describe(r: &Request) -> Described<'_> {
         }
         Request::SetAgent { name, on } => ("agent", Some(name), vec![("on", u64::from(*on))], None),
         Request::SetVnc { name, on } => ("vnc", Some(name), vec![("on", u64::from(*on))], None),
+        // The requested values (0: unchanged); numbers, not content.
+        Request::SetResources {
+            name,
+            vcpus,
+            memory_mib,
+        } => (
+            "set_resources",
+            Some(name),
+            vec![
+                ("memory_mib", memory_mib.unwrap_or(0)),
+                ("vcpus", vcpus.map_or(0, u64::from)),
+            ],
+            None,
+        ),
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),
         Request::Pull { .. } => ("pull", None, vec![], None),
@@ -342,6 +356,30 @@ mod tests {
         fs::remove_file(&file).unwrap();
         std::os::unix::fs::symlink("/dev/null", &file).unwrap();
         assert!(open_at(dir.path(), "dev", 300).is_err());
+    }
+
+    #[test]
+    fn resources_and_vnc() {
+        let resize = Request::SetResources {
+            name: "dev".into(),
+            vcpus: Some(4),
+            memory_mib: None,
+        };
+        let (op, vm, args, argv0) = describe(&resize);
+        assert_eq!((op, vm, argv0), ("set_resources", Some("dev"), None));
+        assert_eq!(args, [("memory_mib", 0), ("vcpus", 4)]);
+        let new = Request::New {
+            name: "dev".into(),
+            image: "arch".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_gib: 10,
+            net: crate::config::NetProfile::Offline,
+            forwards: vec![],
+            wait: true,
+            vnc: true,
+        };
+        assert!(entry(&new).contains(r#""op":"new","args":{"vnc":1}"#));
     }
 
     /// `pull` and `image_rm` name their image; invalid ids are left out.

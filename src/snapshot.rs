@@ -576,7 +576,7 @@ impl Manager {
     }
 
     /// The VM's snapshots with their RAM sizes (lifecycle lock held).
-    async fn list_snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
+    pub(crate) async fn list_snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
         let vm_dir = self.paths.vm_dir(name);
         let list = match self.running(name) {
             Some(vm) => list_live(&vm.qmp).await?.0,

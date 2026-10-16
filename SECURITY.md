@@ -82,8 +82,10 @@ Agents reach Stallo through `stallo mcp`, which marks its requests
 `via: mcp`. The daemon then refuses every tool on a VM whose agent
 control is off (the default; `stallo agent <vm> on` turns it on), refuses
 VM creation unless `agents_can_create = true` in `stallod.toml`, and
-never lets agents delete VMs, pull or delete images, resume VMs or change
-agent control. Agents create VMs only from images a human has already pulled
+never lets agents delete VMs, pull or delete images, resume VMs, change
+agent control, turn VNC on (also not through `new`) or change a VM's CPUs
+and memory: agent control of a small VM must not let an agent claim the
+host's CPU and memory budget. Agents create VMs only from images a human has already pulled
 (`stallo images pull <id>`). Turning agent control off stops new agent
 calls; calls already running (an `exec` can run up to an hour) finish
 first.
