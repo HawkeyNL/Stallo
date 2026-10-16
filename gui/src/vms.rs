@@ -1,7 +1,7 @@
 //! The connected window: the VM list with the host meter, and a VM's
-//! overview with its lifecycle actions and its snapshots. All text from
-//! the daemon goes through the view-model (`stallo::printable`) into plain
-//! labels.
+//! overview with its lifecycle actions, its screen and its snapshots. All
+//! text from the daemon goes through the view-model (`stallo::printable`)
+//! into plain labels.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -17,6 +17,7 @@ use stallo::snapshot::Snapshot;
 use crate::Ui;
 use crate::client;
 use crate::model::{self, Action, Op, Pending, Poll};
+use crate::screen::Screen;
 
 /// The pill around a VM's state in the sidebar.
 pub const CSS: &str = ".state-pill { border-radius: 999px; padding: 1px 8px; background-color: alpha(currentColor, 0.12); }";
@@ -96,7 +97,7 @@ impl Progress {
     }
 }
 
-/// The content pane for one VM: the Overview and Snapshots tabs.
+/// The content pane for one VM: the Overview, Screen and Snapshots tabs.
 struct Detail {
     name: String,
     vms: Weak<Vms>,
@@ -110,9 +111,12 @@ struct Detail {
     /// Shown while an action on this VM runs.
     busy: adw::Spinner,
     values: Vec<adw::ActionRow>,
+    /// VNC on or off from the next start.
+    live_screen: adw::SwitchRow,
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
     tabs: adw::ViewStack,
+    screen: Rc<Screen>,
     take: gtk::Button,
     snaps_group: adw::PreferencesGroup,
     /// First on the timeline while a snapshot is taken.
@@ -138,7 +142,8 @@ struct SnapWidgets {
     working: Progress,
 }
 
-/// The name of the Snapshots tab in [`Detail::tabs`].
+/// Names of tabs in [`Detail::tabs`].
+const SCREEN: &str = "screen";
 const SNAPSHOTS: &str = "snapshots";
 
 impl Vms {
@@ -300,6 +305,10 @@ impl Vms {
             self.tick();
         } else if let Some(t) = timer.take_if(|_| !on) {
             t.remove();
+            drop(timer);
+            if let Some(d) = self.detail.borrow().as_ref() {
+                d.screen.set_wanted(false);
+            }
         }
     }
 
@@ -346,10 +355,14 @@ impl Vms {
             return;
         };
         let visible = !self.split.is_collapsed() || self.split.shows_content();
+        let tab = detail.tabs.visible_child_name();
+        detail
+            .screen
+            .set_wanted(visible && tab.as_deref() == Some(SCREEN));
         // Not while an action on the VM runs: the daemon would make the
         // list wait for it. The action asks again when it is done.
         if visible
-            && detail.tabs.visible_child_name().as_deref() == Some(SNAPSHOTS)
+            && tab.as_deref() == Some(SNAPSHOTS)
             && !self.pending.borrow().blocks(&detail.name)
             && !model::snaps_wait(detail.snaps_stuck.borrow().as_ref(), &vm.state, now)
             && detail.snaps_poll.borrow_mut().due(now)
@@ -386,7 +399,17 @@ impl Vms {
                 }
             });
         }
-        let have = detail.details.borrow().is_some();
+        // Started or stopped since the last `info`: ask again now (the
+        // Screen tab waits for the socket in it).
+        let seen = detail
+            .details
+            .borrow()
+            .as_ref()
+            .map(|d| model::kind(&d.vm.state));
+        let have = seen == Some(model::kind(&vm.state));
+        if seen.is_some() && !have {
+            detail.poll.borrow_mut().soon();
+        }
         if model::wants_info(visible, model::kind(&vm.state), have)
             && detail.poll.borrow_mut().due(now)
         {
@@ -489,7 +512,7 @@ impl Vms {
     }
 
     /// Runs a lifecycle action, after a confirmation if it may lose data.
-    fn ask(self: &Rc<Self>, op: Op, name: &str) {
+    pub(crate) fn ask(self: &Rc<Self>, op: Op, name: &str) {
         let Some(vm) = self.vm(name) else {
             return;
         };
@@ -527,7 +550,7 @@ impl Vms {
     }
 
     /// Asks before `action`, with Cancel as the default.
-    fn confirm(self: &Rc<Self>, c: &model::Confirm, action: Action, name: &str) {
+    pub(crate) fn confirm(self: &Rc<Self>, c: &model::Confirm, action: Action, name: &str) {
         let dialog = adw::AlertDialog::builder()
             .heading(&c.heading)
             .heading_use_markup(false)
@@ -627,7 +650,7 @@ impl Vms {
     }
 
     /// Runs an action; one per VM at a time.
-    fn run(self: &Rc<Self>, action: Action, name: &str) {
+    pub(crate) fn run(self: &Rc<Self>, action: Action, name: &str) {
         if !self.online.get() || !self.pending.borrow_mut().start(name, &action) {
             return;
         }
@@ -646,7 +669,7 @@ impl Vms {
                         v.ui.toast(&text);
                     }
                 }
-                Ok(Err(e)) => v.ui.fail(&action.failed(&name, &e)),
+                Ok(Err((step, e))) => v.ui.fail(&action.failed_at(step).failed(&name, &e)),
                 Err(_) => {}
             }
             v.refresh_open();
@@ -661,6 +684,55 @@ impl Vms {
             }
             v.tick();
         });
+    }
+
+    /// The Overview switch moved: off at once, on after the risk is
+    /// spelled out. A move that matches the VM (an update) does nothing.
+    fn switch_live_screen(self: &Rc<Self>, row: &adw::SwitchRow, name: &str) {
+        let on = row.is_active();
+        let Some(vm) = self.vm(name).filter(|vm| vm.vnc != on) else {
+            return;
+        };
+        if !on {
+            return self.run(Action::LiveScreen(false), name);
+        }
+        let c = model::confirm_live_screen_switch(&vm);
+        let dialog = adw::AlertDialog::builder()
+            .heading(&c.heading)
+            .heading_use_markup(false)
+            .body(&c.body)
+            .body_use_markup(false)
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("confirm", c.button);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let (v, name, row) = (Rc::downgrade(self), name.to_owned(), row.downgrade());
+        dialog.connect_response(None, move |_, response| match response {
+            "confirm" => {
+                if let Some(v) = v.upgrade() {
+                    v.run(Action::LiveScreen(true), &name);
+                }
+            }
+            // Back to what the VM has now: it may have been turned on
+            // elsewhere meanwhile.
+            _ => {
+                if let (Some(v), Some(row)) = (v.upgrade(), row.upgrade())
+                    && let Some(on) = v.vm(&name).map(|vm| vm.vnc)
+                {
+                    row.set_active(on);
+                }
+            }
+        });
+        dialog.present(Some(&self.root));
+    }
+
+    /// Fresh VM list and details at the next tick.
+    pub(crate) fn poll_soon(self: &Rc<Self>) {
+        self.list_poll.borrow_mut().soon();
+        if let Some(d) = self.detail.borrow().as_ref() {
+            d.poll.borrow_mut().soon();
+        }
     }
 
     /// The Snapshots tab may have come into view: fresh data now.
@@ -819,6 +891,24 @@ impl Detail {
             overview.add(&group);
         }
 
+        let live_screen = adw::SwitchRow::builder()
+            .title("Live Screen")
+            .subtitle(
+                "Shows the VM's screen in the Screen tab. Changes take effect at the next start.",
+            )
+            .use_markup(false)
+            .active(vm.vnc)
+            .build();
+        let (v, name) = (Rc::downgrade(vms), vm.name.clone());
+        live_screen.connect_active_notify(move |row| {
+            if let Some(v) = v.upgrade() {
+                v.switch_live_screen(row, &name);
+            }
+        });
+        let screen_group = adw::PreferencesGroup::builder().title("Screen").build();
+        screen_group.add(&live_screen);
+        overview.add(&screen_group);
+
         let take = gtk::Button::builder()
             .label("Take Snapshot")
             .valign(gtk::Align::Center)
@@ -870,8 +960,15 @@ impl Detail {
         let snapshots = adw::PreferencesPage::new();
         snapshots.add(&snaps_group);
 
+        let screen = Screen::new(vm, vms);
         let tabs = adw::ViewStack::new();
         tabs.add_titled_with_icon(&overview, Some("overview"), "Overview", "computer-symbolic");
+        tabs.add_titled_with_icon(
+            &screen.root,
+            Some(SCREEN),
+            "Screen",
+            "video-display-symbolic",
+        );
         tabs.add_titled_with_icon(
             &snapshots,
             Some(SNAPSHOTS),
@@ -931,9 +1028,11 @@ impl Detail {
             resume,
             busy,
             values,
+            live_screen,
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
             tabs,
+            screen,
             take,
             snaps_group,
             taking,
@@ -966,6 +1065,13 @@ impl Detail {
         if let Some(text) = working.map(Action::progress) {
             self.busy.set_tooltip_text(Some(text));
             name_spinner(&self.busy, text);
+        }
+        self.screen
+            .update(vm, self.details.borrow().as_ref(), blocked);
+        // Not while an action runs: it may be this switch's own.
+        self.live_screen.set_sensitive(!blocked);
+        if !blocked {
+            self.live_screen.set_active(vm.vnc);
         }
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
