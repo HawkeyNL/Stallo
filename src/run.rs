@@ -368,6 +368,7 @@ mod tests {
             forwards: vec![],
             agent_control: true,
             may_pull: false,
+            vnc: false,
         };
         let err = m.create(&new).await.unwrap_err();
         assert!(
@@ -392,6 +393,7 @@ mod tests {
             forwards: vec![],
             agent_control: false,
             may_pull: true,
+            vnc: false,
         };
         let err = m.create(&new).await.unwrap_err();
         assert!(err.to_string().contains("kept for `stallo run`"), "{err}");
@@ -428,6 +430,7 @@ mod tests {
                 forwards: vec![],
                 agent_control: false,
                 may_pull: true,
+                vnc: false,
             };
             let err = m.create(&new).await.unwrap_err();
             assert_eq!(err.to_string(), why);
@@ -459,6 +462,7 @@ mod tests {
             forwards: vec![],
             agent_control: false,
             may_pull: true,
+            vnc: false,
         };
         let err = m.create(&new).await.unwrap_err();
         assert!(err.to_string().contains(why), "{err}");

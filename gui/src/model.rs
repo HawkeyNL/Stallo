@@ -1335,6 +1335,7 @@ impl NewVm {
             },
             forwards: vec![],
             wait: true,
+            vnc: false,
         }
     }
 

@@ -56,6 +56,9 @@ enum Cmd {
         /// Return once QEMU runs, without waiting for the guest agent.
         #[arg(long)]
         no_wait: bool,
+        /// Start with a VNC server (as `stallo set <vm> --vnc on`).
+        #[arg(long)]
+        vnc: bool,
     },
     /// List VMs.
     Ls,
@@ -130,13 +133,20 @@ enum Cmd {
         #[arg(value_enum)]
         state: OnOff,
     },
-    /// Change a VM setting; it applies from the VM's next start.
+    /// Change VM settings; they apply from the VM's next start.
+    #[command(group(clap::ArgGroup::new("change").required(true).multiple(true)))]
     Set {
         vm: String,
         /// A VNC server on a Unix socket for humans (never TCP); reach it
         /// with `ssh -L 5901:<socket> <host>`.
-        #[arg(long, value_enum)]
-        vnc: OnOff,
+        #[arg(long, value_enum, group = "change")]
+        vnc: Option<OnOff>,
+        /// vCPUs (the VM must be stopped).
+        #[arg(long, group = "change")]
+        cpus: Option<u32>,
+        /// Memory, e.g. 4G or 1536M (the VM must be stopped).
+        #[arg(long, value_parser = parse_mib, group = "change")]
+        mem: Option<u64>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
@@ -273,6 +283,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             forwards,
             bind,
             no_wait,
+            vnc,
         } => {
             let net = match net {
                 Net::Offline => NetProfile::Offline,
@@ -291,6 +302,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 net,
                 forwards,
                 wait: !no_wait,
+                vnc,
             })
             .await?;
             if json {
@@ -444,25 +456,52 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{vm}  {}", restored_line(&r));
             }
         }
-        Cmd::Set { vm, vnc } => {
-            let on = matches!(vnc, OnOff::On);
-            let v = call(Request::SetVnc {
-                name: vm.clone(),
-                on,
-            })
-            .await?;
-            if json {
-                print_json(&v);
-            } else {
-                let when = if v["running"] == true {
-                    " from the next start"
-                } else {
-                    ""
-                };
-                println!("{vm}  vnc {}{when}", if on { "on" } else { "off" });
-                if let Some(sock) = v["socket"].as_str() {
-                    println!("socket: {sock}");
+        Cmd::Set { vm, vnc, cpus, mem } => {
+            // First, so a running VM is refused before VNC changes.
+            let resources = if cpus.is_some() || mem.is_some() {
+                let v = call(Request::SetResources {
+                    name: vm.clone(),
+                    vcpus: cpus,
+                    memory_mib: mem,
+                })
+                .await?;
+                if !json {
+                    let info: VmInfo = serde_json::from_value(v.clone())?;
+                    println!("{vm}  {}", summary(&info));
                 }
+                Some(v)
+            } else {
+                None
+            };
+            let mut vnc_result = None;
+            if let Some(vnc) = vnc {
+                let on = matches!(vnc, OnOff::On);
+                let v = call(Request::SetVnc {
+                    name: vm.clone(),
+                    on,
+                })
+                .await
+                .map_err(|e| match resources {
+                    Some(_) => e.context(format!(
+                        "the CPU/memory change of {vm} was applied, VNC was not"
+                    )),
+                    None => e,
+                })?;
+                if !json {
+                    let when = if v["running"] == true {
+                        " from the next start"
+                    } else {
+                        ""
+                    };
+                    println!("{vm}  vnc {}{when}", if on { "on" } else { "off" });
+                    if let Some(sock) = v["socket"].as_str() {
+                        println!("socket: {sock}");
+                    }
+                }
+                vnc_result = Some(v);
+            }
+            if json {
+                print_json(&serde_json::json!({"resources": resources, "vnc": vnc_result}));
             }
         }
         Cmd::Agent { vm, state } => {
@@ -1227,5 +1266,33 @@ mod tests {
         Cli::command().debug_assert();
         let c = Cli::try_parse_from(["stallo", "exec", "dev", "--", "uname", "-a"]).unwrap();
         assert!(matches!(c.command, Cmd::Exec { ref argv, .. } if argv == &["uname", "-a"]));
+        let set = |a: &[&str]| Cli::try_parse_from([&["stallo", "set", "dev"], a].concat());
+        let c = set(&["--cpus", "4", "--mem", "4G"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                vnc: None,
+                cpus: Some(4),
+                mem: Some(4096),
+                ..
+            }
+        ));
+        let c = set(&["--vnc", "on"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                vnc: Some(OnOff::On),
+                cpus: None,
+                mem: None,
+                ..
+            }
+        ));
+        assert!(set(&["--mem", "1G", "--vnc", "off"]).is_ok());
+        assert!(set(&[]).is_err(), "at least one setting");
+        assert!(set(&["--mem", "2T"]).is_err());
+        let c = Cli::try_parse_from(["stallo", "new", "dev", "--vnc"]).unwrap();
+        assert!(matches!(c.command, Cmd::New { vnc: true, .. }));
+        let c = Cli::try_parse_from(["stallo", "new", "dev"]).unwrap();
+        assert!(matches!(c.command, Cmd::New { vnc: false, .. }));
     }
 }

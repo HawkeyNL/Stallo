@@ -52,6 +52,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         forwards: Vec<PortForward>,
         wait: bool,
+        /// A VNC socket from the first start (humans only, as `SetVnc`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vnc: bool,
     },
     List,
     Start {
@@ -186,6 +189,12 @@ pub enum Request {
     SetVnc {
         name: String,
         on: bool,
+    },
+    /// Changes a stopped VM's vCPUs and/or memory (humans only).
+    SetResources {
+        name: String,
+        vcpus: Option<u32>,
+        memory_mib: Option<u64>,
     },
     Host,
     Images,
@@ -346,6 +355,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
     use Request::*;
     match r {
         List | Host | Images => Gate::Open,
+        // VNC input bypasses agent control and the audit log (as SetVnc).
+        New { vnc: true, .. } => Gate::Closed,
         New { .. } => Gate::Create,
         Rm { .. }
         | Pull { .. }
@@ -353,6 +364,9 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | Resume { .. }
         | SetAgent { .. }
         | SetVnc { .. }
+        // Growing a VM takes host CPU and memory budget that a human sized;
+        // agent control of a small VM must not let an agent claim the host.
+        | SetResources { .. }
         | SnapshotDelete { .. } => Gate::Closed,
         Start { name, .. }
         | Stop { name, .. }
@@ -488,6 +502,17 @@ mod tests {
         // serde cannot reject extra keys on argument-less ops; they are ignored.
         let list = r#"{"via":"mcp","request":{"op":"list"}}"#;
         assert!(serde_json::from_str::<Envelope>(list).is_ok());
+        // `vnc` is left out when off (older daemons refuse unknown keys)
+        // and defaults to off.
+        let new = r#"{"op":"new","name":"a","image":"arch","vcpus":1,"memory_mib":512,"disk_gib":10,"net":"offline","wait":true}"#;
+        let r: Request = serde_json::from_str(new).unwrap();
+        assert!(matches!(r, Request::New { vnc: false, .. }));
+        assert_eq!(serde_json::to_string(&r).unwrap(), new);
+        let r: Request = serde_json::from_str(&new.replace('}', r#","vnc":true}"#)).unwrap();
+        assert!(matches!(r, Request::New { vnc: true, .. }));
+        let resize = r#"{"op":"set_resources","name":"dev","vcpus":4,"memory_mib":null}"#;
+        let r: Request = serde_json::from_str(resize).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), resize);
         for bad in [
             r#"{"via":"cli","request":{"op":"stop","name":"dev","force":false,"x":1}}"#,
             r#"{"via":"root","request":{"op":"list"}}"#,
@@ -530,6 +555,14 @@ mod tests {
             agent_gate(&Request::SetVnc {
                 name: name(),
                 on: true
+            }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::SetResources {
+                name: name(),
+                vcpus: None,
+                memory_mib: Some(4096)
             }),
             Gate::Closed
         );
@@ -580,6 +613,7 @@ mod tests {
             net: NetProfile::Offline,
             forwards: vec![],
             wait: true,
+            vnc: false,
         };
         let on = |_: &str| Ok(true);
         let off = |_: &str| Ok(false);
@@ -593,6 +627,20 @@ mod tests {
         assert!(check_agent(Via::Mcp, &new, true, off).is_ok());
         assert!(err(Via::Mcp, &new, false, on).contains("agents_can_create"));
         assert!(check_agent(Via::Cli, &new, false, off).is_ok());
+        // VNC at create is for humans only, even where agents may create.
+        let mut new_vnc = new.clone();
+        if let Request::New { vnc, .. } = &mut new_vnc {
+            *vnc = true;
+        }
+        assert!(err(Via::Mcp, &new_vnc, true, on).contains("only available to humans"));
+        assert!(check_agent(Via::Cli, &new_vnc, false, off).is_ok());
+        let resize = Request::SetResources {
+            name: "dev".into(),
+            vcpus: Some(4),
+            memory_mib: None,
+        };
+        assert!(err(Via::Mcp, &resize, true, on).contains("only available to humans"));
+        assert!(check_agent(Via::Cli, &resize, false, off).is_ok());
         let closed = Request::SetAgent {
             name: "dev".into(),
             on: true,

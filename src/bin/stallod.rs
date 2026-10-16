@@ -354,6 +354,7 @@ async fn dispatch(
             net,
             forwards,
             wait,
+            vnc,
         } => {
             let new = NewVm {
                 name: name.clone(),
@@ -366,6 +367,8 @@ async fn dispatch(
                 agent_control: via == Via::Mcp,
                 // Pulls are for humans (Gate::Closed), also through `new`.
                 may_pull: via == Via::Cli,
+                // Agents never get here with vnc (Gate::Closed).
+                vnc,
             };
             let started = Instant::now();
             m.create(&new).await?;
@@ -554,6 +557,14 @@ async fn dispatch(
                 "running": m.running(&name).is_some(),
                 "socket": on.then(|| m.paths.vnc_socket(&name)),
             })
+        }
+        Request::SetResources {
+            name,
+            vcpus,
+            memory_mib,
+        } => {
+            let cfg = m.set_resources(&name, vcpus, memory_mib).await?;
+            json!(info(m, &cfg).await)
         }
         Request::Resume { name } => {
             m.resume(&name).await?;
