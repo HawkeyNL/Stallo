@@ -1,4 +1,5 @@
-//! M0 gate: boot, exec, limits, graceful stop, clean removal, admission.
+//! M0 gate: boot, exec, files, limits, graceful stop, second boot, clean
+//! removal, admission.
 
 mod common;
 
@@ -21,7 +22,9 @@ fn boot_exec_stop_rm() {
 
     // Create, start, wait for the guest agent.
     let started = Instant::now();
-    let out = d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    let out = d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     let ready = started.elapsed();
     assert!(out.contains("ready in"), "{out}");
     eprintln!(
@@ -66,9 +69,26 @@ fn boot_exec_stop_rm() {
         d.ok(&["exec", "dev", "--admin", "--", "id", "-un"]).trim(),
         "root"
     );
+    assert_sudo_with_password(&d);
+    assert_secure_boot(&d);
     let t = Instant::now();
     d.ok(&["exec", "dev", "--", "true"]);
     eprintln!("MEASURE exec true: {} ms", t.elapsed().as_millis());
+    // Offline: the guest sees no network device besides loopback.
+    assert_eq!(
+        d.ok(&["exec", "dev", "--", "ls", "/sys/class/net"]).trim(),
+        "lo"
+    );
+    assert_no_wait_online(&d);
+
+    // File round trip through the guest agent.
+    let src = d.base.join("blob");
+    let back = d.base.join("blob.back");
+    let blob: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    fs::write(&src, &blob).unwrap();
+    d.ok(&["cp", src.to_str().unwrap(), "dev:/home/agent/blob"]);
+    d.ok(&["cp", "dev:/home/agent/blob", back.to_str().unwrap()]);
+    assert_eq!(fs::read(&back).unwrap(), blob);
 
     // QEMU overhead: resident memory outside the guest RAM mapping.
     let (total_kib, guest_kib) = rss_split(qemu, 2048 << 10);
@@ -81,7 +101,9 @@ fn boot_exec_stop_rm() {
     );
 
     // Admission: a second VM does not fit the budget and leaves nothing.
-    let out = d.stallo(&["new", "two", "--cpus", "1", "--mem", "1G", "--disk", "10G"]);
+    let out = d.stallo(&[
+        "new", "two", "--image", &d.image, "--cpus", "1", "--mem", "1G", "--disk", "10G",
+    ]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("budget"));
     assert!(!d.vm_dir("two").exists());
@@ -98,6 +120,21 @@ fn boot_exec_stop_rm() {
     assert!(!cg.exists());
     assert!(!d.vm_runtime("dev").exists());
 
+    // Second boot: ready again, and the file survived.
+    let t = Instant::now();
+    // `start` waits for the guest agent.
+    assert_eq!(d.ok(&["start", "dev"]).trim(), "dev  started");
+    eprintln!(
+        "MEASURE start (second boot) -> guest agent ready: {:.1} s",
+        t.elapsed().as_secs_f64()
+    );
+    d.assert_safe("dev");
+    assert_no_wait_online(&d);
+    fs::remove_file(&back).unwrap();
+    d.ok(&["cp", "dev:/home/agent/blob", back.to_str().unwrap()]);
+    assert_eq!(fs::read(&back).unwrap(), blob);
+    d.ok(&["stop", "dev"]);
+
     // Remove: no files, cgroups or sockets left.
     d.ok(&["rm", "dev", "--yes"]);
     assert!(!d.vm_dir("dev").exists());
@@ -113,6 +150,75 @@ fn boot_exec_stop_rm() {
             .unwrap()
             .any(|e| { e.unwrap().file_name().to_string_lossy().starts_with("vm-") })
     );
+}
+
+/// The guest user gets root through sudo with its password and in no
+/// other way (seed.rs): one cloud-init rule, no admin groups, `sudo -n`
+/// refused, `sudo -S` with the password accepted. The test sets a known
+/// password first, so the VM's secret is never read.
+fn assert_sudo_with_password(d: &Daemon) {
+    let admin = |cmd: &str| d.ok(&["exec", "dev", "--admin", "--", "sh", "-c", cmd]);
+    let rules = admin("grep -v '^#' /etc/sudoers.d/90-cloud-init-users | grep .");
+    assert_eq!(rules, "agent ALL=(ALL:ALL) ALL\n");
+    assert_eq!(admin("id -nG agent"), "agent\n");
+    admin("echo agent:stallo-test-pw | chpasswd");
+    let out = d.stallo(&["exec", "dev", "--", "sudo", "-k", "-n", "true"]);
+    assert!(!out.status.success(), "sudo without a password worked");
+    assert_eq!(
+        d.ok(&[
+            "exec",
+            "dev",
+            "--",
+            "sh",
+            "-c",
+            "echo stallo-test-pw | sudo -k -S -p '' id -un",
+        ]),
+        "root\n"
+    );
+}
+
+/// Secure Boot is on for `secure-boot` images and off for `uefi` ones (an
+/// empty variable store, see qemu.rs).
+fn assert_secure_boot(d: &Daemon) {
+    use stallo::images::Firmware;
+    // Four attribute bytes, then the value.
+    let on = d.ok(&[
+        "exec",
+        "dev",
+        "--",
+        "od",
+        "-An",
+        "-tu1",
+        "-j4",
+        "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+    ]);
+    let want = match stallo::images::find(&d.image).unwrap().firmware {
+        Firmware::SecureBoot => "1",
+        Firmware::Uefi => "0",
+    };
+    assert_eq!(on.trim(), want, "SecureBoot variable");
+}
+
+/// systemd-networkd-wait-online and systemd-time-wait-sync never started
+/// in the guest: without a NIC the first would hold the boot for 2 minutes
+/// and the second forever (see qemu.rs and seed.rs).
+fn assert_no_wait_online(d: &Daemon) {
+    for unit in [
+        "systemd-networkd-wait-online.service",
+        "systemd-time-wait-sync.service",
+    ] {
+        let started = d.ok(&[
+            "exec",
+            "dev",
+            "--",
+            "systemctl",
+            "show",
+            "-P",
+            "ExecMainStartTimestampMonotonic",
+            unit,
+        ]);
+        assert_eq!(started.trim(), "0", "{unit} ran");
+    }
 }
 
 /// Resident KiB of `pid`: (total, in mappings of at least `guest_kib`,

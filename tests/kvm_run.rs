@@ -40,7 +40,9 @@ fn throwaway_runs() {
         return;
     }
     let d = Daemon::start("run", "");
-    d.ok(&["new", "dev", "--cpus", "2", "--mem", "2G", "--disk", "20G"]);
+    d.ok(&[
+        "new", "dev", "--image", &d.image, "--cpus", "2", "--mem", "2G", "--disk", "20G",
+    ]);
     d.ok(&[
         "exec",
         "dev",
