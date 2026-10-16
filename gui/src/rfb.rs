@@ -7,26 +7,28 @@
 #![expect(dead_code, reason = "the Screen tab (GUI-8) is the first user")]
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// From connecting up to and including the server's init message.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// For the rest of a server message once its first byte is in; the server
 /// may stay quiet for as long as the screen does not change.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
-/// For one message to the server.
+/// For one message to the server, and for letting go of held keys and
+/// buttons when the session ends.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// The largest framebuffer we accept (4096 x 4096), 64 MiB as BGRx.
-const MAX_PIXELS: u64 = 16 << 20;
+/// The longest side we accept: at most 64 MiB of BGRx.
+const MAX_SIDE: u16 = 4096;
 const MAX_NAME: u32 = 1024;
 const MAX_CUT_TEXT: u32 = 1 << 20;
 /// Input waiting to be written.
@@ -54,9 +56,12 @@ pub struct Rect {
 pub struct Frame {
     pub width: u16,
     pub height: u16,
-    /// 4 bytes a pixel, B G R x (`GDK_MEMORY_B8G8R8X8`); rows of `width * 4`
-    /// bytes with no padding. A copy of its own: the session keeps writing.
-    pub pixels: Arc<[u8]>,
+    /// The whole screen, 4 bytes a pixel, B G R x (`GDK_MEMORY_B8G8R8X8`);
+    /// rows of `width * 4` bytes with no padding. Never changes once
+    /// published. The session reuses the buffer two frames later, so drop a
+    /// frame once a newer one is shown: while it is still held, the session
+    /// has to copy it.
+    pub pixels: Arc<Vec<u8>>,
     /// What changed since the frame with `serial - 1`. When a reader skips
     /// a serial (the watch keeps only the latest), it must redraw it all.
     pub damage: Vec<Rect>,
@@ -91,23 +96,23 @@ enum Out {
     },
 }
 
-/// An open connection. Dropping it closes the connection.
-#[derive(Debug)]
+/// An open connection. Dropping it ends the session: the guest gets a
+/// release for every key and button still held (within `WRITE_TIMEOUT`),
+/// then the connection closes.
 pub struct Session {
     out: mpsc::Sender<Out>,
-    task: JoinHandle<Result<()>>,
+    /// Sent to on overload; dropped with the session.
+    stop: Cell<Option<oneshot::Sender<()>>>,
+    end: Arc<OnceLock<String>>,
     buttons: Cell<u8>,
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    #[cfg(test)]
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Session {
     /// Connects to a VNC Unix socket and completes the handshake. Must run
-    /// on the I/O runtime. The receiver closes when the session ends.
+    /// on the I/O runtime. The receiver closes when the session ends; then
+    /// [`Session::end_reason`] says why.
     pub async fn connect(path: &Path) -> Result<(Session, watch::Receiver<Frame>)> {
         let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, UnixStream::connect(path))
             .await
@@ -125,41 +130,52 @@ impl Session {
         write(&mut wr, &set_encodings()).await?;
         write(&mut wr, &update_request(false, width, height)).await?;
 
-        let fb = vec![0; frame_len(width, height)];
+        let black = || Arc::new(vec![0; frame_len(width, height)]);
         let (frames, rx) = watch::channel(Frame {
             width,
             height,
-            pixels: Arc::from(&fb[..]),
+            pixels: black(),
             damage: Vec::new(),
             serial: 0,
         });
-        let (out, out_rx) = mpsc::channel(QUEUE);
         let screen = Screen {
             width,
             height,
-            fb,
+            back: black(),
+            behind: Vec::new(),
+            damage: Vec::new(),
+            content: false,
             serial: 0,
         };
-        let qemu_keys = Arc::new(AtomicBool::new(false));
-        let reader = read_loop(rd, screen, frames, out.clone(), qemu_keys.clone());
-        let writer = write_loop(wr, out_rx, qemu_keys);
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                r = reader => r,
-                r = writer => r,
-            }
-        });
+        let (out, out_rx) = mpsc::channel(QUEUE);
+        let (stop, stop_rx) = oneshot::channel();
+        let end = Arc::new(OnceLock::new());
+        let io = Io {
+            rd,
+            wr,
+            screen,
+            frames,
+            out: out.clone(),
+            out_rx,
+            stop: stop_rx,
+        };
+        let task = tokio::spawn(run(io, end.clone()));
+        #[cfg(not(test))]
+        drop(task);
         let session = Session {
             out,
-            task,
+            stop: Cell::new(Some(stop)),
+            end,
             buttons: Cell::new(0),
+            #[cfg(test)]
+            task,
         };
         Ok((session, rx))
     }
 
     /// Queues input without blocking. When the queue fills up, pointer
-    /// motion goes first; a key or button change that finds no room ends
-    /// the session rather than leaving a key held down in the guest.
+    /// motion is dropped first; a key or button change that finds no room
+    /// ends the session, which then lets go of everything it holds down.
     pub fn send(&self, input: Input) {
         let motion = match input {
             Input::Pointer { buttons, .. } => self.buttons.replace(buttons) == buttons,
@@ -168,10 +184,63 @@ impl Session {
         if motion && self.out.capacity() <= KEEP_FREE {
             return;
         }
-        if self.out.try_send(Out::Input(input)).is_err() && !motion {
-            self.task.abort();
+        if self.out.try_send(Out::Input(input)).is_err()
+            && !motion
+            && let Some(stop) = self.stop.take()
+        {
+            let _ = stop.send(());
         }
     }
+
+    /// Why the session ended; `None` while it runs.
+    pub fn end_reason(&self) -> Option<&str> {
+        self.end.get().map(String::as_str)
+    }
+}
+
+/// Everything the session task owns.
+struct Io {
+    rd: OwnedReadHalf,
+    wr: OwnedWriteHalf,
+    screen: Screen,
+    frames: watch::Sender<Frame>,
+    out: mpsc::Sender<Out>,
+    out_rx: mpsc::Receiver<Out>,
+    stop: oneshot::Receiver<()>,
+}
+
+/// The session task: reads until something ends it, lets go of held keys
+/// and buttons, and records why it ended before the frames close.
+async fn run(mut io: Io, end: Arc<OnceLock<String>>) {
+    let qemu_keys = AtomicBool::new(false);
+    let mut writer = Writer {
+        w: io.wr,
+        keys: HashMap::new(),
+        pointer: (0, 0, 0),
+        dirty: false,
+    };
+    let result = tokio::select! {
+        r = read_loop(io.rd, &mut io.screen, &io.frames, &io.out, &qemu_keys) => r,
+        r = writer.run(&mut io.out_rx, &qemu_keys) => r,
+        stop = io.stop => match stop {
+            Ok(()) => Err(anyhow!("the VM's display did not keep up with the input")),
+            Err(_) => Ok(()), // the session was dropped
+        },
+    };
+    // Not after a write cut off half-way: the stream is out of step.
+    if !writer.dirty {
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, writer.release()).await;
+    }
+    let reason = match result {
+        Ok(()) => "closed".to_owned(),
+        Err(e) => {
+            let e = format!("{e:#}");
+            tracing::warn!("VM display session ended: {e}");
+            e
+        }
+    };
+    let _ = end.set(reason);
+    // `io.frames` drops here, after the reason is in.
 }
 
 /// RFB 3.8 with security type None, up to and including ServerInit.
@@ -215,8 +284,8 @@ async fn handshake(s: &mut UnixStream) -> Result<(u16, u16)> {
 
 fn check_size(width: u16, height: u16) -> Result<()> {
     ensure!(
-        u64::from(width) * u64::from(height) <= MAX_PIXELS,
-        "the VM's display is too large: {width}x{height}"
+        (1..=MAX_SIDE).contains(&width) && (1..=MAX_SIDE).contains(&height),
+        "the VM's display has an unsupported size: {width}x{height}"
     );
     Ok(())
 }
@@ -250,30 +319,43 @@ fn update_request(incremental: bool, width: u16, height: u16) -> Vec<u8> {
     m
 }
 
-/// The wire bytes for input; `qemu_keys` once the server took the QEMU
-/// extended key event. `None` for a key with nothing to send.
-fn input_message(input: Input, qemu_keys: bool) -> Option<Vec<u8>> {
-    match input {
-        Input::Pointer { x, y, buttons } => {
-            Some([&[5, buttons][..], &x.to_be_bytes(), &y.to_be_bytes()].concat())
+fn pointer_message(x: u16, y: u16, buttons: u8) -> Vec<u8> {
+    [&[5, buttons][..], &x.to_be_bytes(), &y.to_be_bytes()].concat()
+}
+
+/// How a key went to the server at key-down; its key-up goes the same way.
+#[derive(Debug, Clone, Copy)]
+enum Sent {
+    /// The QEMU extended key event.
+    Qemu { keysym: u32, scancode: u32 },
+    /// A plain KeyEvent.
+    Keysym(u32),
+}
+
+impl Sent {
+    /// The scancode once the server took the QEMU extension and the key is
+    /// in the table, else the keysym. `None` with neither.
+    fn choose(keycode: u32, keysym: u32, qemu_keys: bool) -> Option<Sent> {
+        let scancode = keycode
+            .checked_sub(8)
+            .and_then(qemu_scancode)
+            .filter(|_| qemu_keys);
+        match scancode {
+            Some(scancode) => Some(Sent::Qemu { keysym, scancode }),
+            None if keysym != 0 => Some(Sent::Keysym(keysym)),
+            None => None,
         }
-        Input::Key {
-            keycode,
-            keysym,
-            down,
-        } => {
-            let scancode = keycode
-                .checked_sub(8)
-                .and_then(qemu_scancode)
-                .filter(|_| qemu_keys);
-            let sym = keysym.to_be_bytes();
-            match scancode {
-                Some(code) => {
-                    Some([&[255, 0, 0, down.into()][..], &sym, &code.to_be_bytes()].concat())
-                }
-                None if keysym != 0 => Some([&[4, down.into(), 0, 0][..], &sym].concat()),
-                None => None,
-            }
+    }
+
+    fn message(self, down: bool) -> Vec<u8> {
+        match self {
+            Sent::Qemu { keysym, scancode } => [
+                &[255, 0, 0, down.into()][..],
+                &keysym.to_be_bytes(),
+                &scancode.to_be_bytes(),
+            ]
+            .concat(),
+            Sent::Keysym(keysym) => [&[4, down.into(), 0, 0][..], &keysym.to_be_bytes()].concat(),
         }
     }
 }
@@ -329,66 +411,174 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(
-    mut w: W,
-    mut rx: mpsc::Receiver<Out>,
-    qemu_keys: Arc<AtomicBool>,
-) -> Result<()> {
-    while let Some(out) = rx.recv().await {
-        let bytes = match out {
-            Out::Update {
-                incremental,
-                width,
-                height,
-            } => update_request(incremental, width, height),
-            Out::Input(input) => match input_message(input, qemu_keys.load(Ordering::Relaxed)) {
-                Some(m) => m,
-                None => continue,
-            },
-        };
-        write(&mut w, &bytes).await?;
-    }
-    Ok(())
+/// Writes to the server and remembers what the guest sees held down.
+struct Writer<W> {
+    w: W,
+    /// Keys down, by GTK keycode, with how they were sent.
+    keys: HashMap<u32, Sent>,
+    /// The last pointer event written: x, y, buttons.
+    pointer: (u16, u16, u8),
+    /// A write is under way; if it is cut off, the stream is out of step.
+    dirty: bool,
 }
 
-/// The framebuffer as the reader keeps it.
+impl<W: AsyncWrite + Unpin> Writer<W> {
+    async fn run(&mut self, rx: &mut mpsc::Receiver<Out>, qemu_keys: &AtomicBool) -> Result<()> {
+        while let Some(out) = rx.recv().await {
+            let bytes = match out {
+                Out::Update {
+                    incremental,
+                    width,
+                    height,
+                } => update_request(incremental, width, height),
+                Out::Input(Input::Pointer { x, y, buttons }) => {
+                    self.pointer = (x, y, buttons);
+                    pointer_message(x, y, buttons)
+                }
+                Out::Input(Input::Key {
+                    keycode,
+                    keysym,
+                    down: true,
+                }) => {
+                    // A repeat goes the way the first key-down went.
+                    let sent = match self.keys.get(&keycode) {
+                        Some(&sent) => sent,
+                        None => {
+                            let qemu = qemu_keys.load(Ordering::Relaxed);
+                            let Some(sent) = Sent::choose(keycode, keysym, qemu) else {
+                                continue;
+                            };
+                            self.keys.insert(keycode, sent);
+                            sent
+                        }
+                    };
+                    sent.message(true)
+                }
+                // A key-up for a key the guest never saw go down is dropped.
+                Out::Input(Input::Key { keycode, .. }) => match self.keys.remove(&keycode) {
+                    Some(sent) => sent.message(false),
+                    None => continue,
+                },
+            };
+            self.write(&bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.dirty = true;
+        write(&mut self.w, bytes).await?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Lets go of every key and button the guest sees held.
+    async fn release(&mut self) -> Result<()> {
+        for sent in std::mem::take(&mut self.keys).into_values() {
+            self.write(&sent.message(false)).await?;
+        }
+        let (x, y, buttons) = self.pointer;
+        if buttons != 0 {
+            self.pointer.2 = 0;
+            self.write(&pointer_message(x, y, 0)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The reader's side of the screen: it writes into `back` while the watch
+/// holds the front, and the two swap on each publish.
 struct Screen {
     width: u16,
     height: u16,
-    fb: Vec<u8>,
+    back: Arc<Vec<u8>>,
+    /// What `back` misses from the front: the damage last published.
+    behind: Vec<Rect>,
+    /// Changes not published yet, and whether any of them is content.
+    damage: Vec<Rect>,
+    content: bool,
     serial: u64,
+}
+
+impl Screen {
+    /// The buffer to draw into, caught up with the front. Copies it whole
+    /// only while a reader still holds it.
+    fn back(&mut self, frames: &watch::Sender<Frame>) -> &mut Vec<u8> {
+        let back = Arc::make_mut(&mut self.back);
+        if !self.behind.is_empty() {
+            let front = frames.borrow();
+            if back.len() == front.pixels.len() {
+                let stride = usize::from(front.width) * 4;
+                for r in &self.behind {
+                    let row = usize::from(r.w) * 4;
+                    for y in usize::from(r.y)..usize::from(r.y) + usize::from(r.h) {
+                        let start = y * stride + usize::from(r.x) * 4;
+                        back[start..start + row].copy_from_slice(&front.pixels[start..start + row]);
+                    }
+                }
+            } else {
+                back.clone_from(&front.pixels);
+            }
+            self.behind.clear();
+        }
+        back
+    }
+
+    fn resize(&mut self, width: u16, height: u16) -> Result<()> {
+        check_size(width, height)?;
+        self.width = width;
+        self.height = height;
+        self.back = Arc::new(vec![0; frame_len(width, height)]);
+        self.behind.clear();
+        self.damage = vec![Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        }];
+        Ok(())
+    }
+
+    /// Publishes `back` once it has content: a resize alone would show a
+    /// black screen.
+    fn publish(&mut self, frames: &watch::Sender<Frame>) {
+        if !self.content {
+            return;
+        }
+        self.content = false;
+        self.serial += 1;
+        let damage = std::mem::take(&mut self.damage);
+        let old = frames.send_replace(Frame {
+            width: self.width,
+            height: self.height,
+            pixels: std::mem::take(&mut self.back),
+            damage: damage.clone(),
+            serial: self.serial,
+        });
+        self.back = old.pixels;
+        self.behind = damage;
+    }
 }
 
 async fn read_loop<R: AsyncRead + Unpin>(
     rd: R,
-    mut screen: Screen,
-    frames: watch::Sender<Frame>,
-    out: mpsc::Sender<Out>,
-    qemu_keys: Arc<AtomicBool>,
+    screen: &mut Screen,
+    frames: &watch::Sender<Frame>,
+    out: &mpsc::Sender<Out>,
+    qemu_keys: &AtomicBool,
 ) -> Result<()> {
     let mut r = BufReader::with_capacity(64 << 10, rd);
     loop {
         // No limit here: a still screen sends nothing.
         let kind = r.read_u8().await?;
-        let message = read_message(&mut r, kind, &mut screen, &qemu_keys);
-        let Some((damage, resized)) = tokio::time::timeout(MESSAGE_TIMEOUT, message)
+        let message = read_message(&mut r, kind, screen, frames, qemu_keys);
+        let Some(resized) = tokio::time::timeout(MESSAGE_TIMEOUT, message)
             .await
             .context("the VM's display stalled mid-message")??
         else {
             continue;
         };
-        if !damage.is_empty() {
-            screen.serial += 1;
-            frames.send_replace(Frame {
-                width: screen.width,
-                height: screen.height,
-                // ponytail: one copy of the screen per update; share the
-                // buffer copy-on-write if this shows up in a profile.
-                pixels: Arc::from(&screen.fb[..]),
-                damage,
-                serial: screen.serial,
-            });
-        }
+        screen.publish(frames);
         // One request outstanding: the next one after each update.
         // ponytail: an unsolicited update (QEMU's key extension ack, a
         // resize) adds a request; QEMU folds pending requests into one.
@@ -401,19 +591,19 @@ async fn read_loop<R: AsyncRead + Unpin>(
     }
 }
 
-/// Reads the rest of one server message. `Some((damage, resized))` after
-/// a framebuffer update, `None` after anything else we can let pass.
+/// Reads the rest of one server message. `Some(resized)` after a
+/// framebuffer update, `None` after anything else we can let pass.
 async fn read_message<R: AsyncRead + Unpin>(
     r: &mut R,
     kind: u8,
     screen: &mut Screen,
+    frames: &watch::Sender<Frame>,
     qemu_keys: &AtomicBool,
-) -> Result<Option<(Vec<Rect>, bool)>> {
+) -> Result<Option<bool>> {
     match kind {
         0 => {
             r.read_u8().await?;
             let rects = r.read_u16().await?;
-            let mut damage = Vec::new();
             let mut resized = false;
             for _ in 0..rects {
                 let rect = Rect {
@@ -424,27 +614,20 @@ async fn read_message<R: AsyncRead + Unpin>(
                 };
                 match r.read_i32().await? {
                     ENC_RAW => {
-                        read_raw(r, screen, rect).await?;
-                        damage.push(rect);
+                        read_raw(r, screen, frames, rect).await?;
+                        screen.damage.push(rect);
+                        screen.content = true;
                     }
                     ENC_DESKTOP_SIZE => {
-                        check_size(rect.w, rect.h)?;
-                        screen.width = rect.w;
-                        screen.height = rect.h;
-                        screen.fb = vec![0; frame_len(rect.w, rect.h)];
-                        damage = vec![Rect {
-                            x: 0,
-                            y: 0,
-                            w: rect.w,
-                            h: rect.h,
-                        }];
+                        screen.resize(rect.w, rect.h)?;
+                        screen.content = false;
                         resized = true;
                     }
                     ENC_QEMU_KEY => qemu_keys.store(true, Ordering::Relaxed),
                     e => bail!("the VM's display sent an unknown encoding {e}"),
                 }
             }
-            Ok(Some((damage, resized)))
+            Ok(Some(resized))
         }
         2 => Ok(None), // Bell
         3 => {
@@ -464,7 +647,12 @@ async fn read_message<R: AsyncRead + Unpin>(
 }
 
 /// Reads a raw rectangle straight into the framebuffer, row by row.
-async fn read_raw<R: AsyncRead + Unpin>(r: &mut R, screen: &mut Screen, rect: Rect) -> Result<()> {
+async fn read_raw<R: AsyncRead + Unpin>(
+    r: &mut R,
+    screen: &mut Screen,
+    frames: &watch::Sender<Frame>,
+    rect: Rect,
+) -> Result<()> {
     ensure!(
         u32::from(rect.x) + u32::from(rect.w) <= u32::from(screen.width)
             && u32::from(rect.y) + u32::from(rect.h) <= u32::from(screen.height),
@@ -472,9 +660,10 @@ async fn read_raw<R: AsyncRead + Unpin>(r: &mut R, screen: &mut Screen, rect: Re
     );
     let stride = usize::from(screen.width) * 4;
     let row = usize::from(rect.w) * 4;
+    let fb = screen.back(frames);
     for y in usize::from(rect.y)..usize::from(rect.y) + usize::from(rect.h) {
         let start = y * stride + usize::from(rect.x) * 4;
-        r.read_exact(&mut screen.fb[start..start + row]).await?;
+        r.read_exact(&mut fb[start..start + row]).await?;
     }
     Ok(())
 }
@@ -549,12 +738,13 @@ mod tests {
         Rect { x, y, w, h }
     }
 
-    /// The session's end: its error, failing on a panic or a hang.
-    async fn ended(session: &mut Session) -> Result<()> {
+    /// Why the session ended, failing on a panic or a hang.
+    async fn ended(session: &mut Session) -> String {
         tokio::time::timeout(Duration::from_secs(5), &mut session.task)
             .await
             .expect("the session did not end")
-            .expect("the session panicked")
+            .expect("the session panicked");
+        session.end_reason().unwrap().to_owned()
     }
 
     async fn start_err(server_bytes: Vec<u8>) -> String {
@@ -638,14 +828,20 @@ mod tests {
     }
 
     #[test]
-    fn refuses_oversize_framebuffer_and_long_name() {
+    fn refuses_bad_framebuffer_sizes_and_long_names() {
         rt().block_on(async {
             let head = [VERSION.to_vec(), vec![1, 1, 0, 0, 0, 0]].concat();
-            let mut m = head.clone();
-            m.extend_from_slice(&[0x10, 0x01, 0x10, 0x00]); // 4097 x 4096
-            assert!(start_err(m).await.contains("too large"));
+            for size in [
+                [0x10, 0x01, 0x10, 0x00],
+                [0x20, 0, 0, 1],
+                [0, 0, 0, 1],
+                [0, 1, 0, 0],
+            ] {
+                let e = start_err([&head[..], &size].concat()).await;
+                assert!(e.contains("unsupported size"), "{size:?}: {e}");
+            }
             let mut m = head;
-            m.extend_from_slice(&[0, 1, 0, 1]);
+            m.extend_from_slice(&[0x10, 0, 0x10, 0]); // 4096 x 4096 is fine
             m.extend_from_slice(&[0; 16]);
             m.extend_from_slice(&(MAX_NAME + 1).to_be_bytes());
             assert!(start_err(m).await.contains("name too long"));
@@ -657,13 +853,15 @@ mod tests {
         rt().block_on(async {
             tokio::time::pause();
             let (client, _server) = UnixStream::pair().unwrap();
-            let e = Session::start(client).await.unwrap_err();
+            let Err(e) = Session::start(client).await else {
+                panic!("the handshake did not time out");
+            };
             assert!(format!("{e:#}").contains("in time"), "{e:#}");
         });
     }
 
     #[test]
-    fn desktop_size_resizes() {
+    fn desktop_size_waits_for_content() {
         rt().block_on(async {
             let (_session, mut rx, mut server) = connected(4, 3).await;
             server
@@ -674,11 +872,61 @@ mod tests {
                 read_n(&mut server, 10).await,
                 update_request(false, 640, 480)
             );
-            rx.changed().await.unwrap();
-            let f = rx.borrow();
-            assert_eq!((f.width, f.height), (640, 480));
+            // No black frame for the resize alone.
+            assert!(!rx.has_changed().unwrap());
+            server
+                .write_all(&update(&[(rect(0, 0, 1, 1), ENC_RAW, &[7; 4])]))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_n(&mut server, 10).await,
+                update_request(true, 640, 480)
+            );
+            let f = rx.borrow_and_update().clone();
+            assert_eq!((f.width, f.height, f.serial), (640, 480, 1));
             assert_eq!(f.pixels.len(), 640 * 480 * 4);
-            assert_eq!(f.damage, [rect(0, 0, 640, 480)]);
+            assert_eq!(f.pixels[..4], [7; 4]);
+            assert_eq!(f.damage, [rect(0, 0, 640, 480), rect(0, 0, 1, 1)]);
+        });
+    }
+
+    /// One pixel at `x` of a 4x1 screen, and the frame it makes.
+    async fn draw(server: &mut UnixStream, rx: &mut watch::Receiver<Frame>, x: u16) -> Frame {
+        let v = x as u8 + 1;
+        server
+            .write_all(&update(&[(rect(x, 0, 1, 1), ENC_RAW, &[v; 4])]))
+            .await
+            .unwrap();
+        assert_eq!(read_n(server, 10).await, update_request(true, 4, 1));
+        rx.borrow_and_update().clone()
+    }
+
+    fn row(px: [u8; 4]) -> Vec<u8> {
+        px.iter().flat_map(|&v| [v; 4]).collect()
+    }
+
+    #[test]
+    fn frames_are_whole_and_buffers_reused() {
+        rt().block_on(async {
+            let (_session, mut rx, mut server) = connected(4, 1).await;
+            // Holding every frame: each stays as it was published.
+            let f1 = draw(&mut server, &mut rx, 0).await;
+            let f2 = draw(&mut server, &mut rx, 1).await;
+            let f3 = draw(&mut server, &mut rx, 2).await;
+            assert_eq!(*f1.pixels, row([1, 0, 0, 0]));
+            assert_eq!(*f2.pixels, row([1, 2, 0, 0]));
+            assert_eq!(*f3.pixels, row([1, 2, 3, 0]));
+            assert_eq!(f3.damage, [rect(2, 0, 1, 1)]);
+            // Dropping them: the session draws into the same two buffers.
+            let p3 = Arc::as_ptr(&f3.pixels);
+            drop((f1, f2, f3));
+            let f4 = draw(&mut server, &mut rx, 3).await;
+            assert_eq!(*f4.pixels, row([1, 2, 3, 4]));
+            drop(f4);
+            let f5 = draw(&mut server, &mut rx, 0).await;
+            assert_eq!(Arc::as_ptr(&f5.pixels), p3);
+            assert_eq!(*f5.pixels, row([1, 2, 3, 4]));
+            assert_eq!(f5.serial, 5);
         });
     }
 
@@ -686,13 +934,13 @@ mod tests {
     fn key_events() {
         rt().block_on(async {
             let (session, _rx, mut server) = connected(4, 3).await;
-            // Before the server takes the extension: the X keysym.
-            let a = Input::Key {
+            let a = |down| Input::Key {
                 keycode: 30 + 8,
                 keysym: 0x61,
-                down: true,
+                down,
             };
-            session.send(a);
+            // Before the server takes the extension: the X keysym.
+            session.send(a(true));
             assert_eq!(read_n(&mut server, 8).await, [4, 1, 0, 0, 0, 0, 0, 0x61]);
             // QEMU acks the extension with a pseudo-rect.
             server
@@ -700,20 +948,26 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(read_n(&mut server, 10).await, update_request(true, 4, 3));
-            session.send(a);
-            assert_eq!(
-                read_n(&mut server, 12).await,
-                [255, 0, 0, 1, 0, 0, 0, 0x61, 0, 0, 0, 0x1e]
-            );
-            // Right Ctrl up: an E0 key.
+            // The key-up goes the way its key-down went.
+            session.send(a(false));
+            assert_eq!(read_n(&mut server, 8).await, [4, 0, 0, 0, 0, 0, 0, 0x61]);
+            // Now as scancodes, repeats included.
+            let ext = |down: u8| [255, 0, 0, down, 0, 0, 0, 0x61, 0, 0, 0, 0x1e];
+            session.send(a(true));
+            assert_eq!(read_n(&mut server, 12).await, ext(1));
+            session.send(a(true));
+            assert_eq!(read_n(&mut server, 12).await, ext(1));
+            session.send(a(false));
+            assert_eq!(read_n(&mut server, 12).await, ext(0));
+            // Right Ctrl: an E0 key.
             session.send(Input::Key {
                 keycode: 97 + 8,
                 keysym: 0xffe4,
-                down: false,
+                down: true,
             });
             assert_eq!(
                 read_n(&mut server, 12).await,
-                [255, 0, 0, 0, 0, 0, 0xff, 0xe4, 0, 0, 0, 0x9d]
+                [255, 0, 0, 1, 0, 0, 0xff, 0xe4, 0, 0, 0, 0x9d]
             );
             // No scancode: the keysym after all.
             session.send(Input::Key {
@@ -725,6 +979,14 @@ mod tests {
                 read_n(&mut server, 8).await,
                 [4, 1, 0, 0, 0x10, 0x08, 0xff, 0x13]
             );
+            // A key-up without a key-down sends nothing.
+            session.send(a(false));
+            session.send(Input::Pointer {
+                x: 1,
+                y: 2,
+                buttons: 0,
+            });
+            assert_eq!(read_n(&mut server, 6).await, [5, 0, 0, 1, 0, 2]);
         });
     }
 
@@ -754,9 +1016,35 @@ mod tests {
     }
 
     #[test]
+    fn dropping_releases_held_keys_and_buttons() {
+        rt().block_on(async {
+            let (session, _rx, mut server) = connected(4, 3).await;
+            session.send(Input::Key {
+                keycode: 38,
+                keysym: 0x61,
+                down: true,
+            });
+            session.send(Input::Pointer {
+                x: 2,
+                y: 1,
+                buttons: 4,
+            });
+            assert_eq!(read_n(&mut server, 8).await, [4, 1, 0, 0, 0, 0, 0, 0x61]);
+            assert_eq!(read_n(&mut server, 6).await, [5, 4, 0, 2, 0, 1]);
+            drop(session);
+            assert_eq!(read_n(&mut server, 8).await, [4, 0, 0, 0, 0, 0, 0, 0x61]);
+            assert_eq!(read_n(&mut server, 6).await, [5, 0, 0, 2, 0, 1]);
+            let mut rest = Vec::new();
+            server.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.is_empty(), "{rest:?}");
+        });
+    }
+
+    #[test]
     fn motion_is_dropped_before_keys() {
         rt().block_on(async {
-            // A server that never reads: the writer gets stuck.
+            // No await between the sends, so the writer cannot drain the
+            // queue in the meantime.
             let (mut session, _rx, _server) = connected(4, 3).await;
             for i in 0..1000 {
                 session.send(Input::Pointer {
@@ -765,25 +1053,24 @@ mod tests {
                     buttons: 0,
                 });
             }
-            assert!(session.out.capacity() >= KEEP_FREE);
-            for _ in 0..KEEP_FREE / 2 {
+            assert_eq!(session.out.capacity(), KEEP_FREE);
+            for _ in 0..KEEP_FREE {
                 session.send(Input::Key {
                     keycode: 38,
                     keysym: 0x61,
                     down: true,
                 });
             }
-            assert!(!session.task.is_finished());
+            assert_eq!(session.out.capacity(), 0);
+            assert!(session.end_reason().is_none());
             // A key with no room left ends the session.
-            for _ in 0..=KEEP_FREE / 2 {
-                session.send(Input::Key {
-                    keycode: 38,
-                    keysym: 0x61,
-                    down: false,
-                });
-            }
-            let end = tokio::time::timeout(Duration::from_secs(5), &mut session.task).await;
-            assert!(end.unwrap().unwrap_err().is_cancelled());
+            session.send(Input::Key {
+                keycode: 38,
+                keysym: 0x61,
+                down: false,
+            });
+            let e = ended(&mut session).await;
+            assert!(e.contains("keep up"), "{e}");
         });
     }
 
@@ -800,7 +1087,15 @@ mod tests {
             ),
             (
                 update(&[(rect(0, 0, 4097, 4096), ENC_DESKTOP_SIZE, &[])]),
-                "too large",
+                "unsupported size",
+            ),
+            (
+                update(&[(rect(0, 0, 8192, 1), ENC_DESKTOP_SIZE, &[])]),
+                "unsupported size",
+            ),
+            (
+                update(&[(rect(0, 0, 0, 480), ENC_DESKTOP_SIZE, &[])]),
+                "unsupported size",
             ),
             (update(&[(rect(0, 0, 1, 1), 5, &[])]), "unknown encoding"),
             (vec![3, 0, 0, 0, 0, 0x10, 0, 1], "too much text"),
@@ -811,7 +1106,7 @@ mod tests {
             for (bytes, want) in cases {
                 let (mut session, mut rx, mut server) = connected(4, 3).await;
                 server.write_all(&bytes).await.unwrap();
-                let e = format!("{:#}", ended(&mut session).await.unwrap_err());
+                let e = ended(&mut session).await;
                 assert!(e.contains(want), "{want}: {e}");
                 assert!(rx.changed().await.is_err());
             }
@@ -842,7 +1137,7 @@ mod tests {
                 }
                 let _ = server.write_all(&bytes).await;
                 drop(server);
-                let _ = ended(&mut session).await;
+                ended(&mut session).await;
             }
         });
     }
