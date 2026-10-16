@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use stallo::api::{Envelope, Request, Via, VmDetails, VmInfo};
+use stallo::api::{Envelope, ImageInfo, Request, Via, VmDetails, VmInfo};
 use stallo::host::HostInfo;
 use stallo::paths::Paths;
 use stallo::snapshot::Snapshot;
@@ -20,16 +20,19 @@ use crate::model::{self, Action, CallError, Probe, Production};
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide: 12, in three pools. Lifecycle
-/// actions may take up to 150 s each and snapshot actions 15 min, so each
-/// kind has its own slots: reads (polls, the probe) never wait behind an
-/// action, and a start or stop never waits behind a snapshot job.
+/// Requests in flight at once, app-wide: 14, in four pools. Lifecycle
+/// actions may take up to 150 s each, snapshot actions 15 min and image
+/// downloads and creates 30 min, so each kind has its own slots: reads
+/// (polls, the probe) never wait behind an action, a start or stop never
+/// waits behind a snapshot job, and nothing waits behind a download.
 const READ_SLOTS: usize = 4;
 const ACTION_SLOTS: usize = 4;
 const SNAP_SLOTS: usize = 4;
+const CREATE_SLOTS: usize = 2;
 static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
 static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
 static SNAPS: Semaphore = Semaphore::const_new(SNAP_SLOTS);
+static CREATES: Semaphore = Semaphore::const_new(CREATE_SLOTS);
 
 fn runtime() -> &'static Handle {
     static RT: OnceLock<Handle> = OnceLock::new();
@@ -135,6 +138,16 @@ pub async fn act(
         _ => &SNAPS,
     };
     call_in(slots, socket, action.request(name), action.limit()).await
+}
+
+/// The images VMs can be created from (`images`).
+pub async fn images(socket: &Path) -> Result<Vec<ImageInfo>, CallError> {
+    get(socket, Request::Images, READ_TIMEOUT).await
+}
+
+/// Downloads an image or creates a VM: a `pull` or `new` request.
+pub async fn create(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
+    call_in(&CREATES, socket, request, model::CREATE_LIMIT).await
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -364,6 +377,32 @@ mod tests {
                 "s2 has no RAM state; stop the VM first".into()
             ))
         );
+    }
+
+    #[test]
+    fn image_and_create_requests() {
+        let (_d, s, fake) = serve(
+            r#"{"op":"images"}"#,
+            answer(concat!(
+                r#"{"ok":true,"data":[{"id":"arch","name":"Arch","cached":false},"#,
+                r#"{"id":"ubuntu-26.04","name":"Ubuntu","cached":true,"os":"linux","size_bytes":7}]}"#,
+                "\n"
+            )),
+        );
+        let list = run(async move { images(&s).await }).unwrap();
+        fake.join().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[1].cached, list[1].size_bytes), (true, Some(7)));
+
+        let (_d, s, fake) = serve(r#"{"op":"pull","image":"arch"}"#, answer("{\"ok\":true}\n"));
+        let pull = Request::Pull {
+            image: "arch".into(),
+        };
+        assert_eq!(
+            run(async move { create(&s, pull).await }),
+            Ok(serde_json::Value::Null)
+        );
+        fake.join().unwrap();
     }
 
     #[test]

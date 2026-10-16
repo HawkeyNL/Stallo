@@ -3,6 +3,8 @@
 //! the daemon goes through the view-model (`stallo::printable`) into plain
 //! labels.
 
+mod create;
+
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
@@ -45,6 +47,7 @@ pub struct Vms {
     host_poll: RefCell<Poll>,
     /// The heartbeat, while polling is on.
     timer: RefCell<Option<glib::SourceId>>,
+    create: create::Create,
 }
 
 struct Row {
@@ -152,7 +155,15 @@ impl Vms {
             &adw::StatusPage::builder()
                 .icon_name("computer-symbolic")
                 .title("No Virtual Machines Yet")
-                .description("Create one in a terminal with stallo new.")
+                .description("Create your first VM.")
+                .child(
+                    &gtk::Button::builder()
+                        .label("New Virtual Machine")
+                        .action_name("vms.new")
+                        .halign(gtk::Align::Center)
+                        .css_classes(["pill", "suggested-action"])
+                        .build(),
+                )
                 .css_classes(["compact"])
                 .build(),
         ));
@@ -201,8 +212,12 @@ impl Vms {
         meter.append(&memory);
         meter.append(&disk);
 
+        let create = create::Create::new();
+        let sidebar_header = adw::HeaderBar::new();
+        sidebar_header.pack_start(&create.button);
         let sidebar = adw::ToolbarView::builder().content(&scroll).build();
-        sidebar.add_top_bar(&adw::HeaderBar::new());
+        sidebar.add_top_bar(&sidebar_header);
+        sidebar.add_top_bar(&create.strip);
         sidebar.add_bottom_bar(&meter);
 
         let none = adw::NavigationPage::builder()
@@ -254,7 +269,9 @@ impl Vms {
             list_poll: RefCell::new(Poll::new(model::LIST_EVERY)),
             host_poll: RefCell::new(Poll::new(model::HOST_EVERY)),
             timer: RefCell::default(),
+            create,
         });
+        create::connect(&vms);
         // Selecting (keyboard, focus, screen readers) shows a VM beside the
         // list; activating (click, Enter) also brings it forward when the
         // view is collapsed, even if it was selected already.
@@ -277,6 +294,7 @@ impl Vms {
 
     /// While the daemon is out of reach no action can be sent.
     pub fn set_online(&self, on: bool) {
+        self.create.set_online(on);
         if self.online.replace(on) != on {
             self.refresh_open();
         }
