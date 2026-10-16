@@ -70,16 +70,27 @@ async fn call_in(
     request: Request,
     limit: Duration,
 ) -> Result<serde_json::Value, CallError> {
+    let work = async {
+        let _slot = slots.acquire().await;
+        send(socket, request, limit).await
+    };
+    tokio::time::timeout(limit, work)
+        .await
+        .unwrap_or(Err(CallError::Timeout))
+}
+
+/// Sends one request, without a slot; `limit` covers the answer.
+async fn send(
+    socket: &Path,
+    request: Request,
+    limit: Duration,
+) -> Result<serde_json::Value, CallError> {
     // The app is a human interface, like the CLI.
     let envelope = Envelope {
         via: Via::Cli,
         request,
     };
-    let work = async {
-        let _slot = slots.acquire().await;
-        stallo::api::call(socket, &envelope).await
-    };
-    match tokio::time::timeout(limit, work).await {
+    match tokio::time::timeout(limit, stallo::api::call(socket, &envelope)).await {
         Err(_) => Err(CallError::Timeout),
         Ok(Ok(data)) => Ok(data),
         Ok(Err(e)) => Err(
@@ -159,21 +170,21 @@ pub async fn create(socket: &Path, request: Request) -> Result<serde_json::Value
     call_in(&CREATES, socket, request, model::CREATE_LIMIT).await
 }
 
-/// One part of a file copy (`file_read`, `file_write`).
+/// One part of a file copy (`file_read`, `file_write`). The time limit
+/// starts once it has a slot: a copy waits for another copy's chunk, not
+/// for the whole other copy to fit in its own limit.
 pub async fn file(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
-    call_in(&FILES, socket, request, model::FILE_LIMIT).await
+    let _slot = FILES.acquire().await;
+    send(socket, request, model::FILE_LIMIT).await
 }
 
-/// Runs host file work off the I/O thread; `what` names it in the error.
+/// Runs host file work off the I/O thread.
 pub async fn blocking<T: Send + 'static>(
-    what: String,
-    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+    work: impl FnOnce() -> Result<T, CallError> + Send + 'static,
 ) -> Result<T, CallError> {
-    match tokio::task::spawn_blocking(work).await {
-        Ok(Ok(t)) => Ok(t),
-        Ok(Err(e)) => Err(CallError::Failed(format!("cannot {what}: {e}"))),
-        Err(e) => Err(CallError::Failed(format!("cannot {what}: {e}"))),
-    }
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|e| Err(CallError::Failed(e.to_string())))
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -456,16 +467,12 @@ mod tests {
             model::read_answer(data.unwrap(), 0),
             Ok((b"hi".to_vec(), false))
         );
-        // Host file errors read like daemon ones.
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing");
-        let got = run(async move {
-            blocking("open it".into(), move || std::fs::File::open(&missing)).await
-        });
-        match got {
-            Err(CallError::Failed(e)) => assert!(e.starts_with("cannot open it: "), "{e}"),
-            other => panic!("{other:?}"),
-        }
+        // Host file work runs off the I/O thread; a panic is an error.
+        assert_eq!(run(async { blocking(|| Ok(7)).await }), Ok(7));
+        assert!(matches!(
+            run(async { blocking(|| -> Result<(), CallError> { panic!("boom") }).await }),
+            Err(CallError::Failed(_))
+        ));
     }
 
     #[test]

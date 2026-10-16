@@ -1003,6 +1003,15 @@ pub fn confirm_delete(vm: &VmInfo, tag: &str) -> Confirm {
     }
 }
 
+/// Memory in words: whole GiB where it is one, else MiB.
+fn memory(mib: u64) -> String {
+    if mib.is_multiple_of(1024) {
+        format!("{} GiB", mib / 1024)
+    } else {
+        format!("{mib} MiB")
+    }
+}
+
 const MIB_PER_GIB: f64 = 1024.0;
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 /// Addresses shown at most; a guest reports what it likes.
@@ -1013,11 +1022,7 @@ pub type Facts = Vec<(&'static str, Vec<(&'static str, String)>)>;
 
 pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
     let k = kind(&vm.state);
-    let memory = if vm.memory_mib.is_multiple_of(1024) {
-        format!("{} GiB", vm.memory_mib / 1024)
-    } else {
-        format!("{} MiB", vm.memory_mib)
-    };
+    let memory = memory(vm.memory_mib);
     let used = details.map_or("Unknown".to_owned(), |d| {
         format!("{:.1} GiB", d.disk_used_bytes as f64 / BYTES_PER_GIB)
     });
@@ -1687,12 +1692,12 @@ pub fn stop_offer(vm: &VmInfo) -> Option<(Op, &'static str)> {
     }
 }
 
-/// What the Overview's Delete VM row says: the daemon deletes only
-/// stopped VMs.
-pub fn remove_note(vm: &VmInfo) -> &'static str {
-    match stop_offer(vm) {
-        None => "Deletes its disk and all its snapshots for good.",
-        Some(_) => "Stop the VM to delete it.",
+/// What the Overview's Delete VM row says, and whether it can delete
+/// now: the daemon deletes only stopped VMs.
+pub fn remove_note(vm: &VmInfo) -> (&'static str, bool) {
+    match kind(&vm.state) {
+        Kind::Stopped => ("Deletes its disk and all its snapshots for good.", true),
+        _ => ("Stop the VM to delete it.", false),
     }
 }
 
@@ -1706,6 +1711,8 @@ pub fn resize_block(vm: &VmInfo) -> Option<&'static str> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResizeForm {
     pub vcpus: u32,
+    /// What the VM has now, exactly.
+    pub memory_mib: u64,
     pub memory_gib: u64,
     pub max_vcpus: u32,
     pub max_memory_gib: u64,
@@ -1721,6 +1728,7 @@ pub fn resize_form(vm: &VmInfo, host: &HostInfo) -> ResizeForm {
     let memory_gib = (vm.memory_mib / 1024).max(1);
     ResizeForm {
         vcpus: vm.vcpus,
+        memory_mib: vm.memory_mib,
         memory_gib,
         max_vcpus: limits.vcpus.max(vm.vcpus).min(255),
         max_memory_gib: limits.memory_gib.max(memory_gib),
@@ -1740,7 +1748,11 @@ impl ResizeForm {
     pub fn notes(&self) -> [String; 2] {
         [
             format!("Up to {}", self.max_vcpus),
-            format!("Up to {} GiB", self.max_memory_gib),
+            format!(
+                "Now {} · up to {} GiB",
+                memory(self.memory_mib),
+                self.max_memory_gib
+            ),
         ]
     }
 }
@@ -1990,9 +2002,11 @@ pub const MAX_DOWNLOAD: u64 = 16 << 30;
 pub const FILE_LIMIT: Duration = Duration::from_secs(180);
 
 /// What the Files tab shows instead of its buttons while the VM does not
-/// run. Fixed text only.
-pub fn files_status(vm: &VmInfo) -> Option<ScreenStatus> {
+/// run. Fixed text only. A copy that runs (`copying`) keeps the buttons
+/// and its progress in view, even when the VM stops under it.
+pub fn files_status(vm: &VmInfo, copying: bool) -> Option<ScreenStatus> {
     let (title, description, button) = match kind(&vm.state) {
+        _ if copying => return None,
         Kind::Running => return None,
         Kind::Stopped => (
             "The VM Is Stopped",
@@ -2185,6 +2199,79 @@ impl Transfer {
         }
         let verb = if self.upload { "upload" } else { "download" };
         failure(format!("Could not {verb} {}", self.name), e)
+    }
+}
+
+/// A copy that runs, as the Files tab of its VM shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyJob {
+    pub transfer: Transfer,
+    /// Cancel was pressed: it stops after the chunk in flight.
+    pub cancelled: bool,
+}
+
+impl CopyJob {
+    /// What the progress row's subtitle says.
+    pub fn subtitle(&self) -> String {
+        if self.cancelled {
+            "Cancelling…".to_owned()
+        } else {
+            self.transfer.progress()
+        }
+    }
+}
+
+/// The copies that run, one per VM at most, kept by the window rather
+/// than a VM's page, so a page opened again shows its VM's copy.
+#[derive(Debug, Default)]
+pub struct Copies(HashMap<String, CopyJob>);
+
+impl Copies {
+    /// Claims `vm` for a copy; false if one runs there already.
+    pub fn start(&mut self, vm: &str, transfer: Transfer) -> bool {
+        if self.0.contains_key(vm) {
+            return false;
+        }
+        let job = CopyJob {
+            transfer,
+            cancelled: false,
+        };
+        self.0.insert(vm.to_owned(), job);
+        true
+    }
+
+    pub fn get(&self, vm: &str) -> Option<&CopyJob> {
+        self.0.get(vm)
+    }
+
+    /// The size is known now.
+    pub fn sized(&mut self, vm: &str, total: u64) {
+        if let Some(j) = self.0.get_mut(vm) {
+            j.transfer.total = Some(total);
+        }
+    }
+
+    /// `bytes` more are copied.
+    pub fn copied(&mut self, vm: &str, bytes: u64) {
+        if let Some(j) = self.0.get_mut(vm) {
+            j.transfer.done += bytes;
+        }
+    }
+
+    pub fn cancel(&mut self, vm: &str) {
+        if let Some(j) = self.0.get_mut(vm) {
+            j.cancelled = true;
+        }
+    }
+
+    /// Whether the copy on `vm` should stop: cancelled, or gone.
+    pub fn stops(&self, vm: &str) -> bool {
+        self.0.get(vm).is_none_or(|j| j.cancelled)
+    }
+
+    /// The copy ended; frees `vm` for the next one.
+    pub fn finish(&mut self, vm: &str) -> Option<CopyJob> {
+        self.0.remove(vm)
     }
 }
 
@@ -4228,24 +4315,64 @@ mod tests {
             down.failed(&CallError::Timeout).title,
             "Could not download b"
         );
-        assert_eq!(files_status(&vm("running")), None);
-        assert_eq!(files_status(&vm("stopped")).unwrap().button, Some("Start"));
-        let paused = files_status(&vm("paused")).unwrap();
+        assert_eq!(files_status(&vm("running"), false), None);
+        assert_eq!(
+            files_status(&vm("stopped"), false).unwrap().button,
+            Some("Start")
+        );
+        // A copy that runs stays in view when the VM stops under it.
+        assert_eq!(files_status(&vm("stopped"), true), None);
+        let paused = files_status(&vm("paused"), false).unwrap();
         assert_eq!(paused.button, None);
         assert!(paused.description.contains("while the VM runs"));
+    }
+
+    #[test]
+    fn copies_outlive_the_page() {
+        let mut c = Copies::default();
+        assert!(c.get("dev").is_none() && c.stops("dev"), "none runs");
+        assert!(c.start("dev", Transfer::new(true, "/tmp/a.txt")));
+        // One copy per VM; another VM is free.
+        assert!(!c.start("dev", Transfer::new(false, "/tmp/b")));
+        assert!(c.start("web", Transfer::new(false, "/tmp/b")));
+        assert!(!c.stops("dev"));
+        c.sized("dev", 4 << 20);
+        c.copied("dev", 1 << 20);
+        c.copied("dev", 1 << 20);
+        let job = c.get("dev").unwrap();
+        assert_eq!(job.transfer.title(), "Uploading a.txt…");
+        assert_eq!(job.subtitle(), "2.0 MiB of 4.0 MiB");
+        assert_eq!(job.transfer.fraction(), Some(0.5));
+        // Cancel: says so, and stops after the chunk in flight.
+        c.cancel("dev");
+        assert!(c.stops("dev") && !c.stops("web"));
+        assert_eq!(c.get("dev").unwrap().subtitle(), "Cancelling…");
+        let done = c.finish("dev").unwrap();
+        assert_eq!(done.transfer.done, 2 << 20);
+        assert!(c.get("dev").is_none());
+        assert!(c.start("dev", Transfer::new(true, "/tmp/c")), "free again");
+        // Updates to a VM without a copy change nothing.
+        c.copied("nope", 5);
+        c.cancel("nope");
+        assert!(c.get("nope").is_none());
     }
 
     #[test]
     fn deleting_a_vm() {
         let stopped = vm("stopped");
         assert_eq!(stop_offer(&stopped), None);
-        assert!(remove_note(&stopped).contains("for good"));
+        let (note, can) = remove_note(&stopped);
+        assert!(note.contains("for good") && can);
         assert_eq!(stop_offer(&vm("running")), Some((Op::Stop, "Stop")));
         assert_eq!(
             stop_offer(&vm("paused (disk full)")),
             Some((Op::ForceOff, "Force Off…"))
         );
-        assert_eq!(remove_note(&vm("running")), "Stop the VM to delete it.");
+        assert_eq!(
+            remove_note(&vm("running")),
+            ("Stop the VM to delete it.", false)
+        );
+        assert!(!remove_note(&vm("paused")).1);
         let c = confirm_remove(&stopped);
         assert_eq!(c.heading, "Delete dev?");
         assert!(c.body.contains("disk") && c.body.contains("snapshots"));
@@ -4350,6 +4477,7 @@ mod tests {
             form,
             ResizeForm {
                 vcpus: 2,
+                memory_mib: 2048,
                 memory_gib: 2,
                 max_vcpus: room.vcpus,
                 max_memory_gib: room.memory_gib,
@@ -4359,7 +4487,7 @@ mod tests {
             form.notes(),
             [
                 format!("Up to {}", room.vcpus),
-                format!("Up to {} GiB", room.memory_gib)
+                format!("Now 2 GiB · up to {} GiB", room.memory_gib)
             ]
         );
         // Only what changed is sent; nothing changed, nothing to save.
@@ -4397,6 +4525,7 @@ mod tests {
         assert_eq!((f.max_vcpus, f.max_memory_gib), (8, 6));
         // Odd MiB stay unless memory is changed.
         assert_eq!(f.memory_gib, 6);
+        assert_eq!(f.notes()[1], "Now 6656 MiB · up to 6 GiB");
         assert_eq!(
             f.action(4, 6),
             Some(Action::Resize {

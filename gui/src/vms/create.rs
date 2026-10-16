@@ -256,16 +256,18 @@ impl Form {
             .build();
         name.upcast_ref::<gtk::Widget>()
             .update_relation(&[gtk::accessible::Relation::DescribedBy(&[hint.upcast_ref()])]);
-        let live_screen = adw::SwitchRow::builder()
-            .title("Live Screen")
-            .subtitle("See and use the VM's screen in this window.")
-            .use_markup(false)
-            .active(true)
-            .build();
         let name_group = adw::PreferencesGroup::new();
         name_group.add(&name);
         name_group.add(&hint);
-        name_group.add(&live_screen);
+        // Its own group: the name's hint stays right under the name.
+        let live_screen = adw::SwitchRow::builder()
+            .title("Live Screen")
+            .subtitle("See and use the VM's screen here. Anyone in the stallo group can too.")
+            .use_markup(false)
+            .active(true)
+            .build();
+        let screen_group = adw::PreferencesGroup::new();
+        screen_group.add(&live_screen);
 
         let spin = |title: &str, value: u64, lower: u64| {
             let adjustment = gtk::Adjustment::new(
@@ -304,6 +306,7 @@ impl Form {
         let page = adw::PreferencesPage::new();
         page.add(&image_group);
         page.add(&name_group);
+        page.add(&screen_group);
         page.add(&advanced_group);
         stack.add_named(&page, Some("form"));
         stack.set_visible_child_name("form");

@@ -21,7 +21,7 @@ use stallo::snapshot::Snapshot;
 
 use crate::Ui;
 use crate::client;
-use crate::model::{self, Action, Op, Pending, Poll, Setting};
+use crate::model::{self, Action, Copies, CopyJob, Op, Pending, Poll, Setting};
 use crate::screen::Screen;
 
 /// The pill around a VM's state in the sidebar.
@@ -41,6 +41,8 @@ pub struct Vms {
     detail: RefCell<Option<Rc<Detail>>>,
     /// VMs with an action in flight or just done: one at a time per VM.
     pending: RefCell<Pending>,
+    /// File copies that run, by VM: they outlive the VM's page.
+    copies: RefCell<Copies>,
     /// The daemon answers (no reconnect banner).
     online: Cell<bool>,
     memory_bar: gtk::LevelBar,
@@ -125,12 +127,12 @@ struct Detail {
     connect_agent: adw::ActionRow,
     remove_row: adw::ActionRow,
     remove: gtk::Button,
-    /// In the Delete VM row while the VM is not stopped.
-    remove_stop: gtk::Button,
     resources: adw::PreferencesGroup,
     resize: gtk::Button,
     /// In place of Edit while the VM is not stopped.
     resize_stop: gtk::Button,
+    /// The host is asked for its free resources before the editor opens.
+    resizing: Cell<bool>,
     details: RefCell<Option<VmDetails>>,
     poll: RefCell<Poll>,
     tabs: adw::ViewStack,
@@ -282,6 +284,7 @@ impl Vms {
             none,
             detail: RefCell::default(),
             pending: RefCell::default(),
+            copies: RefCell::default(),
             online: Cell::new(true),
             memory_bar,
             memory,
@@ -535,7 +538,8 @@ impl Vms {
     fn refresh(&self, detail: &Detail) {
         if let Some(vm) = self.vm(&detail.name) {
             let working = self.pending.borrow().action(&detail.name).cloned();
-            detail.update(&vm, self.online.get(), working.as_ref());
+            let copy = self.copies.borrow().get(&detail.name).cloned();
+            detail.update(&vm, self.online.get(), working.as_ref(), copy.as_ref());
         }
     }
 
@@ -815,12 +819,22 @@ impl Vms {
     /// Asks for new processors and memory, capped by what the host has
     /// free now.
     fn ask_resize(self: &Rc<Self>, name: &str) {
+        let Some(detail) = self.detail.borrow().clone().filter(|d| d.name == name) else {
+            return;
+        };
+        // One editor at a time: Edit stays off until the host answers.
+        if detail.resizing.replace(true) {
+            return;
+        }
+        self.refresh(&detail);
         let (v, socket, name) = (Rc::downgrade(self), self.socket.clone(), name.to_owned());
         glib::spawn_future_local(async move {
             let got = client::spawn(async move { client::host(&socket).await }).await;
+            detail.resizing.set(false);
             let Some(v) = v.upgrade() else {
                 return;
             };
+            v.refresh(&detail);
             match got {
                 Ok(Ok(host)) => v.resize_dialog(&name, &host),
                 Ok(Err(e)) => v.ui.fail(&model::failure(
@@ -1158,15 +1172,10 @@ impl Detail {
                 v.ask_remove(&name);
             }
         });
-        let remove_stop = gtk::Button::builder()
-            .valign(gtk::Align::Center)
-            .visible(false)
-            .build();
         let remove_row = adw::ActionRow::builder()
             .title("Delete VM")
             .use_markup(false)
             .build();
-        remove_row.add_suffix(&remove_stop);
         remove_row.add_suffix(&remove);
         let remove_group = adw::PreferencesGroup::new();
         remove_group.add(&remove_row);
@@ -1298,10 +1307,10 @@ impl Detail {
             connect_agent,
             remove_row,
             remove,
-            remove_stop,
             resources: resources.expect("a Resources group"),
             resize,
             resize_stop,
+            resizing: Cell::new(false),
             details: RefCell::default(),
             poll: RefCell::new(Poll::new(model::INFO_EVERY)),
             tabs,
@@ -1321,7 +1330,7 @@ impl Detail {
 
     /// Shows `vm` as it is now. No actions while offline or while an
     /// action on it runs or just ran (`working`).
-    fn update(&self, vm: &VmInfo, online: bool, working: Option<&Action>) {
+    fn update(&self, vm: &VmInfo, online: bool, working: Option<&Action>, copy: Option<&CopyJob>) {
         let blocked = !online || working.is_some();
         let set = model::actions(vm, blocked);
         for (action, op) in self.actions.iter().zip(Op::ALL) {
@@ -1342,7 +1351,7 @@ impl Detail {
         }
         self.screen
             .update(vm, self.details.borrow().as_ref(), blocked);
-        self.files.update(vm, blocked);
+        self.files.update(vm, blocked, copy);
         for (row, setting) in [
             (&self.live_screen, Setting::LiveScreen),
             (&self.agent, Setting::Agent),
@@ -1353,17 +1362,22 @@ impl Detail {
             }
         }
         self.connect_agent.set_visible(vm.agent_control);
-        // Both need the VM stopped: until then each offers the stop.
-        let stopped = model::stop_offer(vm).is_none();
-        self.remove_row.set_subtitle(model::remove_note(vm));
-        self.remove.set_visible(stopped);
-        self.remove.set_sensitive(!blocked);
-        offer_stop(&self.remove_stop, vm);
+        // Both need the VM stopped.
+        let (note, can_remove) = model::remove_note(vm);
+        self.remove_row.set_subtitle(note);
+        self.remove.set_sensitive(!blocked && can_remove);
         // Fixed text only: descriptions are markup.
         self.resources.set_description(model::resize_block(vm));
-        self.resize.set_visible(stopped);
-        self.resize.set_sensitive(!blocked);
-        offer_stop(&self.resize_stop, vm);
+        let stop = model::stop_offer(vm);
+        self.resize.set_visible(stop.is_none());
+        self.resize.set_sensitive(!blocked && !self.resizing.get());
+        // Edit's place offers the stop it needs.
+        self.resize_stop.set_visible(stop.is_some());
+        if let Some((op, label)) = stop {
+            self.resize_stop.set_label(label);
+            self.resize_stop
+                .set_action_name(Some(&format!("vm.{}", op.action())));
+        }
         let facts = model::facts(vm, self.details.borrow().as_ref());
         let values = facts.into_iter().flat_map(|(_, rows)| rows);
         for (row, (_, value)) in self.values.iter().zip(values) {
@@ -1469,17 +1483,6 @@ impl Detail {
             delete,
             working,
         }
-    }
-}
-
-/// Shows `button` as the stop a change needs first, if it does; its
-/// action decides whether it is enabled.
-fn offer_stop(button: &gtk::Button, vm: &VmInfo) {
-    let stop = model::stop_offer(vm);
-    button.set_visible(stop.is_some());
-    if let Some((op, label)) = stop {
-        button.set_label(label);
-        button.set_action_name(Some(&format!("vm.{}", op.action())));
     }
 }
 
