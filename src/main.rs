@@ -11,6 +11,7 @@ use serde_json::Value;
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Via, VmInfo};
 use stallo::config::NetProfile;
 use stallo::host::HostInfo;
+use stallo::images::{Kind, Os};
 use stallo::snapshot::{Restored, Snapshot, Taken};
 
 #[derive(Parser)]
@@ -40,10 +41,12 @@ enum Cmd {
         /// [default: 2]
         #[arg(long)]
         cpus: Option<u32>,
-        /// Memory, e.g. 2G or 1536M [default: 2G; 4G for an installer ISO].
+        /// Memory, e.g. 2G or 1536M [default: 2G; 4G for an installer ISO
+        /// or Windows].
         #[arg(long, value_parser = parse_mib)]
         mem: Option<u64>,
-        /// Disk size, e.g. 20G [default: 20G; 32G for an installer ISO].
+        /// Disk size, e.g. 20G [default: 20G; 32G for an installer ISO;
+        /// 64G for Windows].
         #[arg(long, value_parser = parse_gib)]
         disk: Option<u64>,
         #[arg(long, value_enum, default_value = "offline")]
@@ -150,6 +153,10 @@ enum Cmd {
         /// Memory, e.g. 4G or 1536M (the VM must be stopped).
         #[arg(long, value_parser = parse_mib, group = "change")]
         mem: Option<u64>,
+        /// Network profile of a VM made from an installer ISO (the VM must
+        /// be stopped).
+        #[arg(long, value_enum, group = "change")]
+        net: Option<Net>,
         /// Empty the CD-ROM drive of a VM made from an installer ISO
         /// (`eject`), or put a pulled ISO in it (its image id).
         #[arg(long, value_name = "eject|ISO", group = "change")]
@@ -181,7 +188,7 @@ enum Cmd {
         #[arg(long, value_name = "FILE", requires = "http")]
         token_file: Option<PathBuf>,
     },
-    /// List images, download one or delete one.
+    /// List images, download, import or delete one.
     Images {
         #[command(subcommand)]
         action: Option<ImagesCmd>,
@@ -199,6 +206,23 @@ enum McpCmd {
 enum ImagesCmd {
     /// Download and verify an image.
     Pull { id: String },
+    /// Import an installer ISO you downloaded yourself. It is copied into
+    /// Stallo as is: nothing verifies it.
+    Import {
+        /// The ISO file (read with your own rights).
+        path: PathBuf,
+        /// What the ISO installs.
+        #[arg(long, value_enum)]
+        os: ImportOs,
+        /// The image id (`local-` is added if missing; default: from the
+        /// file name).
+        #[arg(long)]
+        id: Option<String>,
+        /// A label for `stallo images`: letters, digits, spaces, `.`, `_`
+        /// and `-` (default: the id).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Delete a cached image (refused while a VM uses it). To get a newer
     /// build of a moving image, delete it and pull it again.
     Rm {
@@ -216,9 +240,24 @@ enum OnOff {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum ImportOs {
+    Windows,
+    Linux,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum Net {
     Offline,
     Internet,
+}
+
+impl From<Net> for NetProfile {
+    fn from(net: Net) -> Self {
+        match net {
+            Net::Offline => Self::Offline,
+            Net::Internet => Self::Internet,
+        }
+    }
 }
 
 /// Exit code for errors of stallo itself (daemon unreachable, no such VM,
@@ -292,15 +331,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             no_wait,
             vnc,
         } => {
-            let net = match net {
-                Net::Offline => NetProfile::Offline,
-                Net::Internet => NetProfile::Internet,
-            };
+            let net = net.into();
             let forwards = forwards
                 .iter()
                 .map(|f| stallo::net::parse_forward(f, bind))
                 .collect::<Result<_>>()?;
-            let (def_cpus, def_mem, def_disk) = new_defaults(&image);
+            let (def_cpus, def_mem, def_disk) = match stallo::images::find(&image) {
+                Ok(e) => new_defaults(Some(e.kind), Some(e.os)),
+                // An image only the daemon knows: ask it what it is.
+                Err(_) => {
+                    let images: Vec<ImageInfo> =
+                        serde_json::from_value(call(Request::Images).await?)?;
+                    let info = images.into_iter().find(|i| i.id == image);
+                    new_defaults(info.as_ref().and_then(|i| i.kind), info.and_then(|i| i.os))
+                }
+            };
             let v = call(Request::New {
                 vcpus: cpus.unwrap_or(def_cpus),
                 memory_mib: mem.unwrap_or(def_mem),
@@ -469,6 +514,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             vnc,
             cpus,
             mem,
+            net,
             cdrom,
         } => {
             // First, so a running VM is refused before VNC changes.
@@ -487,6 +533,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 None
             };
+            let mut net_result = None;
+            if let Some(net) = net {
+                let v = call(Request::SetNet {
+                    name: vm.clone(),
+                    net: net.into(),
+                })
+                .await
+                .map_err(|e| match resources {
+                    Some(_) => e.context(format!(
+                        "the CPU/memory change of {vm} was applied, the network change was not"
+                    )),
+                    None => e,
+                })?;
+                if !json {
+                    let info: VmInfo = serde_json::from_value(v.clone())?;
+                    println!("{vm}  {}", summary(&info));
+                }
+                net_result = Some(v);
+            }
             let mut vnc_result = None;
             if let Some(vnc) = vnc {
                 let on = matches!(vnc, OnOff::On);
@@ -495,11 +560,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     on,
                 })
                 .await
-                .map_err(|e| match resources {
-                    Some(_) => e.context(format!(
-                        "the CPU/memory change of {vm} was applied, VNC was not"
+                .map_err(|e| match (&resources, &net_result) {
+                    (None, None) => e,
+                    _ => e.context(format!(
+                        "the other changes of {vm} were applied, VNC was not"
                     )),
-                    None => e,
                 })?;
                 if !json {
                     let when = if v["running"] == true {
@@ -522,8 +587,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     iso: iso.clone(),
                 })
                 .await
-                .map_err(|e| match (&resources, &vnc_result) {
-                    (None, None) => e,
+                .map_err(|e| match (&resources, &net_result, &vnc_result) {
+                    (None, None, None) => e,
                     _ => e.context(format!(
                         "the other changes of {vm} were applied, the CD-ROM change was not"
                     )),
@@ -544,6 +609,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if json {
                 print_json(&serde_json::json!({
                     "resources": resources,
+                    "net": net_result,
                     "vnc": vnc_result,
                     "cdrom": cdrom_result,
                 }));
@@ -605,10 +671,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", mcp_install(&exe, socket.as_deref(), &path)?);
         }
         Cmd::Images { action } => {
-            // Pull and rm answer null; show the catalog afterwards.
+            // Pull, import and rm: show the catalog afterwards.
             match action {
                 Some(ImagesCmd::Pull { id }) => {
                     call(Request::Pull { image: id }).await?;
+                }
+                Some(ImagesCmd::Import { path, os, id, name }) => {
+                    import(&socket, &path, os, id, name).await?;
                 }
                 Some(ImagesCmd::Rm { id, yes }) => {
                     if !yes {
@@ -897,13 +966,66 @@ fn snaps_table(list: &[Snapshot], now: u64) -> String {
     out
 }
 
-/// `stallo new`'s (vcpus, memory MiB, disk GiB) for `image`: a desktop
-/// installed from an ISO needs more than a cloud image.
-fn new_defaults(image: &str) -> (u32, u64, u64) {
-    match stallo::images::find(image).map(|e| e.kind) {
-        Ok(stallo::images::Kind::Iso) => (2, 4096, 32),
+/// `stallo new`'s (vcpus, memory MiB, disk GiB) for an image of `kind` and
+/// `os` (`None`: unknown, as in `ImageInfo`): a desktop installed from an
+/// ISO needs more than a cloud image, and Windows more still.
+fn new_defaults(kind: Option<Kind>, os: Option<Os>) -> (u32, u64, u64) {
+    match (kind, os) {
+        (_, Some(Os::Windows)) => stallo::config::WINDOWS_MIN,
+        (Some(Kind::Iso), _) => (2, 4096, 32),
         _ => (2, 2048, 20),
     }
+}
+
+/// `stallo images import`: opens the file with the user's own rights and
+/// streams it to stallod, which never sees the path.
+async fn import(
+    socket: &std::path::Path,
+    path: &std::path::Path,
+    os: ImportOs,
+    id: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
+    use stallo::images::{self, LOCAL_PREFIX};
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let meta = file.metadata()?;
+    let size = meta.len();
+    ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    ensure!(
+        size <= images::MAX_IMPORT_BYTES,
+        "{} is larger than {} GiB",
+        path.display(),
+        images::MAX_IMPORT_BYTES >> 30
+    );
+    let id = match id {
+        Some(id) if images::is_local(&id) => id,
+        Some(id) => format!("{LOCAL_PREFIX}{id}"),
+        None => images::local_id(&path.file_stem().unwrap_or_default().to_string_lossy()),
+    };
+    let name = name.unwrap_or_else(|| id.clone());
+    let os = match os {
+        ImportOs::Windows => images::Os::Windows,
+        ImportOs::Linux => images::Os::Linux,
+    };
+    eprintln!(
+        "importing {} ({}) as {id}...",
+        path.display(),
+        mib(size >> 20)
+    );
+    let request = Request::ImportIso { id, os, name, size };
+    // `take`: a file that grows meanwhile sends `size` bytes all the same.
+    let body = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), size);
+    api::upload(
+        socket,
+        &Envelope {
+            via: Via::Cli,
+            request,
+        },
+        body,
+    )
+    .await?;
+    Ok(())
 }
 
 fn images_table(images: &[ImageInfo]) -> String {
@@ -1123,11 +1245,19 @@ mod tests {
 
     #[test]
     fn defaults_per_image_kind() {
-        assert_eq!(new_defaults("ubuntu-26.04"), (2, 2048, 20));
-        assert_eq!(new_defaults("fedora-44-workstation"), (2, 4096, 32));
-        assert_eq!(new_defaults("ubuntu-26.04-desktop"), (2, 4096, 32));
-        // An image only a newer daemon knows: the cloud defaults.
-        assert_eq!(new_defaults("other"), (2, 2048, 20));
+        let catalog = |id| {
+            let e = stallo::images::find(id).unwrap();
+            new_defaults(Some(e.kind), Some(e.os))
+        };
+        assert_eq!(catalog("ubuntu-26.04"), (2, 2048, 20));
+        assert_eq!(catalog("fedora-44-workstation"), (2, 4096, 32));
+        assert_eq!(catalog("ubuntu-26.04-desktop"), (2, 4096, 32));
+        // An image the daemon does not describe: the cloud defaults.
+        assert_eq!(new_defaults(None, None), (2, 2048, 20));
+        // Windows: its minimums, from an ISO or not.
+        for kind in [Some(Kind::Iso), None] {
+            assert_eq!(new_defaults(kind, Some(Os::Windows)), (2, 4096, 64));
+        }
     }
 
     #[test]
@@ -1370,6 +1500,15 @@ mod tests {
             } if c == "eject"
         ));
         assert!(set(&["--cdrom", "fedora-44-workstation"]).is_ok());
+        let c = set(&["--net", "internet"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                net: Some(Net::Internet),
+                ..
+            }
+        ));
+        assert!(set(&["--net", "lan"]).is_err());
         assert!(set(&["--cdrom"]).is_err());
         assert!(set(&[]).is_err(), "at least one setting");
         assert!(set(&["--mem", "2T"]).is_err());

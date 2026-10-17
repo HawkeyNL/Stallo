@@ -172,8 +172,17 @@ impl Daemon {
     /// [`Daemon::start_sized`] with catalog image `id` (a cloud image or
     /// an installer ISO) instead of [`image_id`].
     pub fn start_with(name: &str, config: &str, max_memory_mib: u64, id: &str) -> Self {
+        Self::launch(name, config, max_memory_mib, Some(id))
+    }
+
+    /// [`Daemon::start_sized`] without any image, for a test that imports
+    /// its own (`stallo images import`).
+    pub fn start_without_image(name: &str, config: &str, max_memory_mib: u64) -> Self {
+        Self::launch(name, config, max_memory_mib, None)
+    }
+
+    fn launch(name: &str, config: &str, max_memory_mib: u64, id: Option<&str>) -> Self {
         assert!(max_memory_mib <= MAX_SIZED_MIB);
-        let id = id.to_owned();
         let home = env_path("HOME");
         let (lock, cache_root) = exclusive();
 
@@ -189,24 +198,26 @@ impl Daemon {
 
         // Hard-link the cached image (free) and copy the debs (small), if
         // the image needs any.
-        let file = match stallo::images::find(&id).map(|e| e.kind) {
-            Ok(stallo::images::Kind::Iso) => format!("{id}.iso"),
-            _ => format!("{id}.qcow2"),
-        };
-        let source = home.join(".local/share/stallo-dev/images");
-        let image = source.join(&file);
-        assert!(
-            image.exists(),
-            "{} missing; run `stallo images pull {id}` in dev mode first",
-            image.display()
-        );
-        fs::hard_link(&image, images.join(&file)).unwrap();
-        let debs = images.join(format!("{id}.debs"));
-        if let Ok(cached) = fs::read_dir(source.join(format!("{id}.debs"))) {
-            fs::create_dir(&debs).unwrap();
-            for e in cached {
-                let e = e.unwrap();
-                fs::copy(e.path(), debs.join(e.file_name())).unwrap();
+        if let Some(id) = id {
+            let file = match stallo::images::find(id).map(|e| e.kind) {
+                Ok(stallo::images::Kind::Iso) => format!("{id}.iso"),
+                _ => format!("{id}.qcow2"),
+            };
+            let source = home.join(".local/share/stallo-dev/images");
+            let image = source.join(&file);
+            assert!(
+                image.exists(),
+                "{} missing; run `stallo images pull {id}` in dev mode first",
+                image.display()
+            );
+            fs::hard_link(&image, images.join(&file)).unwrap();
+            let debs = images.join(format!("{id}.debs"));
+            if let Ok(cached) = fs::read_dir(source.join(format!("{id}.debs"))) {
+                fs::create_dir(&debs).unwrap();
+                for e in cached {
+                    let e = e.unwrap();
+                    fs::copy(e.path(), debs.join(e.file_name())).unwrap();
+                }
             }
         }
 
@@ -255,7 +266,7 @@ impl Daemon {
         let socket = runtime.join("api.sock");
         let d = Self {
             name: name.to_owned(),
-            image: id,
+            image: id.unwrap_or_default().to_owned(),
             unit,
             cache_root,
             base,
@@ -329,7 +340,8 @@ impl Daemon {
     }
 
     /// Panics unless every process in the unit outside the daemon and tools
-    /// leaves is an offline, small QEMU, and `vm` has one.
+    /// leaves is an offline, small QEMU or a swtpm on an inherited socket,
+    /// and `vm` has one.
     pub fn assert_safe(&self, vm: &str) {
         assert!(!self.vm_pids(vm).is_empty(), "no processes in vm-{vm}");
         for entry in fs::read_dir(&self.cgroup).unwrap().flatten() {
@@ -344,7 +356,15 @@ impl Daemon {
                     .filter(|a| !a.is_empty())
                     .map(|a| String::from_utf8_lossy(a).into_owned())
                     .collect();
-                check_argv_max(&argv, self.max_memory_mib);
+                if argv[0] == stallo::tpm::SWTPM {
+                    // Only a Windows VM has an swtpm, on its own state.
+                    let vm = name.strip_prefix("vm-").expect("a VM cgroup");
+                    let cfg = stallo::config::VmConfig::load(&self.vm_dir(vm)).unwrap();
+                    assert!(!cfg.machine.is_linux(), "swtpm in Linux VM {vm}");
+                    check_swtpm_argv(&argv, &self.vm_dir(vm).join(stallo::tpm::DIR));
+                } else {
+                    check_argv_max(&argv, self.max_memory_mib);
+                }
             }
         }
     }
@@ -429,6 +449,46 @@ fn check_argv_max(argv: &[String], max_memory_mib: u64) {
         assert!(
             mem <= max_memory_mib,
             "too much memory for this host: {mem}"
+        );
+    }
+}
+
+/// The harness rules for a swtpm command line: the VM's own state in
+/// `tpm_dir`, a control channel on an inherited socket, no data socket, no
+/// TCP, no socket or log file.
+pub fn check_swtpm_argv(argv: &[String], tpm_dir: &Path) {
+    assert_eq!(argv[1], "socket", "{argv:?}");
+    let state: Vec<&String> = argv
+        .windows(2)
+        .filter(|w| w[0] == "--tpmstate")
+        .map(|w| &w[1])
+        .collect();
+    assert_eq!(
+        state,
+        [&format!("dir={}", tpm_dir.display())],
+        "swtpm must keep its VM's own state: {argv:?}"
+    );
+    let ctrl: Vec<&String> = argv
+        .windows(2)
+        .filter(|w| w[0] == "--ctrl")
+        .map(|w| &w[1])
+        .collect();
+    assert!(
+        ctrl.len() == 1
+            && ctrl[0].starts_with("type=unixio,clientfd=")
+            && ctrl[0].ends_with(",terminate"),
+        "swtpm must use an inherited control socket: {argv:?}"
+    );
+    for bad in ["--server", "--port", "-p", "--daemon", "-d"] {
+        assert!(
+            !argv.iter().any(|a| a == bad),
+            "swtpm must have no {bad}: {argv:?}"
+        );
+    }
+    for bad in ["tcp", "path=", "bindaddr", "file="] {
+        assert!(
+            !argv.iter().any(|a| a.contains(bad)),
+            "swtpm must have no listener ({bad}): {argv:?}"
         );
     }
 }

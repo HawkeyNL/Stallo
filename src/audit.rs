@@ -35,10 +35,13 @@ pub struct Entry {
     pub pid: Option<i32>,
     pub via: Via,
     pub op: &'static str,
-    /// The image `pull`, `image_rm` and `set_cdrom` act on, if it is a
-    /// valid image id.
+    /// The image `pull`, `image_rm`, `set_cdrom` and `import_iso` act on,
+    /// if it is a valid image id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// SHA-256 of an imported ISO, once the import succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     /// Sizes in bytes (or counts) of the arguments that carry content.
     pub args: BTreeMap<&'static str, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,20 +182,49 @@ pub fn describe(r: &Request) -> Described<'_> {
             ],
             None,
         ),
+        Request::SetNet { name, net } => (
+            "set_net",
+            Some(name),
+            vec![(
+                "internet",
+                u64::from(*net == crate::config::NetProfile::Internet),
+            )],
+            None,
+        ),
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),
         Request::Pull { .. } => ("pull", None, vec![], None),
         Request::ImageRm { .. } => ("image_rm", None, vec![], None),
+        // The id is in `image`; the client's file path never reaches stallod.
+        Request::ImportIso { os, name, size, .. } => (
+            "import_iso",
+            None,
+            vec![
+                ("name", len(name)),
+                ("size", *size),
+                ("windows", u64::from(*os == crate::images::Os::Windows)),
+            ],
+            None,
+        ),
     }
 }
 
-/// The image a request acts on (`pull`, `image_rm`, the ISO of
-/// `set_cdrom`), if its id is valid: anything else is untrusted text and
+/// The SHA-256 to log for an operation's result: an import's.
+pub fn sha256(op: &str, data: &serde_json::Value) -> Option<String> {
+    (op == "import_iso")
+        .then(|| data["sha256"].as_str())
+        .flatten()
+        .map(str::to_owned)
+}
+
+/// The image a request acts on (`pull`, `image_rm`, `import_iso`, the ISO
+/// of `set_cdrom`), if its id is valid: anything else is untrusted text and
 /// stays out of the log.
 pub fn image(r: &Request) -> Option<String> {
     match r {
         Request::Pull { image }
         | Request::ImageRm { image }
+        | Request::ImportIso { id: image, .. }
         | Request::SetCdrom {
             iso: Some(image), ..
         } => {
@@ -265,6 +297,7 @@ mod tests {
             via: Via::Mcp,
             op,
             image: None,
+            sha256: None,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 7,
@@ -346,6 +379,7 @@ mod tests {
             via: Via::Cli,
             op,
             image: None,
+            sha256: None,
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 0,
@@ -385,6 +419,15 @@ mod tests {
         let (op, vm, args, argv0) = describe(&resize);
         assert_eq!((op, vm, argv0), ("set_resources", Some("dev"), None));
         assert_eq!(args, [("memory_mib", 0), ("vcpus", 4)]);
+        let net = Request::SetNet {
+            name: "dev".into(),
+            net: crate::config::NetProfile::Internet,
+        };
+        assert_eq!(
+            describe(&net),
+            ("set_net", Some("dev"), vec![("internet", 1)], None)
+        );
+        assert!(entry(&net).contains(r#""op":"set_net","args":{"internet":1}"#));
         let mut new = Request::New {
             name: "dev".into(),
             image: "arch".into(),
@@ -438,6 +481,48 @@ mod tests {
         *iso = None;
         assert_eq!(describe(&cd).2, [("eject", 1)]);
         assert_eq!(image(&cd), None);
+        // `import_iso`: its id, the label's size, never the label itself.
+        let import = Request::ImportIso {
+            id: "local-win11".into(),
+            os: crate::images::Os::Windows,
+            name: "secret label".into(),
+            size: 7 << 30,
+        };
+        assert_eq!(
+            describe(&import),
+            (
+                "import_iso",
+                None,
+                vec![("name", 12), ("size", 7 << 30), ("windows", 1)],
+                None
+            )
+        );
+        assert_eq!(image(&import).as_deref(), Some("local-win11"));
+        assert!(!entry(&import).contains("secret"));
+        // A successful import logs its SHA-256; nothing else does.
+        let data = serde_json::json!({"id": "local-win11", "sha256": "ab12", "size": 1});
+        assert_eq!(sha256("import_iso", &data).as_deref(), Some("ab12"));
+        assert_eq!(sha256("images", &data), None);
+        assert_eq!(sha256("import_iso", &serde_json::Value::Null), None);
+        let e = Entry {
+            time_ms: 1,
+            uid: 1000,
+            pid: None,
+            via: Via::Cli,
+            op: "import_iso",
+            image: image(&import),
+            sha256: sha256("import_iso", &data),
+            args: describe(&import).2.into_iter().collect(),
+            argv0: None,
+            result_bytes: 0,
+            ms: 0,
+            ok: true,
+        };
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(
+            line.contains(r#""image":"local-win11","sha256":"ab12""#),
+            "{line}"
+        );
         let e = Entry {
             time_ms: 1,
             uid: 1000,
@@ -445,6 +530,7 @@ mod tests {
             via: Via::Cli,
             op: "image_rm",
             image: image(&rm),
+            sha256: None,
             args: BTreeMap::new(),
             argv0: None,
             result_bytes: 0,

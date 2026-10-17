@@ -243,7 +243,8 @@ ICMP with one `ping`. "Without table" is the control run.
 - **Not tested:** multicast and broadcast destinations (passt does not
   relay them, and the table drops them), and IPv4-mapped IPv6 destinations.
   A v4-mapped `sendto` leaves the host as an IPv4 packet, so `deny4` covers
-  it; the `::ffff:0:0/96` entry in `deny6` is only a backstop.
+  it; the `::ffff:0:0/96` entry in `deny6` is only a backstop. *Later
+  found:* the table's DNS exception does not, see "Known gaps".
 
 ## Throughput and latency
 
@@ -326,6 +327,59 @@ table inet stallo {
   the user is recreated with another uid, the table must be reloaded.
   Otherwise the probe fails and `internet` starts are refused, which is
   fail closed.
+
+## Known gaps
+
+### IPv4-mapped loopback DNS (found 2026-10-17; guests are IPv4 only since)
+
+- **The gap.** passt drops guest frames whose source or destination is
+  `127.0.0.0/8` or `::1` (passt `tap.c`, IPv4 and IPv6 handlers), but not
+  an IPv6 frame to the IPv4-mapped `::ffff:127.0.0.53`. passt treats that
+  address as IPv4 (`nat_outbound` in `fwd.c` passes it on unchanged) and
+  opens an IPv4 socket to `127.0.0.53:53` as user `stallo`. The table's
+  exception for the daemon's own downloads,
+  `ip daddr 127.0.0.53 … th dport 53 accept`, comes before the
+  `fib daddr type local` drop, so the query reaches the host's resolver
+  and its answer goes back to the guest. A guest that crafts such frames
+  (admin rights in the guest) could ask the host's split DNS: tailnet and
+  LAN names, `/etc/hosts`, and make resolved send LLMNR or mDNS queries
+  into the LAN. It needs IPv6 in passt, that is, IPv6 on the host.
+- **Evidence.** passt `0.0~git20260120.386b5f5-1` (Ubuntu's) in an offline
+  nested guest, our exact flags, `--fd` from a socketpair, a dummy uplink
+  with IPv4 and IPv6 default routes, and a logging UDP/TCP responder on
+  `127.0.0.53:53`. Frames sent by a test client:
+
+  | Frame | Without `-4` | With `-4` |
+  |---|---|---|
+  | IPv4 UDP to `127.0.0.53:53` | dropped (`Loopback address on tap interface`) | dropped |
+  | IPv6 UDP to `[::ffff:127.0.0.53]:53` | **relayed**: the responder logged a query from `127.0.0.1:40001`, and the guest got the DNS answer from `::ffff:127.0.0.53:53` | dropped, nothing reached the responder |
+  | IPv6 TCP SYN to `[::ffff:127.0.0.53]:53` | passt was killed by its seccomp filter (signal 31): the guest loses only its own network | dropped |
+
+- **Mitigation now.** passt runs with `-4` (`net::passt_args`): guests get
+  IPv4 only, no IPv6 internet. passt then refuses IPv6 listeners, so
+  IPv6 port forwards (`--bind ::1`) are refused at create and start.
+  passt has no option that drops IPv4-mapped destinations.
+- **Plan to get IPv6 back** (not done): allow the resolver only to the
+  daemon's helper programs, which run in the `tools/` leaf of the
+  daemon's cgroup (`src/cgroup.rs`), never in a `vm-<name>/` leaf where
+  passt runs:
+
+  ```
+  socket cgroupv2 level 3 "system.slice/stallod.service/tools" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+  ```
+
+  - nft resolves the path to a cgroup id when the rule is loaded. The
+    path must exist then, and the id changes whenever stallod restarts
+    (systemd recreates its cgroup). So the rule must load after stallod
+    created `tools/`, in a small table of its own, replaced on every
+    start. `stallod.service` is `Type=exec`, so a plain `ExecStartPost`
+    runs before `tools/` exists: switch to `Type=notify` with `READY=1`
+    after the cgroup setup, or use a root helper that waits for the path.
+    Until the rule is loaded, downloads fail (fail closed).
+  - The isolation probe should then also expect `EPERM` for UDP to
+    `127.0.0.53:53` sent from the `daemon/` leaf.
+  - Then drop `-4` and re-run the frames above: the IPv6 UDP row must be
+    dropped by the table.
 
 ## Not covered here
 
@@ -515,3 +569,97 @@ reference.
   public IPv4 resolver for guests (default `9.9.9.9`, Quad9).
 - **The table also limits the daemon itself.** Its image downloads cannot
   use a proxy or mirror on the LAN or on localhost.
+
+## Windows guests
+
+**Not verified yet.** The lab above used Linux guests. Windows guests and
+VMs from any imported ISO take the `internet` profile with the same passt
+flags and the same table. So do VMs from a catalog ISO. This checklist is
+for the owner's first Windows VM on a production install. A VM installed
+offline gets the profile later with `stallo set <vm> --net internet`
+(stopped, no RAM snapshots); the same checks apply.
+
+**Why nothing changes for the isolation:**
+- Everything is enforced on the host. passt turns the guest's frames into
+  sockets of user `stallo`, the table drops those to denied addresses, and
+  passt runs under its AppArmor profile. Nothing is configured inside the
+  guest.
+- A guest that sets its own address, gateway or DNS server still only
+  reaches passt. Its packets to a LAN DNS server or router leave the host
+  as `stallo` sockets and are dropped.
+- The catalog's per-image `internet` flag does not apply. It exists
+  because a cloud image's seed (`network-config`) must match the NIC, or
+  DHCP never comes up and the VM is never ready. A VM from an ISO
+  (imported or from the catalog) has no seed: the installed OS asks
+  passt's DHCP itself.
+
+**What the guest gets** (passt's behaviour, not checked with Windows):
+- An Intel 82574L card (QEMU `e1000e`), which Windows has a driver for.
+- IPv4 by DHCP: **the laptop's own LAN address** and its default gateway
+  (passt copies them), DNS server `169.254.1.53`, no search domain.
+- No IPv6: passt runs IPv4 only (see "Known gaps").
+- Windows ignores DHCP's MTU option and keeps 1500. passt sizes TCP
+  segments to the guest's MSS, so this should not matter.
+
+**Before you start, on the laptop:**
+1. Do "Check the host first" under "Installing on a host". If the LAN
+   has global IPv6, or the router answers on its WAN address, **do not
+   continue** until the LAN's IPv6 prefix is in `deny6` and the WAN
+   address in `deny4` (`/etc/stallo/stallo.nft`, then
+   `sudo systemctl reload stallo-nft`).
+2. Check the table: `sudo nft list table inet stallo` must print it.
+3. Note the addresses to test, with `ip -br addr` and `ip route show default`:
+   - `<gw>`: the default gateway (your router);
+   - `<lan-dev>`: another device on the LAN with a known open port, for
+     example a NAS or printer web page;
+   - `<host-other>`: any other address of the laptop that is not its LAN
+     address (`docker0`, `virbr0`, `tailscale0`), if it has one;
+   - `<lan-v6>`: a LAN device's global IPv6 address, if the LAN has global
+     IPv6 (`ip -6 neigh` on the laptop lists neighbours);
+   - `<wan>`: the router's public address (its status page, or
+     `curl -s https://ifconfig.me` from the laptop).
+4. Controls, as your own user on the laptop: `curl -m 3 http://<gw>/`
+   and the `<lan-dev>` page answer.
+5. Optional, to prove that no guest address reaches the laptop's
+   loopback: `python3 -m http.server 8000 --bind 127.0.0.1` in a
+   terminal (loopback only; stop it with Ctrl+C afterwards).
+6. Create the VM: `stallo new win --image local-<id> --net internet`.
+   An offline VM gets it with `stallo set <vm> --net internet` (stopped
+   VM, no RAM snapshots).
+
+**Inside Windows**, in PowerShell (during Setup: Shift+F10, then
+`powershell`):
+
+| # | Command | Expected |
+|---|---|---|
+| 1 | `ipconfig /all` | The Intel 82574L adapter, `DHCP Enabled: Yes`, the laptop's LAN address, `Default Gateway` = `<gw>`, `DNS Servers` = `169.254.1.53`, no DNS suffix |
+| 2 | `nslookup example.com` | `Address: 169.254.1.53` as server, and an answer |
+| 3 | `Test-NetConnection example.com -Port 443` | `TcpTestSucceeded : True` |
+| 4 | `curl.exe -sI https://www.google.com` | `HTTP/1.1 200` (or a redirect) |
+| 5 | In Edge, download and install Chrome; browse a few sites | works |
+| 6 | `curl.exe -6 -sI https://ipv6.google.com` | fails: no IPv6 (passt `-4`) |
+| 7 | `Test-NetConnection <gw> -Port 80` | `TcpTestSucceeded : False` (after a timeout) |
+| 8 | `Test-NetConnection <lan-dev> -Port <its port>` | `False` |
+| 9 | `nslookup example.com <gw>` (UDP to the router's DNS) | `timed out` |
+| 10 | `Test-NetConnection <host-other> -Port 22` (each one) | `False` |
+| 11 | With step 5's server: `Test-NetConnection <gw> -Port 8000` and `Test-NetConnection 169.254.1.53 -Port 8000` | `False`: neither address is mapped to the laptop's loopback (this row tests only that mapping) |
+| 12 | `Test-NetConnection 169.254.169.254 -Port 80`, `Test-NetConnection 10.0.0.1 -Port 80` | `False` |
+| 13 | If the laptop runs Tailscale: `Test-NetConnection 100.100.100.100 -Port 53`, and `nslookup <laptop's tailnet name>` | `False`; no tailnet answer |
+| 14 | `ping <gw>` | no replies |
+| 15 | If the LAN has global IPv6: `Test-NetConnection <lan-v6> -Port <its port>` | `False` |
+| 16 | `Test-NetConnection <wan> -Port 80` and `-Port 443` | `False` |
+
+- **Blocked means a timeout**, not "refused" (finding 7). A `True` in rows
+  7 to 13, 15 or 16 is an isolation failure: stop the VM (`stallo stop win`) and
+  report it.
+- Testing the laptop's LAN address from Windows proves nothing: it is the
+  guest's own address, so Windows answers itself.
+- `ping` to internet hosts may fail even when the internet works: passt
+  needs ping sockets for it (`net.ipv4.ping_group_range`). Use rows 3 and 4.
+- If pages stall while small requests work, note the output of
+  `netsh interface ipv4 show subinterfaces` (MTU) with the report.
+
+**Optional, fail closed** (changes the laptop's firewall for a moment):
+`sudo nft delete table inet stallo`. Within 2 s `stallo ls` shows
+`running (no network)` and row 3 fails. Roll back with
+`sudo systemctl reload stallo-nft`, then `stallo stop win && stallo start win`.

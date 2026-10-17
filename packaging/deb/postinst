@@ -29,15 +29,18 @@ abort-upgrade | abort-deconfigure | abort-remove) ;;
 *) exit 0 ;;
 esac
 
-# QEMU's profile (stallod refuses to start VMs without it: fail closed).
-if ! aa-enabled --quiet 2>/dev/null; then
-	echo "stallo: AppArmor is not enabled; VMs will not start (stallo-qemu)" >&2
-elif [ -e /etc/apparmor.d/disable/stallo-qemu ]; then
-	echo "stallo: the profile stallo-qemu is disabled; VMs will not start" >&2
-else
-	apparmor_parser -r -W /etc/apparmor.d/stallo-qemu ||
-		echo "stallo: cannot load the AppArmor profile stallo-qemu; VMs will not start" >&2
-fi
+# The profiles of QEMU and of swtpm (Windows VMs). stallod refuses to start
+# a VM without its profile: fail closed.
+for profile in stallo-qemu stallo-swtpm; do
+	if ! aa-enabled --quiet 2>/dev/null; then
+		echo "stallo: AppArmor is not enabled; VMs will not start ($profile)" >&2
+	elif [ -e "/etc/apparmor.d/disable/$profile" ]; then
+		echo "stallo: the profile $profile is disabled; VMs that need it will not start" >&2
+	else
+		apparmor_parser -r -W "/etc/apparmor.d/$profile" ||
+			echo "stallo: cannot load the AppArmor profile $profile; VMs that need it will not start" >&2
+	fi
+done
 if [ -d /run/systemd/system ]; then
 	systemctl daemon-reload >/dev/null || true
 fi

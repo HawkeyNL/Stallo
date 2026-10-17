@@ -77,8 +77,8 @@ Guest images (`stallo images` lists them):
 | `fedora-44` | Fedora 44 Cloud Base Generic (44-1.7) | The guest agent's SELinux domain is made permissive (see `catalog/fedora-44.toml`). Offline only for now. |
 | `arch` | Arch Linux cloud image (arch-boxes) | No Secure Boot (its boot loader is not signed for it). Rolling: `latest/` moves every two weeks, and the first pull is kept. Offline only for now. |
 | `debian-13` | Debian 13 generic cloud image (20261015-2632) | Pinned (upstream unsigned): Debian signs no checksums for its cloud images, so Stallo checks a SHA-512 built into it, and a newer build needs a Stallo release. So does a new Debian archive key: the archive keyring that checks the guest-agent package is vendored, and fetches fail until a release ships the new one. Offline only for now. |
-| `ubuntu-26.04-desktop` | Ubuntu 26.04.1 LTS Desktop installer ISO (about 6 GB) | You install it on the VM's screen; no guest agent until you install one. Defaults: 2 vCPUs, 4 GiB, 32 GiB disk. Pinned to the point release: the next one needs a catalog bump. Offline only for now. |
-| `fedora-44-workstation` | Fedora 44 Workstation live installer ISO (44-1.7, about 2.7 GB) | You install it on the VM's screen; no guest agent until you install one (its SELinux domain then needs to be permissive). Defaults: 2 vCPUs, 4 GiB, 32 GiB disk. Offline only for now. |
+| `ubuntu-26.04-desktop` | Ubuntu 26.04.1 LTS Desktop installer ISO (about 6 GB) | You install it on the VM's screen; no guest agent until you install one. Defaults: 2 vCPUs, 4 GiB, 32 GiB disk. Pinned to the point release: the next one needs a catalog bump. |
+| `fedora-44-workstation` | Fedora 44 Workstation live installer ISO (44-1.7, about 2.7 GB) | You install it on the VM's screen; no guest agent until you install one (its SELinux domain then needs to be permissive). Defaults: 2 vCPUs, 4 GiB, 32 GiB disk. |
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
 
@@ -94,7 +94,9 @@ longer. Arch signs the image itself rather than a checksum list. Debian's image 
 catalog (`catalog/debian-13.toml`), while its guest-agent package comes
 from the signed Debian archive. The `internet` profile is refused for
 images it was not verified with (`internet` in the catalog entry): so far
-the Ubuntu ones.
+the Ubuntu ones. VMs from an installer ISO (from the catalog or imported,
+Windows too) take it: they have no seed, so their own OS takes its
+address from passt's DHCP.
 
 A pull starts only if the image's filesystem keeps the disk floor
 (`disk_floor_gib`) free plus twice the image's largest size, or once for
@@ -198,6 +200,10 @@ user: they can reach the daemon socket just like `stallo` can.
     opens to those ranges.
   - Guest DNS goes to a public resolver (`[net] dns` in `stallod.toml`,
     default `9.9.9.9`).
+  - IPv4 only for now: guests get no IPv6, and port forwards bind IPv4
+    addresses only. On a host without an IPv4 default route, `internet`
+    VMs have no network (see "Known gaps" in
+    [docs/network-verification.md](docs/network-verification.md)).
   - Optional TCP port forwards: host ports above 1024, on `127.0.0.1`
     unless `--bind` names one host address:
 
@@ -254,7 +260,8 @@ turn it on. `stallo set <vm> --vnc off` removes it at the next start.
 
 An installer ISO gives you a full desktop that you install yourself on
 the VM's screen, as on a real PC. Stallo only boots the installer: there
-is no seed, no cloud-init and no guest password, and the VM is offline.
+is no seed, no cloud-init and no guest password. The VM is offline unless
+you create it with `--net internet` (production mode).
 
 1. Pull the ISO (humans only). Fedora's is about 2.7 GB, Ubuntu's about
    6 GB. A pull needs the disk floor (`disk_floor_gib`, 20 GiB by
@@ -301,9 +308,9 @@ agent in the guest, which Stallo does not install:
 
 - Check `systemctl status qemu-guest-agent`; if it is missing, install the
   `qemu-guest-agent` package, then
-  `sudo systemctl enable --now qemu-guest-agent`. The VM is offline for
-  now: if neither the installed system nor its ISO holds the package, it
-  cannot be installed yet.
+  `sudo systemctl enable --now qemu-guest-agent`. Without
+  `--net internet` (production mode) the VM is offline: if neither the
+  installed system nor its ISO holds the package, it cannot be installed.
 - Without `--admin`, Stallo runs commands and file copies as the guest
   user `agent`. Create that user with a locked password, or use
   `--admin` (root) for every call:
@@ -318,12 +325,90 @@ Stallo does not wait for a guest agent in a VM made from an ISO: not at
 `new`, `start` or snapshot restore, even after you install one. Agents
 may not create such VMs or change their CD-ROM drive. With agent control
 on (`stallo agent desk on`) they may use the screen, keyboard and mouse,
-and also files and commands once the guest agent runs.
+and also files and commands once the guest agent runs; on an `internet`
+VM that means they can browse, sign in and download as you would.
 
 Disk space: the cached ISO stays until you remove it
 (`stallo images rm fedora-44-workstation`, refused while a VM has it in
 its drive). The VM's disk grows as you install, up to its full size, and
 each RAM snapshot of it takes up to its memory size.
+
+### Importing your own ISO
+
+For an ISO that is not in the catalog, download it yourself and import it
+(humans only). `--os` says what it installs; Stallo does not look inside:
+
+```sh
+stallo images import ~/Downloads/Win11_25H2_English_x64.iso --os windows
+stallo new win --image local-win11-25h2-english-x64
+```
+
+The id is `local-` plus the file name (choose one with `--id`, a label
+with `--name`). The `stallo` command reads the file with your own rights
+and sends it to stallod, which keeps a read-only copy of up to 12 GiB:
+that needs the ISO's size above the disk floor. Nothing verifies an
+imported ISO; `stallo images` shows its SHA-256 to compare with the one
+its publisher lists. It then works like a pulled ISO: `stallo new`,
+`stallo set --cdrom` and `stallo images rm`. A Linux ISO boots without
+Secure Boot, a Windows ISO with it.
+
+A VM from an installer ISO (catalog or imported) may use `--net internet`.
+Humans can change its profile while it is stopped and has no RAM
+snapshots: `stallo set <vm> --net internet` (or `offline`). A VM from a
+cloud image keeps the profile it was created with. Windows gets an e1000e
+network card, which it has a driver for. That emulated card is QEMU code the guest
+can reach, a larger surface than virtio-net; QEMU's seccomp filter, Landlock
+rules and AppArmor profile contain it. The isolation is the same as for
+every `internet` VM and is enforced on the host only; the checks to run
+inside Windows are in
+[docs/network-verification.md](docs/network-verification.md#windows-guests).
+
+### Install Windows 11
+
+Stallo ships no Windows: download the Windows 11 ISO from Microsoft's
+website and use your own licence.
+
+1. Import it with `stallo images import … --os windows` (above), or
+   **Use My Own ISO…** in the desktop app's new-VM dialog.
+2. Create the VM. Windows VMs get Secure Boot, a TPM 2.0 (swtpm) and at
+   least 2 vCPUs, 4 GiB and a 64 GiB disk. On a production install, add
+   `--net internet` ([Network profiles](#network-profiles), and the
+   [checks inside Windows](docs/network-verification.md#windows-guests));
+   offline also works:
+
+   ```sh
+   stallo new win --image local-win11-25h2-english-x64 --net internet
+   ```
+
+   An offline install makes a local account easy (step 5). Afterwards,
+   stop the VM and give it internet, for example to install a browser:
+   `stallo set win --net internet` (production mode).
+
+3. Open the screen. You need not catch "Press any key to boot from CD or
+   DVD": while the ISO is in the drive, the daemon presses Enter for you
+   in the first seconds after each start. If you miss the prompt and land
+   in the firmware menu, stop and start the VM.
+4. In Setup, choose the keyboard layout **US** (not US-International):
+   the agents' `type_text` assumes it. Install on the unallocated space.
+5. Setup asks for a Microsoft account. For a local account, press
+   Shift+F10 for a command prompt and run `start ms-cxh:localonly`. If
+   that does nothing, run
+   `reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f`,
+   then `shutdown /r /t 0`; after the restart Setup offers "I don't have
+   internet". Microsoft keeps removing these bypasses. Stallo was tested
+   up to Setup's first pages only (build 26100.1742, Enterprise
+   Evaluation), not yet through a full install.
+6. Eject the ISO when the install is done (`stallo set win --cdrom eject`),
+   then stop and start the VM.
+
+Take snapshots while the VM runs (`stallo snap win before-update`): a RAM
+snapshot keeps the running Windows and its TPM state together.
+
+Costs: the imported ISO copy (5 to 8 GB) until `stallo images rm`, a
+sparse 64 GiB disk that grows as Windows installs and updates, 4 GiB of
+RAM while it runs, and up to 4 GiB for each RAM snapshot. File copies
+(`stallo cp`), commands (`stallo exec`) and a guest agent are not
+available for Windows yet; the screen, keyboard and mouse are.
 
 ## Agents (MCP)
 

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use stallo::api::{ImageInfo, Request, VmDetails, VmInfo};
 use stallo::config::NetProfile;
 use stallo::host::HostInfo;
+use stallo::images::Os;
 use stallo::printable;
 use stallo::snapshot::Snapshot;
 
@@ -464,6 +465,8 @@ fn next_step(e: &CallError) -> Option<&'static str> {
     };
     if msg.contains("guest agent") {
         Some("Check that qemu-guest-agent is installed and running in the VM.")
+    } else if msg.contains("only restore with its current network") {
+        Some("Delete the snapshots that hold memory in the Snapshots tab, then try again.")
     } else if msg.contains("RAM snapshots") {
         Some(
             "Delete the snapshots that hold memory in the Snapshots tab, or keep the current size.",
@@ -522,6 +525,8 @@ pub enum Action {
     },
     /// Empties the CD-ROM drive (the installer ISO) from the next start.
     Eject,
+    /// Turns internet access of a stopped VM on or off.
+    Internet(bool),
 }
 
 impl Action {
@@ -555,6 +560,14 @@ impl Action {
                 memory_mib: *memory_mib,
             }],
             Action::Eject => vec![Request::SetCdrom { name, iso: None }],
+            Action::Internet(on) => vec![Request::SetNet {
+                name,
+                net: if *on {
+                    NetProfile::Internet
+                } else {
+                    NetProfile::Offline
+                },
+            }],
             Action::Restart { live_screen: on } => on
                 .then(|| live_screen(true))
                 .into_iter()
@@ -582,6 +595,7 @@ impl Action {
                 | Action::Remove
                 | Action::Resize { .. }
                 | Action::Eject
+                | Action::Internet(_)
         )
     }
 
@@ -633,6 +647,13 @@ impl Action {
             Action::Remove => (format!("delete {vm}"), None),
             Action::Resize { .. } => (format!("change the resources of {vm}"), None),
             Action::Eject => (format!("eject the installer of {vm}"), None),
+            Action::Internet(on) => (
+                format!(
+                    "turn {} internet access of {vm}",
+                    if *on { "on" } else { "off" }
+                ),
+                None,
+            ),
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
                 Some(format!("Snapshot of {vm} still running")),
@@ -683,6 +704,8 @@ impl Action {
             Action::Remove => "Deleting VM…",
             Action::Resize { .. } => "Changing resources…",
             Action::Eject => "Ejecting installer…",
+            Action::Internet(true) => "Turning on internet access…",
+            Action::Internet(false) => "Turning off internet access…",
         }
     }
 
@@ -692,9 +715,11 @@ impl Action {
         let vm = printable(vm, 64);
         match self {
             // The Screen tab or the switch shows the outcome.
-            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. } | Action::Agent(_) => {
-                None
-            }
+            Action::Life(_)
+            | Action::LiveScreen(_)
+            | Action::Restart { .. }
+            | Action::Agent(_)
+            | Action::Internet(_) => None,
             Action::Remove => Some(format!("{vm} deleted")),
             Action::Resize { .. } => Some(format!("Resources of {vm} changed")),
             Action::Eject => Some(format!("Installer ejected from {vm}. {AT_NEXT_START}")),
@@ -1033,14 +1058,6 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
     let used = details.map_or("Unknown".to_owned(), |d| {
         format!("{:.1} GiB", d.disk_used_bytes as f64 / BYTES_PER_GIB)
     });
-    let net = match vm.net {
-        NetProfile::Offline => "Off",
-        // The daemon cut it: the network check failed.
-        NetProfile::Internet if vm.state.ends_with(" (no network)") => {
-            "Cut off until the VM restarts"
-        }
-        NetProfile::Internet => "On",
-    };
     let forwards = if vm.forwards.is_empty() {
         "None".to_owned()
     } else {
@@ -1080,13 +1097,10 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
                 ("Disk Used", used),
             ],
         ),
+        // Internet Access is a switch above these (`internet_switch_block`).
         (
             "Network",
-            vec![
-                ("Internet Access", net.to_owned()),
-                ("Port Forwards", forwards),
-                ("Addresses", addresses),
-            ],
+            vec![("Port Forwards", forwards), ("Addresses", addresses)],
         ),
         ("Guest", vec![("Guest Agent", agent.to_owned())]),
     ]
@@ -1179,7 +1193,9 @@ pub const NEW_INSTALLER_DISK_GIB: u64 = 32;
 /// The processors, memory (GiB) and disk (GiB) a VM from `image` gets
 /// unless changed, as `stallo new` gives it.
 pub fn new_defaults(image: &ImageChoice) -> (u32, u64, u64) {
-    if image.installer {
+    if image.windows {
+        minimums(image)
+    } else if image.installer {
         (NEW_VCPUS, NEW_INSTALLER_MEMORY_GIB, NEW_INSTALLER_DISK_GIB)
     } else {
         (NEW_VCPUS, NEW_MEMORY_GIB, NEW_DISK_GIB)
@@ -1197,6 +1213,26 @@ pub fn live_screen_lock(image: &ImageChoice) -> Option<&'static str> {
 /// The smallest disk offered: above the virtual size of every catalog
 /// image, which the daemon requires.
 pub const MIN_DISK_GIB: u64 = 10;
+
+/// The least processors, memory (GiB) and disk (GiB) a VM from `image`
+/// may have: Windows has its own, which the daemon enforces.
+pub fn minimums(image: &ImageChoice) -> (u32, u64, u64) {
+    if image.windows {
+        let (vcpus, memory_mib, disk_gib) = stallo::config::WINDOWS_MIN;
+        (vcpus, memory_mib >> 10, disk_gib)
+    } else {
+        (1, 1, MIN_DISK_GIB)
+    }
+}
+
+/// Under the processors, memory and disk when Windows is chosen.
+pub const WINDOWS_MINIMUMS: &str =
+    "Windows 11 needs at least 2 processors, 4 GiB memory and 64 GiB disk.";
+/// Under the installers when Windows is chosen, instead of
+/// [`INSTALLER_NOTE`].
+pub const WINDOWS_NOTE: &str =
+    "You install Windows yourself, like on a real PC. Choose a local account during setup.";
+
 /// The largest disk the daemon accepts (`VmConfig::validate`).
 pub const MAX_DISK_GIB: u64 = 16384;
 /// The time limit of a create: a first download of a few GiB on a slow
@@ -1221,6 +1257,8 @@ pub struct ImageChoice {
     pub download_reserve: u64,
     /// An installer ISO: installed by hand on the VM's screen.
     pub installer: bool,
+    /// Installs Windows.
+    pub windows: bool,
     /// The internet profile was verified with this image.
     pub internet: bool,
 }
@@ -1257,11 +1295,14 @@ pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
             let installer =
                 i.kind.or(entry.as_ref().map(|e| e.kind)) == Some(stallo::images::Kind::Iso);
             let (title, detail) = split_name(&i.name);
+            let local = stallo::images::is_local(&i.id);
             let os = i.os.map(|os| match os {
                 stallo::images::Os::Linux => "Linux".to_owned(),
                 stallo::images::Os::Windows => "Windows".to_owned(),
             });
             let state = match (i.cached, i.size_bytes) {
+                (true, Some(b)) if local => format!("Imported ({})", size(b)),
+                (true, _) if local => "Imported".to_owned(),
                 (true, Some(b)) => format!("Downloaded ({})", size(b)),
                 (true, None) => "Downloaded".to_owned(),
                 _ if download_bytes > 0 => {
@@ -1282,6 +1323,7 @@ pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
                 download_bytes,
                 download_reserve,
                 installer,
+                windows: i.os == Some(stallo::images::Os::Windows),
                 internet: entry.is_some_and(|e| e.internet),
             }
         })
@@ -1358,15 +1400,15 @@ impl Limits {
         ]
     }
 
-    /// Why no VM fits now, if so.
-    pub fn block(&self) -> Option<&'static str> {
-        if self.vcpus < 1 {
-            Some("This computer has too few processor cores for a VM.")
-        } else if self.memory_gib < 1 {
-            Some("Not enough free memory for another VM. Stop a VM first.")
+    /// Why no VM with at least `min` (see [`minimums`]) fits now, if so.
+    pub fn block(&self, min: (u32, u64, u64)) -> Option<&'static str> {
+        if self.vcpus < min.0 {
+            Some("This computer has too few processor cores for this VM.")
+        } else if self.memory_gib < min.1 {
+            Some("Not enough free memory for this VM. Stop a VM first.")
         } else if !self.download_fits {
             Some("Not enough free disk space to download this image. Free up space first.")
-        } else if self.disk_gib < MIN_DISK_GIB {
+        } else if self.disk_gib < min.2 {
             Some("Not enough free disk space for this VM. Free up space first.")
         } else {
             None
@@ -1377,9 +1419,11 @@ impl Limits {
 /// Why the internet cannot be turned on for `image`, if so. Only the
 /// production daemon has the isolation the internet profile needs.
 pub fn internet_block(image: &ImageChoice, production: bool) -> Option<&'static str> {
+    // As the daemon's `check_net`: an installer ISO (catalog or imported,
+    // Linux or Windows) may use it; a cloud image only if verified.
     if !production {
         Some("Not available: the dev-mode daemon keeps VMs offline.")
-    } else if !image.internet {
+    } else if !image.internet && !image.installer {
         Some("Not available for this image yet.")
     } else {
         None
@@ -1394,6 +1438,8 @@ pub fn production(socket: &Path) -> bool {
 /// A free name for a VM from `image`: `ubuntu`, then `ubuntu-2`...
 pub fn suggest_vm_name(image: &str, taken: &[String]) -> String {
     let base: String = image
+        .strip_prefix(stallo::images::LOCAL_PREFIX)
+        .unwrap_or(image)
         .chars()
         .take_while(char::is_ascii_lowercase)
         .take(24)
@@ -1410,6 +1456,12 @@ pub fn suggest_vm_name(image: &str, taken: &[String]) -> String {
         })
         .find(|n| vm_name(n, taken).is_ok())
         .unwrap_or(base)
+}
+
+/// A free name for a VM from `image`: as [`suggest_vm_name`], with
+/// `windows` for Windows (an imported ISO's id is the file's name).
+pub fn suggest_name_for(image: &ImageChoice, taken: &[String]) -> String {
+    suggest_vm_name(if image.windows { "windows" } else { &image.id }, taken)
 }
 
 /// The name typed for a new VM, checked as the daemon checks it.
@@ -1432,10 +1484,135 @@ pub fn vm_name(typed: &str, taken: &[String]) -> Result<String, String> {
 }
 
 /// The collapsed Advanced row says what the VM gets.
-pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64, internet: bool) -> String {
+pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64) -> String {
     let s = if vcpus == 1 { "" } else { "s" };
-    let net = if internet { "Internet" } else { "Offline" };
-    format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk · {net}")
+    format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk")
+}
+
+/// Starts of words in the file names and volume labels of Windows ISOs:
+/// Microsoft names them by build (`…CLIENTCONSUMER_RET_x64FRE_en-us.iso`)
+/// and labels them `CCCOMA_X64FRE_EN-US_DV9`, `CENA_X64FREE_EN-US_DV9` and
+/// the like.
+const WINDOWS_MARKS: &[&str] = &[
+    "win",
+    "x64fre",
+    "x86fre",
+    "arm64fre",
+    "a64fre",
+    "cccoma",
+    "cena",
+    "cpba",
+    "ccsa",
+    "clientconsumer",
+    "clientbusiness",
+];
+/// Starts of words in the names and labels of Linux ISOs.
+const LINUX_MARKS: &[&str] = &[
+    "linux",
+    "ubuntu",
+    "kubuntu",
+    "xubuntu",
+    "lubuntu",
+    "fedora",
+    "debian",
+    "mint",
+    "archlinux",
+    "opensuse",
+    "suse",
+    "manjaro",
+    "elementary",
+    "zorin",
+    "centos",
+    "rocky",
+    "almalinux",
+    "kali",
+    "nixos",
+    "gentoo",
+    "endeavouros",
+    "rhel",
+];
+
+/// The system an ISO installs, guessed from the words of its file name and
+/// its ISO 9660 volume label; `None` when unsure, and the user is asked.
+/// Only a label: nothing about the file is trusted.
+pub fn guess_os(file_name: &str, label: &str) -> Option<Os> {
+    let text = format!("{file_name} {label}").to_ascii_lowercase();
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |marks: &[&str]| words.iter().any(|w| marks.iter().any(|m| w.starts_with(m)));
+    match (has(WINDOWS_MARKS), has(LINUX_MARKS)) {
+        (true, false) => Some(Os::Windows),
+        (false, true) => Some(Os::Linux),
+        _ => None,
+    }
+}
+
+/// What the import row says while it runs.
+pub fn importing(label: &str, os: Os) -> String {
+    let os = match os {
+        Os::Linux => "Linux",
+        Os::Windows => "Windows",
+    };
+    format!("Importing {label} as {os}…")
+}
+
+/// An import's progress: done as a share, 0 to 1, and in words.
+pub fn import_progress(done: u64, total: u64) -> (f64, String) {
+    let share = match total {
+        0 => 1.0,
+        t => (done as f64 / t as f64).min(1.0),
+    };
+    let text = format!(
+        "{} of {} ({:.0}%)",
+        bytes(done),
+        bytes(total),
+        (share * 100.0).floor()
+    );
+    (share, text)
+}
+
+/// An import failed for a reason with no next step to give.
+pub const IMPORT_FAILED: &str = "Could not import the ISO. Try again.";
+
+/// An ISO with the same id is there already.
+pub const IMPORTED_ALREADY: &str =
+    "An ISO with this file name is imported already. Choose it under Installers.";
+
+/// Why an ISO import failed, in plain sentences with what to do next.
+// ponytail: matches the daemon's English text, as `next_step` does.
+pub fn import_error(e: &CallError) -> String {
+    let m = match e {
+        CallError::Failed(m) => m.as_str(),
+        CallError::Timeout => return "The import took too long. Try again.".to_owned(),
+        _ => {
+            return format!(
+                "Could not import the ISO. {}",
+                next_step(e).unwrap_or_default()
+            );
+        }
+    };
+    if m.contains("not an ISO image") || m.contains("too small to be an ISO") {
+        "This file is not an ISO image. Choose another file.".to_owned()
+    } else if m.contains(" exists;") {
+        IMPORTED_ALREADY.to_owned()
+    } else if m.contains("not enough disk space") {
+        "Not enough free disk space for this ISO. Free up space, then try again.".to_owned()
+    } else if m.contains("pull or import is in progress") {
+        "Another image is being downloaded or imported. Try again when it ends.".to_owned()
+    } else if m.contains("not a regular file") {
+        "Only regular files can be imported. Choose an ISO file.".to_owned()
+    } else if m.starts_with("cannot open ") {
+        "Stallo cannot read this file. Check that you can open it, then try again.".to_owned()
+    } else if m.contains("larger than") {
+        format!(
+            "This file is larger than {} GiB, the most Stallo imports.",
+            stallo::images::MAX_IMPORT_BYTES >> 30
+        )
+    } else {
+        format!("Could not import the ISO: {}", printable(m, 200))
+    }
 }
 
 /// A VM to create, as the dialog has it. `name` and `image` are raw.
@@ -1705,6 +1882,7 @@ pub fn confirm_restart(vm: &VmInfo) -> Confirm {
 pub enum Setting {
     LiveScreen,
     Agent,
+    Internet,
 }
 
 impl Setting {
@@ -1713,6 +1891,7 @@ impl Setting {
         match self {
             Setting::LiveScreen => vm.vnc,
             Setting::Agent => vm.agent_control,
+            Setting::Internet => vm.net == NetProfile::Internet,
         }
     }
 
@@ -1720,14 +1899,17 @@ impl Setting {
         match self {
             Setting::LiveScreen => Action::LiveScreen(on),
             Setting::Agent => Action::Agent(on),
+            Setting::Internet => Action::Internet(on),
         }
     }
 
-    /// The question before turning it on.
-    pub fn confirm(self, vm: &VmInfo) -> Confirm {
+    /// The question before turning it on, if any. Internet access asks
+    /// none: the host stays isolated, and it turns off again as easily.
+    pub fn confirm(self, vm: &VmInfo) -> Option<Confirm> {
         match self {
-            Setting::LiveScreen => confirm_live_screen_switch(vm),
-            Setting::Agent => confirm_agent(vm),
+            Setting::LiveScreen => Some(confirm_live_screen_switch(vm)),
+            Setting::Agent => Some(confirm_agent(vm)),
+            Setting::Internet => None,
         }
     }
 
@@ -1738,12 +1920,13 @@ impl Setting {
 
     /// What its switch moving to `active` asks for: nothing when the
     /// switch only follows the VM (an update), the action when it turns
-    /// off, the question (`None` inside) when it turns on.
+    /// off, the question (`None` inside) when it turns on, unless there
+    /// is none to ask.
     pub fn moved(self, vm: &VmInfo, active: bool) -> Option<Option<Action>> {
         match (self.of(vm) == active, active) {
             (true, _) => None,
-            (false, false) => Some(Some(self.action(false))),
-            (false, true) => Some(None),
+            (false, true) if self.confirm(vm).is_some() => Some(None),
+            (false, _) => Some(Some(self.action(active))),
         }
     }
 
@@ -1787,6 +1970,62 @@ pub fn remove_note(vm: &VmInfo) -> (&'static str, bool) {
     match kind(&vm.state) {
         Kind::Stopped => ("Deletes its disk and all its snapshots for good.", true),
         _ => ("Stop the VM to delete it.", false),
+    }
+}
+
+/// The Overview's row for the network profile, a switch.
+pub const INTERNET_ACCESS: &str = "Internet Access";
+
+/// Why the Internet Access switch cannot move now, if so; as the daemon's
+/// `set_net`, which checks again. Only VMs from an installer ISO have
+/// the switch ([`internet_switchable`]). `snaps`: the VM's snapshots, if
+/// listed.
+pub fn internet_switch_block(
+    vm: &VmInfo,
+    snaps: Option<&[Snapshot]>,
+    production: bool,
+) -> Option<&'static str> {
+    if kind(&vm.state) != Kind::Stopped {
+        Some("Stop the VM to change this.")
+    } else if vm.net == NetProfile::Offline && !production {
+        Some("Not available: the dev-mode daemon keeps VMs offline.")
+    } else if !vm.forwards.is_empty() {
+        Some("Port forwards need it. To turn it off, create the VM again.")
+    } else if snaps.is_some_and(|s| s.iter().any(|s| s.ram_bytes > 0)) {
+        Some("Delete the snapshots that hold memory to change this.")
+    } else {
+        None
+    }
+}
+
+/// Whether `vm` gets the Internet Access switch: made from an installer
+/// ISO (catalog or imported), as the daemon's `set_net`. Reads the
+/// catalog: once per VM page.
+pub fn internet_switchable(vm: &VmInfo) -> bool {
+    vm.image
+        .as_deref()
+        .is_some_and(|i| stallo::images::is_iso(i).unwrap_or(false))
+}
+
+/// Why a VM without the switch keeps its setting.
+pub const INTERNET_FIXED: &str = "VMs from cloud images keep the setting they were created with.";
+
+/// The Internet Access value of a VM without the switch.
+pub fn internet_word(vm: &VmInfo) -> &'static str {
+    match vm.net {
+        NetProfile::Internet => "On",
+        NetProfile::Offline => "Off",
+    }
+}
+
+/// The Internet Access row's subtitle: a cut network, else why it
+/// cannot move, else what it means.
+pub fn internet_note(vm: &VmInfo, block: Option<&'static str>) -> &'static str {
+    // The daemon cut it: the network check failed.
+    if vm.net == NetProfile::Internet && vm.state.ends_with(" (no network)") {
+        "Cut off until the VM restarts."
+    } else {
+        block.unwrap_or("Reaches the internet, not this computer or your local network.")
     }
 }
 
@@ -2989,7 +3228,6 @@ mod tests {
                 "2 GiB",
                 "20 GiB",
                 "Unknown",
-                "Off",
                 "None",
                 "None",
                 "Not running"
@@ -3035,14 +3273,13 @@ mod tests {
                 "1536 MiB",
                 "20 GiB",
                 "1.5 GiB",
-                "On",
                 "127.0.0.1:8080 → 80\n[::1]:2222 → 22",
                 "eth0  10.0.2.15/24\nevil  fe80::1/64",
                 "Answering",
             ]
         );
         let addresses =
-            |d: Option<VmDetails>, state| values(facts(&vm(state), d.as_ref()))[7].clone();
+            |d: Option<VmDetails>, state| values(facts(&vm(state), d.as_ref()))[6].clone();
         assert_eq!(addresses(None, "running"), "Unknown");
         assert_eq!(
             addresses(Some(details(None)), "running"),
@@ -3061,8 +3298,8 @@ mod tests {
                 ..details(None)
             };
             let v = values(facts(&desk(image), Some(&d)));
-            assert!(v[7].starts_with("Unknown (install"), "{v:?}");
-            v[8].clone()
+            assert!(v[6].starts_with("Unknown (install"), "{v:?}");
+            v[7].clone()
         };
         assert_eq!(installed(Some("fedora-44-workstation")), NO_GUEST_AGENT);
         assert!(NO_GUEST_AGENT.starts_with("No guest agent answering"));
@@ -3070,23 +3307,7 @@ mod tests {
             assert!(installed(other).starts_with("Not answering"), "{other:?}");
         }
         let unknown = values(facts(&desk(Some("fedora-44-workstation")), None));
-        assert_eq!(unknown[8], "Unknown");
-        // The daemon cut the network of an internet VM.
-        let cut = VmInfo {
-            net: NetProfile::Internet,
-            ..vm("running (no network)")
-        };
-        assert_eq!(
-            values(facts(&cut, None))[..6],
-            [
-                "Running",
-                "2",
-                "2 GiB",
-                "20 GiB",
-                "Unknown",
-                "Cut off until the VM restarts"
-            ]
-        );
+        assert_eq!(unknown[7], "Unknown");
         assert_eq!(addresses(Some(details(Some(vec![]))), "running"), "None");
         // Old addresses of a VM that stopped since are not shown.
         let old = Some(vec![("eth0".into(), "10.0.2.15/24".into())]);
@@ -3532,6 +3753,9 @@ mod tests {
         }
     }
 
+    /// The minimums of any image but Windows.
+    const LINUX: (u32, u64, u64) = (1, 1, MIN_DISK_GIB);
+
     fn roomy_host() -> HostInfo {
         HostInfo {
             cores: 16,
@@ -3573,7 +3797,7 @@ mod tests {
                 download_fits: true,
             }
         );
-        assert_eq!(l.block(), None);
+        assert_eq!(l.block(LINUX), None);
         assert_eq!(
             l.notes(),
             [
@@ -3610,18 +3834,28 @@ mod tests {
             cores: 2,
             ..host.clone()
         };
-        assert!(limits(&small, 0, 0).block().unwrap().contains("processor"));
+        assert!(
+            limits(&small, 0, 0)
+                .block(LINUX)
+                .unwrap()
+                .contains("processor")
+        );
         let full = HostInfo {
             memory_used_mib: 16000,
             ..host.clone()
         };
-        assert!(limits(&full, 0, 0).block().unwrap().contains("memory"));
+        assert!(limits(&full, 0, 0).block(LINUX).unwrap().contains("memory"));
         let disk = HostInfo {
             disk_free_bytes: 29 << 30,
             ..host.clone()
         };
         assert_eq!(limits(&disk, 0, 0).disk_gib, 9);
-        assert!(limits(&disk, 0, 0).block().unwrap().contains("for this VM"));
+        assert!(
+            limits(&disk, 0, 0)
+                .block(LINUX)
+                .unwrap()
+                .contains("for this VM")
+        );
         // The daemon wants room for the download's reserve above the floor
         // (twice a cloud image, once an installer ISO).
         let edge = HostInfo {
@@ -3629,10 +3863,10 @@ mod tests {
             ..host.clone()
         };
         assert!(limits(&edge, 10 << 30, 20 << 30).download_fits);
-        assert_eq!(limits(&edge, 10 << 30, 20 << 30).block(), None);
+        assert_eq!(limits(&edge, 10 << 30, 20 << 30).block(LINUX), None);
         let short = limits(&edge, 10 << 30, (20 << 30) + 1);
         assert!(!short.download_fits);
-        assert!(short.block().unwrap().contains("download this image"));
+        assert!(short.block(LINUX).unwrap().contains("download this image"));
         // Below the floor: no underflow.
         let below = HostInfo {
             disk_free_bytes: 1 << 30,
@@ -3679,7 +3913,7 @@ mod tests {
         ];
         for host in hosts {
             let l = limits(&host, 0, 0);
-            assert_eq!(l.block(), None, "{host:?}");
+            assert_eq!(l.block(LINUX), None, "{host:?}");
             // With the internet profile: the most overhead there is.
             let admit = |vcpus: u32, gib: u64, disk_gib: u64| {
                 let mib = gib << 10;
@@ -3846,6 +4080,219 @@ mod tests {
         assert!(l.download_fits);
     }
 
+    /// Imported ISOs are installers; Windows has its own defaults,
+    /// minimums, notes and stays offline.
+    #[test]
+    fn windows_and_own_isos() {
+        let own = |id: &str, os| ImageInfo {
+            name: "Win11_25H2".into(),
+            kind: Some(stallo::images::Kind::Iso),
+            os: Some(os),
+            ..image(id, true, Some(6 << 30))
+        };
+        let rows = image_choices(&[
+            own("local-win11", Os::Windows),
+            image("ubuntu-26.04", true, None),
+            own("local-mint", Os::Linux),
+        ]);
+        let order: Vec<(&str, bool, bool)> = rows
+            .iter()
+            .map(|r| (r.id.as_str(), r.installer, r.windows))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("ubuntu-26.04", false, false),
+                ("local-win11", true, true),
+                ("local-mint", true, false),
+            ]
+        );
+        assert_eq!(rows[1].subtitle, "Windows · Imported (6.0 GiB)");
+        assert_eq!((rows[1].download_bytes, rows[1].download_reserve), (0, 0));
+        assert!(rows[1].cached && !rows[1].internet);
+
+        // Windows starts at its minimums, which the daemon enforces.
+        let (vcpus, memory_mib, disk_gib) = stallo::config::WINDOWS_MIN;
+        assert_eq!(minimums(&rows[1]), (vcpus, memory_mib >> 10, disk_gib));
+        assert_eq!(new_defaults(&rows[1]), minimums(&rows[1]));
+        assert_eq!(
+            WINDOWS_MINIMUMS,
+            format!(
+                "Windows 11 needs at least {vcpus} processors, {} GiB memory and {disk_gib} GiB disk.",
+                memory_mib >> 10
+            )
+        );
+        // An imported Linux ISO is a desktop, like the catalog's.
+        assert_eq!(new_defaults(&rows[2]), (2, 4, 32));
+        for row in [&rows[0], &rows[2]] {
+            assert_eq!(minimums(row), LINUX);
+        }
+        // Room for a Linux VM is not room for Windows.
+        let host = HostInfo {
+            disk_free_bytes: 60 << 30,
+            ..roomy_host()
+        };
+        let l = limits(&host, 0, 0);
+        assert_eq!(l.block(minimums(&rows[2])), None);
+        assert_eq!(
+            l.block(minimums(&rows[1])),
+            Some("Not enough free disk space for this VM. Free up space first.")
+        );
+        let two_cores = HostInfo {
+            cores: 2,
+            ..roomy_host()
+        };
+        assert!(
+            limits(&two_cores, 0, 0)
+                .block(minimums(&rows[1]))
+                .unwrap()
+                .contains("processor")
+        );
+        let tight = HostInfo {
+            memory_used_mib: 16384 - 3500,
+            ..roomy_host()
+        };
+        assert_eq!(limits(&tight, 0, 0).block(LINUX), None);
+        assert!(
+            limits(&tight, 0, 0)
+                .block(minimums(&rows[1]))
+                .unwrap()
+                .contains("memory")
+        );
+
+        // Internet in production, as the daemon's `check_net`; not in
+        // dev mode.
+        for row in &rows {
+            assert_eq!(internet_block(row, true), None, "{}", row.id);
+            assert!(internet_block(row, false).unwrap().contains("dev-mode"));
+        }
+
+        // The prefix is no name.
+        assert_eq!(suggest_vm_name("local-win11-25h2", &[]), "win");
+        // Windows is called so.
+        assert_eq!(suggest_name_for(&rows[1], &[]), "windows");
+        assert_eq!(
+            suggest_name_for(&rows[1], &["windows".to_owned()]),
+            "windows-2"
+        );
+        assert_eq!(suggest_name_for(&rows[2], &[]), "mint");
+        assert_eq!(suggest_name_for(&rows[0], &[]), "ubuntu");
+        assert_eq!(suggest_vm_name("local-2604", &[]), "vm");
+        assert_eq!(
+            suggest_vm_name("local-mint", &["mint".to_owned()]),
+            "mint-2"
+        );
+    }
+
+    #[test]
+    fn import_wording() {
+        let windows = Some(Os::Windows);
+        let linux = Some(Os::Linux);
+        for (file, label, os) in [
+            ("Win11_25H2_English_x64.iso", "", windows),
+            (
+                "26100.1742.240906-0331.ge_release_svc_refresh_CLIENTCONSUMER_RET_x64FRE_en-us.iso",
+                "CCCOMA_X64FRE_EN-US_DV9",
+                windows,
+            ),
+            ("download.iso", "CENA_X64FREE_EN-US_DV9", windows),
+            ("setup.iso", "CPBA_A64FRE_NL-NL_DV9", windows),
+            ("en-us_WINDOWS_10.iso", "", windows),
+            (
+                "ubuntu-26.04-desktop-amd64.iso",
+                "Ubuntu 26.04 LTS amd64",
+                linux,
+            ),
+            ("Fedora-Workstation-Live-44.iso", "Fedora-WS-Live-44", linux),
+            (
+                "debian-13.1.0-amd64-netinst.iso",
+                "Debian 13.1.0 amd64 n",
+                linux,
+            ),
+            ("linuxmint-22-cinnamon.iso", "Linux Mint 22 Cinnamon", linux),
+            ("archlinux-2026.10.01-x86_64.iso", "ARCH_202610", linux),
+            ("openSUSE-Tumbleweed-DVD.iso", "", linux),
+            // Unsure: the user is asked.
+            ("download.iso", "", None),
+            ("install.iso", "CDROM", None),
+            ("", "", None),
+            ("linux-and-windows.iso", "", None),
+            ("archive.iso", "", None),
+            ("darwin-x86.iso", "", None),
+            ("backup.iso", "DARWIN", None),
+        ] {
+            assert_eq!(guess_os(file, label), os, "{file} {label}");
+        }
+        assert_eq!(
+            importing("Win11.iso", Os::Windows),
+            "Importing Win11.iso as Windows…"
+        );
+        assert_eq!(
+            importing("mint.iso", Os::Linux),
+            "Importing mint.iso as Linux…"
+        );
+
+        assert_eq!(
+            import_progress(0, 6 << 30),
+            (0.0, "0 bytes of 6.0 GiB (0%)".to_owned())
+        );
+        assert_eq!(
+            import_progress(3 << 29, 6 << 30),
+            (0.25, "1.5 GiB of 6.0 GiB (25%)".to_owned())
+        );
+        // 99.9% is not done yet.
+        assert_eq!(
+            import_progress(999, 1000).1,
+            "999 bytes of 1000 bytes (99%)"
+        );
+        assert_eq!(import_progress(0, 0).0, 1.0);
+
+        let failed = |m: &str| import_error(&CallError::Failed(m.into()));
+        assert_eq!(
+            failed("not an ISO image (no ISO 9660 volume descriptor)"),
+            "This file is not an ISO image. Choose another file."
+        );
+        assert_eq!(
+            failed("the file is too small to be an ISO"),
+            "This file is not an ISO image. Choose another file."
+        );
+        assert_eq!(
+            failed(
+                "image local-x exists; pick another id or remove it first (stallo images rm local-x)"
+            ),
+            IMPORTED_ALREADY
+        );
+        assert!(
+            failed("not enough disk space to download the image: 1.0 GiB free")
+                .starts_with("Not enough free disk space for this ISO.")
+        );
+        assert!(
+            failed("an image pull or import is in progress; try again when it ends")
+                .starts_with("Another image")
+        );
+        assert!(failed("not a regular file").starts_with("Only regular files"));
+        assert_eq!(
+            failed("larger than 12 GiB"),
+            "This file is larger than 12 GiB, the most Stallo imports."
+        );
+        assert_eq!(
+            failed("cannot open /x.iso: Permission denied (os error 13)"),
+            "Stallo cannot read this file. Check that you can open it, then try again."
+        );
+        assert_eq!(
+            failed("stallod said no\u{1b}[2J"),
+            "Could not import the ISO: stallod said no[2J"
+        );
+        assert_eq!(
+            import_error(&CallError::NotRunning),
+            "Could not import the ISO. Start the Stallo service, then try again."
+        );
+        assert_eq!(
+            import_error(&CallError::Timeout),
+            "The import took too long. Try again."
+        );
+    }
+
     #[test]
     fn first_image() {
         let pick = |images: &[ImageInfo]| default_image(&image_choices(images));
@@ -3866,12 +4313,22 @@ mod tests {
 
     #[test]
     fn internet_option() {
-        let rows = image_choices(&[image("ubuntu-26.04", true, None), image("arch", true, None)]);
+        let rows = image_choices(&[
+            image("ubuntu-26.04", true, None),
+            image("arch", true, None),
+            // A catalog installer: allowed like an imported one.
+            ImageInfo {
+                kind: Some(stallo::images::Kind::Iso),
+                ..image("fedora-44-workstation", true, None)
+            },
+        ]);
         assert_eq!(internet_block(&rows[0], true), None);
         assert_eq!(
             internet_block(&rows[1], true),
             Some("Not available for this image yet.")
         );
+        assert!(rows[2].installer);
+        assert_eq!(internet_block(&rows[2], true), None);
         for row in &rows {
             assert!(internet_block(row, false).unwrap().contains("dev-mode"));
         }
@@ -3935,12 +4392,12 @@ mod tests {
             "web is still being created"
         );
         assert_eq!(
-            advanced_summary(2, 2, 20, false),
-            "2 processors · 2 GiB memory · 20 GiB disk · Offline"
+            advanced_summary(2, 2, 20),
+            "2 processors · 2 GiB memory · 20 GiB disk"
         );
         assert_eq!(
-            advanced_summary(1, 4, 40, true),
-            "1 processor · 4 GiB memory · 40 GiB disk · Internet"
+            advanced_summary(1, 4, 40),
+            "1 processor · 4 GiB memory · 40 GiB disk"
         );
         let mut vm = vm("running");
         assert_eq!(first_tab(&vm), "overview");
@@ -4636,7 +5093,7 @@ mod tests {
         ] {
             assert!(c.body.contains(word), "{word}");
         }
-        assert_eq!(Setting::Agent.confirm(&vm("running")), c);
+        assert_eq!(Setting::Agent.confirm(&vm("running")), Some(c));
         assert!(Setting::Agent.destructive() && !Setting::LiveScreen.destructive());
         assert_eq!(MCP_INSTALL, "stallo mcp install");
         assert_eq!(
@@ -4655,6 +5112,117 @@ mod tests {
         assert_eq!(
             Action::Agent(true).failed("dev", &CallError::Timeout).title,
             "Could not turn on agent control of dev"
+        );
+    }
+
+    /// Internet Access: a switch for stopped VMs from an installer ISO,
+    /// with no question either way; otherwise one line says why not.
+    #[test]
+    fn internet_switch() {
+        let win = VmInfo {
+            image: Some("local-win11".into()),
+            ..vm("stopped")
+        };
+        let on = VmInfo {
+            net: NetProfile::Internet,
+            ..win.clone()
+        };
+        assert_eq!(internet_switch_block(&win, None, true), None);
+        assert_eq!(
+            internet_switch_block(&on, None, false),
+            None,
+            "off in dev mode"
+        );
+        assert_eq!(
+            internet_note(&win, None),
+            "Reaches the internet, not this computer or your local network."
+        );
+        // Only VMs from an ISO get the switch; others show their value.
+        assert!(internet_switchable(&win));
+        assert!(internet_switchable(&VmInfo {
+            image: Some("fedora-44-workstation".into()),
+            ..vm("running")
+        }));
+        for image in [Some("ubuntu-26.04"), Some("nope"), None] {
+            let cloud = VmInfo {
+                image: image.map(Into::into),
+                ..vm("running")
+            };
+            assert!(!internet_switchable(&cloud), "{image:?}");
+        }
+        assert_eq!((internet_word(&win), internet_word(&on)), ("Off", "On"));
+        assert_eq!(internet_note(&win, Some(INTERNET_FIXED)), INTERNET_FIXED);
+        for state in ["running", "paused", "running (no network)"] {
+            let busy = VmInfo {
+                state: state.into(),
+                ..on.clone()
+            };
+            let why = internet_switch_block(&busy, None, true);
+            assert_eq!(why, Some("Stop the VM to change this."), "{state}");
+        }
+        let cut = VmInfo {
+            state: "running (no network)".into(),
+            ..on.clone()
+        };
+        assert_eq!(
+            internet_note(&cut, internet_switch_block(&cut, None, true)),
+            "Cut off until the VM restarts."
+        );
+        assert!(
+            internet_switch_block(&win, None, false)
+                .unwrap()
+                .contains("dev-mode")
+        );
+        let fwd = VmInfo {
+            forwards: vec![stallo::config::PortForward {
+                bind: "127.0.0.1".parse().unwrap(),
+                host: 8080,
+                guest: 80,
+            }],
+            ..on.clone()
+        };
+        assert!(
+            internet_switch_block(&fwd, None, true)
+                .unwrap()
+                .contains("create the VM again")
+        );
+        let snaps = [snap("disk", 0, 1, 0), snap("ram", 1 << 20, 2, 1)];
+        assert_eq!(internet_switch_block(&win, Some(&snaps[..1]), true), None);
+        let why = internet_switch_block(&win, Some(&snaps), true);
+        assert_eq!(
+            why,
+            Some("Delete the snapshots that hold memory to change this.")
+        );
+        assert_eq!(internet_note(&win, why), why.unwrap());
+
+        // No question either way; the switch following the VM sends nothing.
+        let s = Setting::Internet;
+        assert_eq!(s.confirm(&win), None);
+        assert_eq!(s.moved(&win, true), Some(Some(Action::Internet(true))));
+        assert_eq!(s.moved(&on, false), Some(Some(Action::Internet(false))));
+        assert_eq!(s.moved(&on, true), None);
+        assert_eq!(
+            serde_json::to_string(&Action::Internet(true).requests("win")[0]).unwrap(),
+            r#"{"op":"set_net","name":"win","net":"internet"}"#
+        );
+        assert!(Action::Internet(false).lifecycle());
+        assert_eq!(
+            Action::Internet(true).progress(),
+            "Turning on internet access…"
+        );
+        assert_eq!(
+            Action::Internet(true).done("win", &serde_json::Value::Null),
+            None
+        );
+        let f = Action::Internet(false).failed(
+            "win",
+            &CallError::Failed("win has RAM snapshots (s1) that only restore with its current network; delete them first: stallo snap win --delete <name>".into()),
+        );
+        assert_eq!(f.title, "Could not turn off internet access of win");
+        assert!(
+            f.details
+                .unwrap()
+                .ends_with("in the Snapshots tab, then try again.")
         );
     }
 

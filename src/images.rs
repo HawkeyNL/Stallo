@@ -18,6 +18,12 @@
 //! the host mounts or parses it (no `qemu-img`). It is cached as
 //! `<id>.iso`, read-only.
 //!
+//! A human can also import an ISO of their own (`stallo images import`):
+//! the client opens the file with its user's rights and streams it over the
+//! API socket, so the daemon never opens a path a client names. Its id
+//! starts with [`LOCAL_PREFIX`], which no catalog id may, and nothing about
+//! it is verified: Stallo only records its SHA-256.
+//!
 //! Keyrings are host files (Ubuntu's, from its keyring packages) or
 //! vendored in `catalog/keys/` and compiled in.
 //!
@@ -39,6 +45,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::config::{NetProfile, validate_image_id};
@@ -114,11 +121,20 @@ pub enum Kind {
     Iso,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The guest operating system of an image, and the machine profile of a
+/// VM (`VmConfig::machine`, `qemu::argv`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Os {
+    #[default]
     Linux,
     Windows,
+}
+
+impl Os {
+    pub fn is_linux(&self) -> bool {
+        *self == Os::Linux
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -169,6 +185,10 @@ impl CatalogEntry {
     pub fn validate(&self) -> Result<()> {
         validate_image_id(&self.id)?;
         let id = &self.id;
+        ensure!(
+            !is_local(id),
+            "{id}: {LOCAL_PREFIX} is kept for imported ISOs"
+        );
         let https = |u: &str| u.starts_with("https://") && !u.contains(char::is_whitespace);
         ensure!(
             https(&self.url) && !self.url.ends_with('/'),
@@ -409,6 +429,19 @@ pub struct Pulled {
     pub sig_date: Option<String>,
     /// Seconds since the epoch.
     pub pulled_at: u64,
+    /// Set for an ISO a human imported (older versions ignore it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<Imported>,
+}
+
+/// What `stallo images import` recorded about an ISO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Imported {
+    /// A label from the client (see [`clean_name`]).
+    pub name: String,
+    /// What the human said the ISO installs; nothing checks it.
+    pub os: Os,
+    pub size: u64,
 }
 
 /// The record of a pull of `id`, if there is a readable one.
@@ -437,18 +470,400 @@ pub fn pull_reserve(entry: &CatalogEntry) -> u64 {
 /// nothing tells a missing agent from a slow one, so waits skip it. An
 /// image that left the catalog counts as having one.
 pub fn has_agent(id: &str) -> bool {
-    find(id).map_or(true, |e| e.agent != Agent::Manual)
+    !is_local(id) && find(id).map_or(true, |e| e.agent != Agent::Manual)
 }
 
 /// Refuses an image that is not cached: agents create VMs only from
-/// images a human pulled.
+/// images a human pulled (or imported).
 pub fn ensure_pulled(paths: &Paths, id: &str) -> Result<()> {
+    if is_local(id) {
+        validate_image_id(id)?;
+        ensure!(
+            iso_path(paths, id).is_file(),
+            "image {id} is not imported; see `stallo images`"
+        );
+        return Ok(());
+    }
     let entry = find(id)?;
     ensure!(
         is_cached(paths, &entry),
         "image {id} not pulled; a human runs `stallo images pull {id}`"
     );
     Ok(())
+}
+
+/// Ids of imported ISOs start with this; catalog ids never do.
+pub const LOCAL_PREFIX: &str = "local-";
+/// Largest ISO `stallo images import` accepts.
+pub const MAX_IMPORT_BYTES: u64 = 12 << 30;
+/// An import fails when the client sends nothing for this long...
+pub const IMPORT_IDLE: Duration = Duration::from_secs(60);
+/// ...or has not sent the whole ISO within this time.
+pub const IMPORT_TOTAL: Duration = Duration::from_secs(3600);
+/// ISO 9660's first volume descriptor holds `CD001` here.
+const ISO_MAGIC: std::ops::Range<usize> = 0x8001..0x8006;
+
+/// Whether `id` names an imported ISO (by its prefix alone).
+pub fn is_local(id: &str) -> bool {
+    id.starts_with(LOCAL_PREFIX)
+}
+
+/// Whether `id` is an installer ISO: imported, or an ISO in the catalog.
+/// Fails for an id that is neither and not in the catalog.
+pub fn is_iso(id: &str) -> Result<bool> {
+    validate_image_id(id)?;
+    Ok(is_local(id) || find(id)?.kind == Kind::Iso)
+}
+
+/// What image `id` installs; for an imported ISO, what its importer said.
+pub fn image_os(paths: &Paths, id: &str) -> Result<Os> {
+    if !is_local(id) {
+        return Ok(find(id)?.os);
+    }
+    validate_image_id(id)?;
+    pulled(paths, id)
+        .and_then(|p| p.imported)
+        .map(|i| i.os)
+        .with_context(|| format!("image {id} is not imported; see `stallo images`"))
+}
+
+/// The firmware image `id` boots with. An imported ISO may have an
+/// unsigned boot chain, so it gets no Secure Boot (a Windows VM gets it
+/// all the same, see `vm::vars_firmware`).
+pub fn image_firmware(id: &str) -> Result<Firmware> {
+    validate_image_id(id)?;
+    if is_local(id) {
+        return Ok(Firmware::Uefi);
+    }
+    Ok(find(id)?.firmware)
+}
+
+/// The default id for an ISO imported from a file with this stem: lower
+/// case, other characters as `-`, at most 64 characters with the prefix.
+pub fn local_id(stem: &str) -> String {
+    let rest: String = stem
+        .chars()
+        .map(|c| match c.to_ascii_lowercase() {
+            c @ ('a'..='z' | '0'..='9' | '.' | '-') => c,
+            _ => '-',
+        })
+        .take(64 - LOCAL_PREFIX.len())
+        .collect();
+    format!("{LOCAL_PREFIX}{rest}")
+}
+
+/// A client's label for an import, safe to show (agents read it too):
+/// letters, digits, spaces, `.`, `_` and `-` only, at most 80 characters.
+pub fn clean_name(name: &str) -> String {
+    name.chars()
+        .filter(|&c| c.is_ascii_alphanumeric() || " ._-".contains(c))
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Imports an ISO a client streams: exactly `size` bytes from `body`. The
+/// caller holds the images lock and has checked the disk space. The ISO
+/// is written to `.partial-<id>/` as it comes in, hashed on the way, and
+/// becomes `<id>.iso` (mode 0444) only when it is complete; on any error,
+/// and if the import is dropped, the partial file goes. The one check on
+/// the content is `CD001` at 0x8001, which catches a wrong file, not a
+/// malicious one.
+pub async fn import(
+    paths: &Paths,
+    id: &str,
+    os: Os,
+    name: &str,
+    size: u64,
+    body: &mut (impl AsyncRead + Unpin),
+) -> Result<Pulled> {
+    ensure!(
+        is_local(id),
+        "an imported image's id must start with {LOCAL_PREFIX}"
+    );
+    validate_image_id(id)?;
+    ensure!(
+        size <= MAX_IMPORT_BYTES,
+        "the ISO is {size} bytes; at most {MAX_IMPORT_BYTES} can be imported"
+    );
+    ensure!(
+        size >= ISO_MAGIC.end as u64,
+        "the file is too small to be an ISO"
+    );
+    let root = paths.images_dir();
+    let iso = iso_path(paths, id);
+    let work = root.join(format!(".partial-{id}"));
+    let part = work.join("iso.part");
+    let mut partial = Partial {
+        root: root.clone(),
+        work: Some(work.clone()),
+    };
+    let file = {
+        let (root, iso, work, part) = (root.clone(), iso.clone(), work.clone(), part.clone());
+        let id = id.to_owned();
+        blocking(move || {
+            ensure_private_dir(&root)?;
+            ensure!(
+                !iso.exists(),
+                "image {id} exists; pick another id or remove it first (stallo images rm {id})"
+            );
+            // What an import that never finished left (the daemon stopped
+            // before it could clean up).
+            safe_remove(&root, &work)?;
+            ensure_private_dir(&work)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&part)
+                .with_context(|| format!("cannot create {}", part.display()))
+        })
+        .await
+    };
+    let result = match file {
+        Ok(file) => {
+            let name = Some(clean_name(name))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| id.to_owned());
+            let imported = Imported { name, os, size };
+            finish(
+                file,
+                body,
+                imported,
+                &part,
+                &root,
+                &record_path(paths, id),
+                &iso,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    partial.remove().await;
+    result
+}
+
+/// Receives the ISO into `file` (`part`), then makes it `iso` with its
+/// record.
+async fn finish(
+    file: fs::File,
+    body: &mut (impl AsyncRead + Unpin),
+    imported: Imported,
+    part: &Path,
+    root: &Path,
+    record_file: &Path,
+    iso: &Path,
+) -> Result<Pulled> {
+    let mut file = tokio::fs::File::from_std(file);
+    let size = imported.size;
+    let sha256 = tokio::time::timeout(IMPORT_TOTAL, receive(body, &mut file, size))
+        .await
+        .with_context(|| format!("the import took longer than {} s", IMPORT_TOTAL.as_secs()))??;
+    file.sync_all().await?;
+    let file = file.into_std().await;
+    let record = Pulled {
+        sha256,
+        sig_date: None,
+        pulled_at: now_secs()?,
+        imported: Some(imported),
+    };
+    let text = toml::to_string(&record)?;
+    let (part, root, record_file, iso) = (
+        part.to_owned(),
+        root.to_owned(),
+        record_file.to_owned(),
+        iso.to_owned(),
+    );
+    blocking(move || {
+        file.set_permissions(fs::Permissions::from_mode(0o444))?;
+        drop(file);
+        let tmp = part.with_file_name("record.toml");
+        fs::write(&tmp, text)?;
+        fs::File::open(&tmp)?.sync_all()?;
+        fs::rename(&tmp, &record_file)?;
+        // Fails if the target exists, as for pulls. Once linked, the ISO
+        // is there: nothing after this fails the import.
+        fs::hard_link(&part, &iso)?;
+        if let Err(e) = fs::File::open(&root).and_then(|d| d.sync_all()) {
+            tracing::warn!("cannot sync {}: {e}", root.display());
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(record)
+}
+
+/// Runs blocking file work (an unlink of a large file, fsyncs) off the
+/// async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await?
+}
+
+/// An import's partial directory: removed by [`Partial::remove`], or when
+/// the import is dropped (the client went away, the daemon stops).
+struct Partial {
+    root: PathBuf,
+    work: Option<PathBuf>,
+}
+
+impl Partial {
+    async fn remove(&mut self) {
+        let Some(work) = self.work.take() else {
+            return;
+        };
+        let root = self.root.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || remove_partial(&root, &work)).await {
+            tracing::error!("cannot remove a partial import: {e}");
+        }
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        static TRASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some(work) = self.work.take() else {
+            return;
+        };
+        let root = std::mem::take(&mut self.root);
+        // Renamed at once, so an import of the same id that starts now
+        // finds no partial directory; the slow delete happens later.
+        let n = TRASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = work.file_name().unwrap_or_default().to_string_lossy();
+        let id = id.trim_start_matches(".partial-");
+        let trash = root.join(format!("{TRASH_PREFIX}{id}-{}-{n}", std::process::id()));
+        match fs::rename(&work, &trash) {
+            Ok(()) => {}
+            // Dropped before the directory was made.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!("cannot move {} aside: {e}", work.display());
+                return;
+            }
+        }
+        // Not awaited: nothing is left to wait for it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(move || remove_partial(&root, &trash))),
+            Err(_) => remove_partial(&root, &trash),
+        }
+    }
+}
+
+/// Partial directories of dropped imports, waiting to be deleted.
+const TRASH_PREFIX: &str = ".trash-";
+
+/// Removes what imports left when the daemon stopped in the middle of
+/// one: `.partial-local-*` and `.trash-*` in the images directory. For
+/// daemon start, before the API serves. Partial pulls stay: they resume.
+pub fn sweep_imports(paths: &Paths) -> Result<()> {
+    let root = paths.images_dir();
+    let Ok(dir) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    let partial = format!(".partial-{LOCAL_PREFIX}");
+    for entry in dir {
+        let name = entry?.file_name();
+        if name
+            .to_str()
+            .is_some_and(|n| n.starts_with(&partial) || n.starts_with(TRASH_PREFIX))
+        {
+            safe_remove(&root, &root.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_partial(root: &Path, work: &Path) {
+    if let Err(e) = safe_remove(root, work) {
+        tracing::error!("cannot remove {}: {e}", work.display());
+    }
+}
+
+/// Copies exactly `size` bytes from `body` into `file` and returns their
+/// SHA-256 (hex). Fails on a read that waits longer than [`IMPORT_IDLE`],
+/// fewer or more bytes, and a missing `CD001`.
+async fn receive(
+    body: &mut (impl AsyncRead + Unpin),
+    file: &mut tokio::fs::File,
+    size: u64,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0; 1 << 20];
+    let mut head = Vec::with_capacity(ISO_MAGIC.end);
+    let mut got = 0;
+    loop {
+        // After `size` bytes this waits for the client's end of stream.
+        let n = tokio::time::timeout(IMPORT_IDLE, body.read(&mut buf))
+            .await
+            .with_context(|| {
+                format!("the client sent nothing for {} s", IMPORT_IDLE.as_secs())
+            })??;
+        if n == 0 {
+            break;
+        }
+        ensure!(
+            n as u64 <= size - got,
+            "the client sent more than {size} bytes"
+        );
+        let chunk = &buf[..n];
+        if head.len() < ISO_MAGIC.end {
+            let take = (ISO_MAGIC.end - head.len()).min(n);
+            head.extend_from_slice(&chunk[..take]);
+            ensure!(
+                head.len() < ISO_MAGIC.end || head[ISO_MAGIC] == *b"CD001",
+                "not an ISO image (no ISO 9660 volume descriptor)"
+            );
+        }
+        hasher.update(chunk);
+        file.write_all(chunk).await?;
+        got += n as u64;
+    }
+    ensure!(got == size, "the client sent {got} of {size} bytes");
+    file.flush().await?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// The imported ISOs, as `stallo images` lists them.
+pub fn local_images(paths: &Paths) -> Vec<crate::api::ImageInfo> {
+    let Ok(dir) = fs::read_dir(paths.images_dir()) else {
+        return vec![];
+    };
+    let mut ids: Vec<String> = dir
+        .filter_map(|e| e.ok())
+        // DirEntry::file_type does not follow symlinks.
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| Some(e.file_name().to_str()?.strip_suffix(".iso")?.to_owned()))
+        .filter(|id| is_local(id) && validate_image_id(id).is_ok())
+        .collect();
+    ids.sort();
+    ids.into_iter()
+        .map(|id| {
+            let record = pulled(paths, &id);
+            let imported = record.as_ref().and_then(|p| p.imported.clone());
+            let sha = record.map_or_else(String::new, |p| format!("SHA-256 {}; ", p.sha256));
+            crate::api::ImageInfo {
+                name: imported
+                    .as_ref()
+                    .map_or_else(|| id.clone(), |i| i.name.clone()),
+                cached: true,
+                kind: Some(Kind::Iso),
+                os: imported.map(|i| i.os),
+                trust: None,
+                size_bytes: fs::metadata(iso_path(paths, &id)).ok().map(|m| m.len()),
+                sig_date: None,
+                notes: vec![
+                    format!("imported from a file you chose; {sha}not verified by Stallo"),
+                    "install by hand over VNC; no guest agent".into(),
+                ],
+                id,
+            }
+        })
+        .collect()
 }
 
 /// Guest-agent packages that older versions cached per Ubuntu release
@@ -618,6 +1033,7 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
         sha256: hash_file::<Sha256>(&image).await?,
         sig_date: sig_date(&validsig),
         pulled_at: now_secs()?,
+        imported: None,
     };
     let tmp = work.join("record.toml");
     fs::write(&tmp, toml::to_string(&record)?)?;
@@ -1293,6 +1709,279 @@ mod tests {
         assert!(!has_agent("ubuntu-26.04-desktop"));
         assert!(has_agent("ubuntu-26.04"));
         assert!(has_agent("left-the-catalog"));
+    }
+
+    /// Imported ISOs: `local-` ids, derived from the file name, never in
+    /// the catalog; ISOs without a guest agent.
+    #[test]
+    fn local_id_rules() {
+        assert_eq!(
+            local_id("Win11_25H2_English_x64"),
+            "local-win11-25h2-english-x64"
+        );
+        assert_eq!(
+            local_id("ubuntu-26.04 (copy)ü"),
+            "local-ubuntu-26.04--copy--"
+        );
+        let long = local_id(&"A".repeat(200));
+        assert_eq!(long.len(), 64);
+        for id in [long.as_str(), "local-", "local-x"] {
+            validate_image_id(id).unwrap();
+            assert!(
+                is_local(id) && is_iso(id).unwrap() && !has_agent(id),
+                "{id}"
+            );
+        }
+        assert!(!is_iso("ubuntu-26.04").unwrap());
+        assert!(is_iso("fedora-44-workstation").unwrap());
+        assert!(is_iso("nope").is_err() && is_iso("local-../x").is_err());
+        assert!(entry_with(&[("id", Some("\"local-ubuntu\""))]).is_err());
+        assert_eq!(
+            clean_name(" Win\u{202e}11\n\u{7}x\u{2066} 25H2_en-x64.iso: <b>é "),
+            "Win11x 25H2_en-x64.iso b",
+            "only letters, digits, space, . _ -"
+        );
+        assert_eq!(clean_name(&"a".repeat(100)).len(), 80);
+    }
+
+    /// An ISO-shaped body: `CD001` at 0x8001.
+    fn iso_bytes(len: usize) -> Vec<u8> {
+        let mut b: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        b[ISO_MAGIC].copy_from_slice(b"CD001");
+        b
+    }
+
+    fn import_paths() -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::new(root.join("data"), root.join("run")).unwrap();
+        (dir, paths)
+    }
+
+    /// Only the finished ISO and its record are left in the images dir.
+    fn image_files(paths: &Paths) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(paths.images_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn import_iso_stream() {
+        let (_d, paths) = import_paths();
+        let data = iso_bytes(0x9000);
+        let size = data.len() as u64;
+        let r = import(
+            &paths,
+            "local-win",
+            Os::Windows,
+            "Win\u{202e}11",
+            size,
+            &mut &data[..],
+        )
+        .await
+        .unwrap();
+        let sha: String = Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(r.sha256, sha);
+        let want = Imported {
+            name: "Win11".into(),
+            os: Os::Windows,
+            size,
+        };
+        assert_eq!(r.imported.as_ref(), Some(&want));
+        assert_eq!(pulled(&paths, "local-win"), Some(r));
+        let iso = iso_path(&paths, "local-win");
+        assert_eq!(fs::read(&iso).unwrap(), data);
+        assert_eq!(
+            fs::metadata(&iso).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(image_files(&paths), ["local-win.iso", "local-win.toml"]);
+        ensure_pulled(&paths, "local-win").unwrap();
+        assert!(ensure_pulled(&paths, "local-other").is_err());
+        assert_eq!(
+            (
+                image_os(&paths, "local-win").unwrap(),
+                image_firmware("local-win").unwrap()
+            ),
+            (Os::Windows, Firmware::Uefi),
+            "vm.rs gives a Windows VM Secure Boot"
+        );
+        assert!(image_os(&paths, "local-other").is_err());
+        assert_eq!(image_os(&paths, "ubuntu-26.04").unwrap(), Os::Linux);
+        assert_eq!(
+            image_firmware("ubuntu-26.04").unwrap(),
+            Firmware::SecureBoot
+        );
+        // An id that exists is refused, and the ISO stays.
+        let e = import(&paths, "local-win", Os::Linux, "x", size, &mut &data[..])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("exists"), "{e:#}");
+        assert_eq!(fs::read(&iso).unwrap(), data);
+        // A Linux ISO boots without Secure Boot; an empty label is the id.
+        import(&paths, "local-arch", Os::Linux, "\n", size, &mut &data[..])
+            .await
+            .unwrap();
+        assert_eq!(image_os(&paths, "local-arch").unwrap(), Os::Linux);
+
+        // `stallo images` lists both, with what is known about them.
+        let list = local_images(&paths);
+        assert_eq!(
+            list.iter()
+                .map(|i| (i.id.as_str(), i.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("local-arch", "local-arch"), ("local-win", "Win11")]
+        );
+        let win = &list[1];
+        assert_eq!(
+            (win.cached, win.kind, win.os, win.trust, win.size_bytes),
+            (true, Some(Kind::Iso), Some(Os::Windows), None, Some(size))
+        );
+        assert!(win.notes[0].contains(&sha) && win.notes[0].contains("not verified"));
+        // Catalog ISOs, partial files and symlinks are not imported ISOs.
+        fs::write(iso_path(&paths, "fedora-44-workstation"), b"iso").unwrap();
+        std::os::unix::fs::symlink(&iso, iso_path(&paths, "local-link")).unwrap();
+        assert_eq!(local_images(&paths).len(), 2);
+        // `images rm` deletes one like a pulled ISO.
+        assert!(remove(&paths, "local-win").unwrap());
+        assert_eq!(local_images(&paths)[0].id, "local-arch");
+        assert!(local_images(&paths).len() == 1 && pulled(&paths, "local-win").is_none());
+    }
+
+    /// Every refused import leaves nothing behind.
+    #[tokio::test]
+    async fn import_iso_refusals() {
+        let (_d, paths) = import_paths();
+        let data = iso_bytes(0x9000);
+        let size = data.len() as u64;
+        let mut not_iso = data.clone();
+        not_iso[0x8001] = b'X';
+        let cases: [(&str, &str, u64, &[u8], &str); 7] = [
+            ("local-big", "", MAX_IMPORT_BYTES + 1, &data, "at most"),
+            ("local-tiny", "", 100, &data[..100], "too small"),
+            ("ubuntu-26.04", "", size, &data, "must start with local-"),
+            ("local-../x", "", size, &data, "invalid image id"),
+            ("local-short", "", size, &data[..0x8100], "sent 33024 of"),
+            ("local-long", "", size - 1, &data, "more than"),
+            ("local-notiso", "", size, &not_iso, "not an ISO"),
+        ];
+        for (id, name, size, body, want) in cases {
+            let e = import(&paths, id, Os::Linux, name, size, &mut &body[..])
+                .await
+                .unwrap_err();
+            assert!(format!("{e:#}").contains(want), "{id}: {e:#}");
+            let left = if paths.images_dir().exists() {
+                image_files(&paths)
+            } else {
+                vec![]
+            };
+            assert!(left.is_empty(), "{id}: {left:?}");
+        }
+        // A stale partial directory, with a planted symlink in it, is swept
+        // first; the symlink is never followed.
+        let target = paths.data.join("target");
+        fs::write(&target, b"keep").unwrap();
+        let work = paths.images_dir().join(".partial-local-x");
+        ensure_private_dir(&work).unwrap();
+        std::os::unix::fs::symlink(&target, work.join("iso.part")).unwrap();
+        import(&paths, "local-x", Os::Linux, "", size, &mut &data[..])
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        assert_eq!(image_files(&paths), ["local-x.iso", "local-x.toml"]);
+    }
+
+    /// An import dropped mid-stream (the daemon stopping) leaves nothing.
+    #[tokio::test]
+    async fn import_iso_dropped() {
+        let (_d, paths) = import_paths();
+        let data = iso_bytes(0x9000);
+        let (mut client, mut body) = tokio::io::duplex(1 << 16);
+        let part = paths.images_dir().join(".partial-local-x/iso.part");
+        tokio::select! {
+            biased;
+            r = import(&paths, "local-x", Os::Linux, "", 2 * 0x9000, &mut body) => {
+                panic!("the import ended: {r:?}")
+            }
+            () = async {
+                client.write_all(&data).await.unwrap();
+                while fs::metadata(&part).map_or(0, |m| m.len()) < data.len() as u64 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            } => {}
+        }
+        // Moved aside at once: an import of the same id right after works.
+        import(&paths, "local-x", Os::Linux, "", 0x9000, &mut &data[..])
+            .await
+            .unwrap();
+        // The rest is removed off the async workers, without waiting.
+        for _ in 0..200 {
+            if image_files(&paths) == ["local-x.iso", "local-x.toml"] {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("left behind: {:?}", image_files(&paths));
+    }
+
+    /// At daemon start, imports cut off by a stop go; partial pulls stay.
+    #[test]
+    fn sweep_cut_off_imports() {
+        let (_d, paths) = import_paths();
+        sweep_imports(&paths).unwrap();
+        let root = paths.images_dir();
+        for d in [
+            ".partial-local-x",
+            ".trash-local-y-1-0",
+            ".partial-ubuntu-26.04",
+        ] {
+            ensure_private_dir(&root.join(d)).unwrap();
+            fs::write(root.join(d).join("iso.part"), b"x").unwrap();
+        }
+        fs::write(iso_path(&paths, "local-z"), b"iso").unwrap();
+        sweep_imports(&paths).unwrap();
+        assert_eq!(
+            image_files(&paths),
+            [".partial-ubuntu-26.04", "local-z.iso"]
+        );
+    }
+
+    /// A client that stalls, or trickles, is cut off and its partial file
+    /// removed.
+    #[tokio::test(start_paused = true)]
+    async fn import_iso_timeouts() {
+        let (_d, paths) = import_paths();
+        let size = 0x9000;
+        // Sends nothing at all.
+        let (_client, mut body) = tokio::io::duplex(64);
+        let e = import(&paths, "local-idle", Os::Linux, "", size, &mut body)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("sent nothing for 60 s"), "{e:#}");
+        assert!(image_files(&paths).is_empty());
+        // A byte every 50 s: never idle for long, but too slow in all.
+        let (mut client, mut body) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            while client.write_all(b"x").await.is_ok() {
+                tokio::time::sleep(Duration::from_secs(50)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let e = import(&paths, "local-slow", Os::Linux, "", size, &mut body)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("took longer than 3600 s"),
+            "{e:#}"
+        );
+        assert_eq!(started.elapsed().as_secs(), IMPORT_TOTAL.as_secs());
+        assert!(image_files(&paths).is_empty());
     }
 
     #[test]

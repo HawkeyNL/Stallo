@@ -141,9 +141,9 @@ impl Cgroups {
         kill_and_remove(&self.vm_dir(name)).await
     }
 
-    /// A tree at `root` (a temporary directory in tests).
-    #[cfg(test)]
-    pub(crate) fn at(root: PathBuf) -> Self {
+    /// A tree at `root`: a temporary directory in tests (stallod's too).
+    #[doc(hidden)]
+    pub fn at(root: PathBuf) -> Self {
         Self { root }
     }
 

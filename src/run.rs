@@ -69,6 +69,12 @@ impl Manager {
             src.throwaway_of.is_none(),
             "{source} is itself the clone of a run"
         );
+        // A clone would carry a copy of the source's machine identity
+        // (firmware variables, TPM), and `exec` runs Linux commands only.
+        ensure!(
+            src.machine.is_linux(),
+            "{source} is a Windows VM; `stallo run` is for Linux VMs"
+        );
 
         let name = format!("{RUN_PREFIX}{}", &new_uuid()?[..8]);
         let _clone_op = self.lock_for_run(&name)?;
@@ -144,6 +150,7 @@ mod tests {
     use super::*;
     use crate::cgroup::Cgroups;
     use crate::config::{DaemonConfig, Mode, NetProfile};
+    use crate::images::Os;
     use crate::paths::Paths;
 
     fn manager(root: &std::path::Path) -> Arc<Manager> {
@@ -180,6 +187,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             cdrom: None,
+            machine: Os::Linux,
         }
     }
 
@@ -606,6 +614,96 @@ mod tests {
             cfg.save(&dir).unwrap();
             let err = m.start("web").await.err().unwrap();
             assert_eq!(err.to_string(), why);
+        }
+    }
+
+    /// A Windows VM fails closed: no `stallo run` clone and nothing below
+    /// its minimum size.
+    #[tokio::test]
+    async fn windows_vms_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        m.cleanup_leftovers().await.unwrap();
+        let win = VmConfig {
+            machine: Os::Windows,
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            ..vm("win", None)
+        };
+        let dir = m.paths.vm_dir("win");
+        fs::create_dir(&dir).unwrap();
+        win.save(&dir).unwrap();
+        let argv = ["true".to_owned()];
+        let err = m
+            .run("win", &argv, false, Duration::from_secs(5), async {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a Windows VM"), "{err}");
+        assert_eq!(fs::read_dir(m.paths.vms_dir()).unwrap().count(), 1);
+        let err = m.set_resources("win", Some(1), None).await.unwrap_err();
+        assert!(err.to_string().contains("at least 2 vCPUs"), "{err}");
+        assert_eq!(m.load("win").unwrap(), win);
+    }
+
+    /// The internet profile for VMs from an ISO (imported Windows or
+    /// Linux, or a catalog ISO): no per-image gate (they have no seed),
+    /// only the host's isolation, which refuses here in both modes (no
+    /// table).
+    #[tokio::test]
+    async fn isos_take_internet_only_with_isolation() {
+        for (image, machine) in [
+            ("local-win11", Os::Windows),
+            ("local-distro", Os::Linux),
+            ("ubuntu-26.04-desktop", Os::Linux),
+        ] {
+            for (mode, why) in [
+                (Mode::Dev, "dev mode"),
+                (Mode::Production, "isolation unavailable"),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+                let dir = m.paths.vm_dir("win");
+                fs::create_dir_all(&dir).unwrap();
+                VmConfig {
+                    image: image.into(),
+                    net: NetProfile::Internet,
+                    machine,
+                    vcpus: 2,
+                    memory_mib: 4096,
+                    disk_gib: 64,
+                    ..vm("win", None)
+                }
+                .save(&dir)
+                .unwrap();
+                let err = m.start("win").await.err().unwrap();
+                assert!(err.to_string().contains(why), "{image} {err}");
+            }
+        }
+    }
+
+    /// Guests get IPv4 only (passt `-4`), so an IPv6 port forward is
+    /// refused with a reason, in both modes and before the isolation check.
+    #[tokio::test]
+    async fn ipv6_forwards_are_refused() {
+        for mode in [Mode::Dev, Mode::Production] {
+            let tmp = tempfile::tempdir().unwrap();
+            let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+            let dir = m.paths.vm_dir("web");
+            fs::create_dir_all(&dir).unwrap();
+            VmConfig {
+                net: NetProfile::Internet,
+                forwards: vec![crate::config::PortForward {
+                    bind: "::1".parse().unwrap(),
+                    host: 8081,
+                    guest: 80,
+                }],
+                ..vm("web", None)
+            }
+            .save(&dir)
+            .unwrap();
+            let err = m.start("web").await.err().unwrap();
+            assert!(err.to_string().contains("IPv4 only"), "{err}");
         }
     }
 

@@ -182,6 +182,11 @@ pub fn passt_args(forwards: &[PortForward], fd: RawFd, dns: IpAddr) -> Vec<Strin
         "none",
         "-u",
         "none",
+        // IPv4 only: passt relays a guest's IPv6 frame to an IPv4-mapped
+        // address (`::ffff:127.0.0.53`) from an IPv4 socket, which the
+        // table's DNS exception for the daemon lets through to the host's
+        // resolver. See "Known gaps" in docs/network-verification.md.
+        "-4",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -302,6 +307,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             cdrom: None,
+            machine: crate::images::Os::Linux,
         }
     }
 
@@ -309,17 +315,17 @@ mod tests {
     fn golden_passt_args() {
         let base = "--foreground --quiet --fd 7 --map-host-loopback none \
                     --map-guest-addr none --dns-forward 169.254.1.53 \
-                    --dns-host 9.9.9.9 --search none -u none";
+                    --dns-host 9.9.9.9 --search none -u none -4";
         let dns = IpAddr::from([9, 9, 9, 9]);
         assert_eq!(passt_args(&[], 7, dns).join(" "), format!("{base} -t none"));
         let lo = "127.0.0.1".parse().unwrap();
         let f = [
             parse_forward("8080:80", lo).unwrap(),
-            parse_forward("2222:22", "::1".parse().unwrap()).unwrap(),
+            parse_forward("2222:22", "192.0.2.7".parse().unwrap()).unwrap(),
         ];
         assert_eq!(
             passt_args(&f, 7, dns).join(" "),
-            format!("{base} -t 127.0.0.1/8080:80 -t ::1/2222:22")
+            format!("{base} -t 127.0.0.1/8080:80 -t 192.0.2.7/2222:22")
         );
     }
 

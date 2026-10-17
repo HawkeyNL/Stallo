@@ -32,10 +32,14 @@ use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
-use crate::{confine, images, input, net, qemu, seed};
+use crate::{confine, images, input, net, qemu, seed, tpm};
 
 /// passt's messages, in the VM directory.
 const PASST_LOG: &str = "passt.log";
+/// How long after swtpm's exit QEMU's exit may follow and still count as
+/// the cause (QEMU closes swtpm's channel as it exits, and its watcher
+/// reports it right after).
+const SWTPM_GRACE: Duration = Duration::from_secs(2);
 /// Graceful power-off budget before QEMU is told to quit.
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `wait_ready` waits for the guest agent.
@@ -78,6 +82,17 @@ const DRAG_STEPS: u32 = 10;
 const INPUT_BUSY_WAIT: Duration = Duration::from_secs(30);
 /// Most wheel clicks in one scroll.
 const MAX_SCROLL: u32 = 50;
+/// Windows' CD loader shows "Press any key to boot from CD or DVD" for
+/// about 5 s, too short for a human to reach the screen. The daemon presses
+/// Enter for them: one every [`BOOT_KEY_EVERY`] from [`BOOT_KEYS_FROM`]
+/// after the start, none after [`BOOT_KEYS_UNTIL`]. Measured on the Win11
+/// 24H2 ISO here: the prompt shows at about 2 s, Setup at 14 s; the hard
+/// end at 9 s keeps a late press off Setup's first page.
+/// ponytail: fixed timing; a host too slow to show the prompt in 9 s needs
+/// a stop and start to retry.
+const BOOT_KEYS_FROM: Duration = Duration::from_secs(2);
+const BOOT_KEY_EVERY: Duration = Duration::from_secs(1);
+const BOOT_KEYS_UNTIL: Duration = Duration::from_secs(9);
 
 /// A pointer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -120,6 +135,8 @@ pub struct NewVm {
 pub struct Running {
     pub config: VmConfig,
     pub pid: u32,
+    /// swtpm's pid and whether it has exited (Windows VMs).
+    tpm: Option<(u32, Arc<AtomicBool>)>,
     pub qmp: Qmp,
     qga_sock: PathBuf,
     rt_dir: PathBuf,
@@ -142,6 +159,8 @@ pub struct Running {
     cut_net: Option<Arc<tokio::sync::Notify>>,
     /// Becomes `true` once QEMU has exited and everything is cleaned up.
     exited: watch::Receiver<bool>,
+    /// The Enter presses for Windows' CD boot prompt, while they run.
+    boot_key_task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Running {
@@ -330,6 +349,32 @@ impl Manager {
         images::pull(&self.paths, &entry).await
     }
 
+    /// Imports an ISO a client streams (`stallo images import`, see
+    /// [`images::import`]). Refused unless `size` bytes fit above the disk
+    /// floor, and while a pull, removal or other import runs: the client
+    /// sets the pace, so nothing queues behind it.
+    pub async fn import_iso(
+        &self,
+        id: &str,
+        os: images::Os,
+        name: &str,
+        size: u64,
+        body: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> Result<images::Pulled> {
+        let _guard = self.images.try_write().map_err(|_| {
+            anyhow::anyhow!("an image pull or import is in progress; try again when it ends")
+        })?;
+        let dir = self.paths.images_dir();
+        ensure_private_dir(&dir)?;
+        host::check_pull_space(
+            host::disk_free(&dir)?,
+            self.config.host.disk_floor_gib,
+            size,
+            0,
+        )?;
+        images::import(&self.paths, id, os, name, size, body).await
+    }
+
     /// Deletes a cached image (`stallo images rm`). Refused while any VM,
     /// stopped or a `stallo run` clone included, was made from it or has it
     /// in its CD-ROM drive: by its `vm.toml` or by its disk's backing file.
@@ -395,7 +440,7 @@ impl Manager {
             !new.name.starts_with(RUN_PREFIX),
             "names starting with {RUN_PREFIX} are kept for `stallo run`"
         );
-        let iso = images::find(&new.image)?.kind == images::Kind::Iso;
+        let iso = images::is_iso(&new.image)?;
         // The agent gate refuses this already; fail closed here too.
         ensure!(
             !(iso && new.agent_control),
@@ -414,12 +459,14 @@ impl Manager {
             forwards: new.forwards.clone(),
             vnc: new.vnc || iso,
             cdrom: iso.then(|| new.image.clone()),
+            machine: images::image_os(&self.paths, &new.image)?,
         };
         cfg.validate()?;
+        cfg.check_min_size()?;
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
-        if new.may_pull {
+        if new.may_pull && !images::is_local(&cfg.image) {
             self.pull(&cfg.image).await?;
         }
 
@@ -452,13 +499,14 @@ impl Manager {
 
     async fn populate(&self, cfg: &VmConfig) -> Result<()> {
         let dir = self.paths.vm_dir(&cfg.name);
-        let entry = images::find(&cfg.image)?;
-        if entry.kind == images::Kind::Iso {
+        let firmware = vars_firmware(cfg, images::image_firmware(&cfg.image)?);
+        if images::is_iso(&cfg.image)? {
             qemu::create_disk(None, &dir.join(qemu::DISK), cfg.disk_gib).await?;
-            qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
+            qemu::create_vars(&dir.join(qemu::VARS), firmware).await?;
             ensure_private_dir(&dir.join(qemu::STATES))?;
             return cfg.save(&dir);
         }
+        let entry = images::find(&cfg.image)?;
         let base = images::image_path(&self.paths, &cfg.image);
         let info = images::check_image(&base).await?;
         ensure!(
@@ -468,7 +516,7 @@ impl Manager {
             cfg.image
         );
         qemu::create_disk(Some(&base), &dir.join(qemu::DISK), cfg.disk_gib).await?;
-        qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
+        qemu::create_vars(&dir.join(qemu::VARS), firmware).await?;
         ensure_private_dir(&dir.join(qemu::STATES))?;
 
         let password = seed::generate_password()?;
@@ -526,6 +574,16 @@ impl Manager {
         }
         // VMs created before snapshots existed have no directory for them.
         ensure_private_dir(&vm_dir.join(qemu::STATES))?;
+        tpm::check_no_restore_pending(&vm_dir)?;
+        // (swtpm's end, QEMU's end) of a Windows VM's TPM link; swtpm
+        // creates the TPM's state at the first start.
+        let tpm_link = if cfg.machine.is_linux() {
+            None
+        } else {
+            ensure_private_dir(&vm_dir.join(tpm::DIR))?;
+            Some(net::socketpair()?)
+        };
+        let tpm_fd = tpm_link.as_ref().map(|(_, q)| q.as_raw_fd());
         // (passt's end, QEMU's end) of the guest's network link.
         let link = match cfg.net {
             NetProfile::Internet => Some(net::socketpair()?),
@@ -551,13 +609,14 @@ impl Manager {
             &vm_dir,
             &rt_dir,
             qemu_fd,
+            tpm_fd,
             vnc.as_deref(),
             agent,
             media,
         )?;
         // Production: the guest's CPUs wait until the spawn checks (AppArmor
-        // label, VNC socket, passt) have passed, so no guest code runs in
-        // a QEMU that is about to be refused.
+        // labels, VNC socket, passt, swtpm) have passed, so no guest code
+        // runs in a QEMU that is about to be refused.
         let hold = paused || self.mode == Mode::Production;
         if hold {
             argv.push("-S".to_owned());
@@ -582,7 +641,7 @@ impl Manager {
                 );
             }
         }
-        match self.spawn(&cfg, &argv, link).await {
+        let started = match self.spawn(&cfg, &argv, link, tpm_link).await {
             Ok(running) if hold && !paused => match running.qmp.execute("cont", None).await {
                 Ok(_) => Ok(running),
                 Err(e) => {
@@ -599,22 +658,36 @@ impl Manager {
                 let _ = safe_remove(&self.paths.runtime, &vnc_dir);
                 Err(e)
             }
+        };
+        // Not after a paused start: that restores a snapshot, past the boot.
+        if let Ok(vm) = &started
+            && !paused
+            && presses_boot_keys(&cfg, &iso)
+        {
+            let task = tokio::spawn(vm.clone().boot_keys(
+                BOOT_KEYS_FROM,
+                BOOT_KEY_EVERY,
+                BOOT_KEYS_UNTIL,
+            ));
+            *vm.boot_key_task.lock().unwrap() = Some(task.abort_handle());
         }
+        started
     }
 
     /// For a VM made from an installer ISO, its CD-ROM drive: the attached
     /// ISO's path, or `None` if empty. `None` for a VM from a cloud image
     /// (or from an image that left the catalog), which has a seed instead.
-    /// Fails closed unless the drive holds a catalog ISO.
+    /// A Windows VM is always made from an ISO. Fails closed unless the
+    /// drive holds a catalog or imported ISO.
     fn cdrom(&self, cfg: &VmConfig) -> Result<Option<Option<PathBuf>>> {
-        if !images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso) {
+        if cfg.machine.is_linux() && !images::is_iso(&cfg.image).unwrap_or(false) {
             return Ok(None);
         }
         let Some(id) = &cfg.cdrom else {
             return Ok(Some(None));
         };
         ensure!(
-            images::find(id)?.kind == images::Kind::Iso,
+            images::is_iso(id)?,
             "{id} in the CD-ROM drive of {} is not an installer ISO",
             cfg.name
         );
@@ -624,9 +697,23 @@ impl Manager {
     /// Whether `cfg`'s network profile may start here. Fail closed: the
     /// internet profile needs production mode and a passing isolation
     /// probe (`net::check_isolation`).
+    ///
+    /// The catalog's per-image `internet` flag is about the seed: its
+    /// network config must bring the NIC up, or the VM never gets ready.
+    /// A VM from an ISO (catalog or imported; every Windows VM) has no
+    /// seed; its own OS asks passt's DHCP. The isolation is on the host
+    /// either way.
     fn check_net(&self, cfg: &VmConfig) -> Result<()> {
-        if cfg.net != NetProfile::Offline {
+        if cfg.net != NetProfile::Offline && !images::is_iso(&cfg.image)? {
             images::find(&cfg.image)?.check_net(cfg.net)?;
+        }
+        // passt runs IPv4 only (net::passt_args), so it refuses IPv6
+        // listeners; say why here, before passt starts.
+        if let Some(f) = cfg.forwards.iter().find(|f| f.bind.is_ipv6()) {
+            bail!(
+                "port forward {} binds IPv6, but guests get IPv4 only for now: recreate the VM with an IPv4 forward (forwards cannot be edited yet)",
+                std::net::SocketAddr::new(f.bind, f.host)
+            );
         }
         match (cfg.net, self.mode) {
             (NetProfile::Offline, _) => Ok(()),
@@ -644,6 +731,7 @@ impl Manager {
         cfg: &VmConfig,
         argv: &[String],
         link: Option<(OwnedFd, OwnedFd)>,
+        tpm_link: Option<(OwnedFd, OwnedFd)>,
     ) -> Result<Arc<Running>> {
         let name = &cfg.name;
         let vm_dir = self.paths.vm_dir(name);
@@ -674,6 +762,15 @@ impl Manager {
             }
             None => (None, None),
         };
+        // Then swtpm, also in the cgroup, so it dies with the VM.
+        let (mut swtpm, tpm_end) = match tpm_link {
+            Some((swtpm_end, qemu_end)) => {
+                let log = private_log(&vm_dir.join(tpm::LOG))?;
+                let child = tpm::spawn(&vm_dir.join(tpm::DIR), swtpm_end, &cg, log, self.mode)?;
+                (Some(child), Some(qemu_end))
+            }
+            None => (None, None),
+        };
         let mut cmd = Command::new(qemu::QEMU);
         cmd.args(argv)
             .stdin(Stdio::null())
@@ -684,13 +781,13 @@ impl Manager {
             .process_group(0);
         // Order matters: the cgroup hook opens files the ruleset denies.
         crate::cgroup::move_on_exec(&mut cmd, &cg)?;
-        if let Some(fd) = qemu_end {
+        for fd in qemu_end.into_iter().chain(tpm_end) {
             net::inherit_on_exec(&mut cmd, fd);
         }
         // Production only: the profile is installed by the package and
         // names the production paths.
         if self.mode == Mode::Production {
-            confine::apparmor_on_exec(&mut cmd);
+            confine::apparmor_on_exec(&mut cmd, confine::QEMU_PROFILE);
         }
         // A VM from an ISO has a blank disk: no base image, the ISO instead.
         let mut backing = match self.cdrom(cfg)? {
@@ -710,7 +807,8 @@ impl Manager {
             ),
             Mode::Dev => "cannot start QEMU".to_owned(),
         })?;
-        // Closes our copy of QEMU's socket end, so passt sees QEMU exit.
+        // Closes our copies of QEMU's socket ends, so passt and swtpm see
+        // QEMU exit.
         drop(cmd);
         let pid = child
             .id()
@@ -727,7 +825,7 @@ impl Manager {
         // Fail closed if QEMU is not confined as asked (profile in complain
         // mode, or replaced by an unconfined one).
         if self.mode == Mode::Production
-            && let Err(e) = confine::check_qemu_profile(pid)
+            && let Err(e) = confine::check_profile(pid, confine::QEMU_PROFILE)
         {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -768,6 +866,57 @@ impl Manager {
                 return Err(e);
             }
         }
+        // swtpm answered QEMU's first commands before QMP came up; one that
+        // died since, or a TPM QEMU did not wire up, fails the start.
+        if let Some(t) = swtpm.as_mut() {
+            let wrong = match t.try_wait()? {
+                Some(status) => Some(anyhow::anyhow!(
+                    "swtpm exited ({status}); see {}",
+                    vm_dir.join(tpm::LOG).display()
+                )),
+                None => match qmp.execute("query-tpm", None).await {
+                    Ok(reply) => check_tpm(&reply).err(),
+                    Err(e) => Some(e.context("cannot query the TPM")),
+                },
+            };
+            if let Some(e) = wrong {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(e);
+            }
+        }
+        let (tx, rx) = watch::channel(false);
+        // Set the moment QEMU is reaped, before the cleanup that `rx` waits
+        // for.
+        let (qemu_tx, qemu_rx) = watch::channel(false);
+        let tpm = swtpm.map(|mut t| {
+            let pid = t.id().expect("a child that was not waited for has a pid");
+            let gone = Arc::new(AtomicBool::new(false));
+            let (this, name, done, mut exited) =
+                (self.clone(), name.clone(), gone.clone(), qemu_rx);
+            // Reaps swtpm. It exits when QEMU closes its socket, or with
+            // the cgroup. Otherwise the guest has lost its TPM: the VM is
+            // killed rather than left running without it.
+            tokio::spawn(async move {
+                let r = t.wait().await;
+                done.store(true, Ordering::Relaxed);
+                // `is_ok` drops the borrow of the channel at once.
+                let qemu_gone = tokio::time::timeout(SWTPM_GRACE, exited.wait_for(|e| *e))
+                    .await
+                    .is_ok();
+                match r {
+                    _ if !qemu_gone => {
+                        tracing::error!("{name}: swtpm exited ({r:?}); stopping {name}");
+                        if let Err(e) = this.cgroups.kill_vm(&name) {
+                            tracing::error!("{name}: {e:#}");
+                        }
+                    }
+                    Ok(s) if s.success() => tracing::debug!("{name}: swtpm exited"),
+                    r => tracing::warn!("{name}: swtpm exited: {r:?}"),
+                }
+            });
+            (pid, gone)
+        });
         let net_down = Arc::new(AtomicBool::new(false));
         let cut_net = passt.map(|mut p| {
             let cut = Arc::new(tokio::sync::Notify::new());
@@ -793,15 +942,16 @@ impl Manager {
             cut
         });
 
-        let (tx, rx) = watch::channel(false);
         let running = Arc::new(Running {
             config: cfg.clone(),
             pid,
+            tpm,
             qmp,
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
             rt_dir: rt_dir.clone(),
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
+            boot_key_task: Mutex::new(None),
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
@@ -813,7 +963,7 @@ impl Manager {
             .lock()
             .unwrap()
             .insert(name.to_owned(), running.clone());
-        tokio::spawn(self.clone().watch(name.clone(), child, tx));
+        tokio::spawn(self.clone().watch(name.clone(), child, tx, qemu_tx));
         tracing::info!("{name}: started, pid {pid}");
         Ok(running)
     }
@@ -896,10 +1046,10 @@ impl Manager {
         cfg.save(&self.paths.vm_dir(name))
     }
 
-    /// Puts pulled installer ISO `iso` into the CD-ROM drive of a VM made
-    /// from an ISO, or empties the drive (`None`); it takes effect at the
-    /// next start. A RAM snapshot restored later runs with the drive as it
-    /// is then, as if the disc had been swapped while the guest ran.
+    /// Puts pulled or imported installer ISO `iso` into the CD-ROM drive of
+    /// a VM made from an ISO, or empties the drive (`None`); it takes effect
+    /// at the next start. A RAM snapshot restored later runs with the drive
+    /// as it is then, as if the disc had been swapped while the guest ran.
     pub async fn set_cdrom(&self, name: &str, iso: Option<&str>) -> Result<()> {
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
@@ -909,7 +1059,7 @@ impl Manager {
             "{name} is a `stallo run` clone; change the VM it was made from"
         );
         ensure!(
-            images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso),
+            images::is_iso(&cfg.image).unwrap_or(false),
             "{name} has no CD-ROM drive; only VMs made from an installer ISO have one"
         );
         // Held until vm.toml names the ISO, so `images rm` sees it. Not
@@ -919,9 +1069,8 @@ impl Manager {
             anyhow::anyhow!("an image pull or removal is in progress; try again when it ends")
         })?;
         if let Some(id) = iso {
-            let entry = images::find(id)?;
             ensure!(
-                entry.kind == images::Kind::Iso,
+                images::is_iso(id)?,
                 "{id} is not an installer ISO; see `stallo images`"
             );
             images::ensure_pulled(&self.paths, id)?;
@@ -958,13 +1107,8 @@ impl Manager {
         cfg.vcpus = vcpus.unwrap_or(cfg.vcpus);
         cfg.memory_mib = memory_mib.unwrap_or(cfg.memory_mib);
         cfg.validate()?;
-        let ram: Vec<String> = self
-            .list_snapshots(name)
-            .await?
-            .into_iter()
-            .filter(|s| s.ram_bytes > 0)
-            .map(|s| s.name)
-            .collect();
+        cfg.check_min_size()?;
+        let ram = self.ram_snapshots(name).await?;
         ensure!(
             ram.is_empty(),
             "{name} has RAM snapshots ({}) that only restore at its current size; delete them first: stallo snap {name} --delete <name>",
@@ -978,6 +1122,61 @@ impl Manager {
         }
         cfg.save(&self.paths.vm_dir(name))?;
         Ok(cfg)
+    }
+
+    /// Changes a stopped VM's network profile, with the checks of `new`.
+    /// Only for VMs made from an installer ISO: a cloud image's seed fixed
+    /// the guest's network config at create (`seed::render`). Refused while
+    /// the VM has RAM snapshots: their device state holds the network card
+    /// (or its absence), so they only restore with the current profile.
+    pub async fn set_net(&self, name: &str, net: NetProfile) -> Result<VmConfig> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        ensure!(
+            self.running(name).is_none(),
+            "{name} is running; stop it first to change its network: stallo stop {name}"
+        );
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        ensure!(
+            images::is_iso(&cfg.image).with_context(|| format!(
+                "{name} is made from an image this build does not know"
+            ))?,
+            "{name} is made from cloud image {}, whose seed fixed the guest's network at `stallo new`; create a new VM with the profile instead",
+            cfg.image
+        );
+        if cfg.net == net {
+            return Ok(cfg);
+        }
+        ensure!(
+            net == NetProfile::Internet || cfg.forwards.is_empty(),
+            "{name} has port forwards, which need the internet profile; port forwards cannot be removed yet; recreate the VM to make it offline"
+        );
+        cfg.net = net;
+        cfg.validate()?;
+        self.check_net(&cfg)?;
+        let ram = self.ram_snapshots(name).await?;
+        ensure!(
+            ram.is_empty(),
+            "{name} has RAM snapshots ({}) that only restore with its current network; delete them first: stallo snap {name} --delete <name>",
+            ram.join(", ")
+        );
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok(cfg)
+    }
+
+    /// The names of a VM's RAM snapshots (lifecycle lock held).
+    async fn ram_snapshots(&self, name: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_snapshots(name)
+            .await?
+            .into_iter()
+            .filter(|s| s.ram_bytes > 0)
+            .map(|s| s.name)
+            .collect())
     }
 
     /// Continues a paused VM, unless the disk is still below the floor.
@@ -999,13 +1198,19 @@ impl Manager {
         Ok(())
     }
 
-    /// QEMU's overhead, plus passt's for `internet` VMs (one cgroup).
+    /// QEMU's overhead, plus passt's for `internet` VMs and swtpm's for
+    /// Windows VMs (one cgroup).
     fn overhead_mib(&self, cfg: &VmConfig) -> u64 {
         let passt = match cfg.net {
             NetProfile::Internet => net::PASST_MEMORY_MIB,
             NetProfile::Offline => 0,
         };
-        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt
+        let swtpm = if cfg.machine.is_linux() {
+            0
+        } else {
+            tpm::MEMORY_MIB
+        };
+        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt + swtpm
     }
 
     /// QEMU creates the QMP socket shortly after start.
@@ -1034,8 +1239,10 @@ impl Manager {
         name: String,
         mut child: tokio::process::Child,
         tx: watch::Sender<bool>,
+        qemu_tx: watch::Sender<bool>,
     ) {
         let status = child.wait().await;
+        let _ = qemu_tx.send(true);
         tracing::info!("{name}: QEMU exited ({status:?})");
         if let Err(e) = self.cgroups.remove_vm(&name).await {
             tracing::error!("{name}: cgroup cleanup failed: {e:#}");
@@ -1107,14 +1314,26 @@ impl Manager {
         Ok(())
     }
 
-    /// Production: kills every VM whose QEMU is no longer confined by its
-    /// AppArmor profile (e.g. the profile was reloaded in complain mode).
+    /// Production: kills every VM whose QEMU or swtpm is no longer confined
+    /// by its AppArmor profile (e.g. the profile was reloaded in complain
+    /// mode).
     pub fn check_confinement(&self) {
         if self.mode != Mode::Production {
             return;
         }
         for vm in self.all_running() {
-            if let Err(e) = confine::check_qemu_profile(vm.pid) {
+            // An swtpm that has exited (its reaper stops the VM) has no
+            // label to check.
+            let swtpm = match &vm.tpm {
+                Some((pid, gone))
+                    if !gone.load(Ordering::Relaxed)
+                        && Path::new(&format!("/proc/{pid}")).exists() =>
+                {
+                    confine::check_profile(*pid, confine::SWTPM_PROFILE)
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = confine::check_profile(vm.pid, confine::QEMU_PROFILE).and(swtpm) {
                 tracing::error!("{}: {e:#}; killing it", vm.config.name);
                 if let Err(e) = self.cgroups.kill_vm(&vm.config.name) {
                     tracing::error!("{}: {e:#}", vm.config.name);
@@ -1346,6 +1565,54 @@ impl Running {
             self.config.name
         );
         Ok(guard)
+    }
+
+    /// Presses Enter for Windows' CD boot prompt: `first` after the call,
+    /// then every `every`, and never after `until`. Ends early when the VM
+    /// exits. A press that fails (paused VM, busy input) is skipped.
+    async fn boot_keys(self: Arc<Self>, first: Duration, every: Duration, until: Duration) {
+        let name = &self.config.name;
+        tracing::info!("{name}: pressing Enter for the CD boot prompt");
+        let start = Instant::now();
+        let (mut at, mut pressed) = (first, 0);
+        while at < until {
+            if self.wait_exited(at.saturating_sub(start.elapsed())).await {
+                return;
+            }
+            at += every;
+            let _input = match self.input().await {
+                Ok(guard) => guard,
+                Err(e) => {
+                    tracing::debug!("{name}: boot key skipped: {e:#}");
+                    continue;
+                }
+            };
+            // The lock may have taken a while: a late press could land on
+            // Setup instead.
+            if start.elapsed() > until {
+                break;
+            }
+            match self.send_key(&["ret"], CHORD_HOLD).await {
+                Ok(()) => pressed += 1,
+                Err(e) => tracing::debug!("{name}: boot key failed: {e:#}"),
+            }
+        }
+        if pressed == 0 {
+            tracing::warn!(
+                "{name}: no Enter reached the CD boot prompt; stop and start the VM if it shows the firmware menu"
+            );
+        }
+    }
+
+    /// Stops the boot-prompt presses: a loaded snapshot is past the boot.
+    /// Under the input lock, which the task holds for all its QMP calls, so
+    /// the abort never cuts a press off before its release.
+    pub(crate) async fn stop_boot_keys(&self) {
+        let _input = self.input_lock.lock().await;
+        let task = self.boot_key_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+        }
     }
 
     async fn mouse_move(&self, x: u32, y: u32) -> Result<()> {
@@ -1824,6 +2091,31 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
     ("systemd-run".to_owned(), args)
 }
 
+/// Whether a start presses Enter for the CD boot prompt: Windows VMs with
+/// an ISO in the drive (`iso` as from [`Manager::cdrom`]) only.
+fn presses_boot_keys(cfg: &VmConfig, iso: &Option<Option<PathBuf>>) -> bool {
+    !cfg.machine.is_linux() && matches!(iso, Some(Some(_)))
+}
+
+/// QEMU's `query-tpm` reply for a Windows VM: exactly one TPM, the CRB
+/// device on swtpm (`qemu::argv`). QEMU's reply is not echoed.
+fn check_tpm(reply: &Value) -> Result<()> {
+    let ok = reply.as_array().is_some_and(|tpms| {
+        tpms.len() == 1 && tpms[0]["model"] == "tpm-crb" && tpms[0]["options"]["type"] == "emulator"
+    });
+    ensure!(ok, "QEMU did not attach the swtpm TPM (query-tpm)");
+    Ok(())
+}
+
+/// The firmware variable template for `cfg`'s disk: Windows always gets
+/// Secure Boot with Microsoft's keys, whatever its image says.
+fn vars_firmware(cfg: &VmConfig, image: images::Firmware) -> images::Firmware {
+    match cfg.machine {
+        images::Os::Windows => images::Firmware::SecureBoot,
+        images::Os::Linux => image,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1998,13 +2290,16 @@ mod tests {
                 forwards: vec![],
                 vnc: false,
                 cdrom: None,
+                machine: images::Os::Linux,
             },
             pid: 0,
+            tpm: None,
             qmp,
             qga_sock: dir.path().join("qga.sock"),
             rt_dir: "/nonexistent".into(),
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
+            boot_key_task: Mutex::new(None),
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
@@ -2106,6 +2401,63 @@ mod tests {
         log.lock().unwrap().clear();
         assert!(vm.drag((0, 0), (0, 800)).await.is_err());
         assert!(summary(&log).is_empty(), "nothing pressed for a bad drag");
+    }
+
+    /// Enter for the CD prompt: only Windows with an ISO in the drive;
+    /// every press is sent and released, failures skip a press, and an
+    /// exited VM gets none.
+    #[tokio::test]
+    async fn boot_keys() {
+        let (_d, mut vm, log) = fake_vm("running", Some(2)).await;
+        let iso = Some(Some(PathBuf::from("/x.iso")));
+        let win = VmConfig {
+            machine: images::Os::Windows,
+            ..vm.config.clone()
+        };
+        assert!(presses_boot_keys(&win, &iso));
+        assert!(!presses_boot_keys(&win, &Some(None)));
+        assert!(!presses_boot_keys(&win, &None));
+        assert!(!presses_boot_keys(&vm.config, &iso));
+
+        let (tx, rx) = watch::channel(false);
+        vm.exited = rx;
+        let vm = Arc::new(vm);
+        let ms = Duration::from_millis;
+        // Presses at 0, 300 and 600 ms; each takes over 100 ms (holds).
+        vm.clone().boot_keys(ms(0), ms(300), ms(900)).await;
+        assert_eq!(summary(&log), ["key ret true", "key ret false"].repeat(3));
+        // None that would start after the deadline.
+        log.lock().unwrap().clear();
+        vm.clone().boot_keys(ms(0), ms(10), ms(60)).await;
+        assert_eq!(summary(&log), ["key ret true", "key ret false"]);
+        log.lock().unwrap().clear();
+        tx.send(true).unwrap();
+        vm.clone().boot_keys(ms(0), ms(1), ms(10)).await;
+        assert!(summary(&log).is_empty());
+
+        let (_d, mut vm, log) = fake_vm("paused", None).await;
+        let (_tx, rx) = watch::channel(false);
+        vm.exited = rx;
+        Arc::new(vm).boot_keys(ms(0), ms(1), ms(10)).await;
+        assert!(summary(&log).is_empty());
+
+        // Aborted with its handle.
+        let (_d, mut vm, log) = fake_vm("running", None).await;
+        let (_tx, rx) = watch::channel(false);
+        vm.exited = rx;
+        let vm = Arc::new(vm);
+        let task = tokio::spawn(vm.clone().boot_keys(ms(200), ms(1), ms(400)));
+        *vm.boot_key_task.lock().unwrap() = Some(task.abort_handle());
+        vm.stop_boot_keys().await;
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(summary(&log).is_empty());
+        // Mid-press, the stop waits for the release.
+        let task = tokio::spawn(vm.clone().boot_keys(ms(0), ms(200), ms(400)));
+        *vm.boot_key_task.lock().unwrap() = Some(task.abort_handle());
+        tokio::time::sleep(ms(20)).await;
+        vm.stop_boot_keys().await;
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(summary(&log), ["key ret true", "key ret false"]);
     }
 
     /// A fake guest agent that counts connections and answers sync and
@@ -2241,6 +2593,29 @@ mod tests {
     }
 
     #[test]
+    fn tpm_reply() {
+        let crb = serde_json::json!({
+            "id": "tpm0",
+            "model": "tpm-crb",
+            "options": {"type": "emulator", "data": {"chardev": "tpm0-ctrl"}}
+        });
+        check_tpm(&Value::Array(vec![crb.clone()])).unwrap();
+        let mut tis = crb.clone();
+        tis["model"] = "tpm-tis".into();
+        let mut passthrough = crb.clone();
+        passthrough["options"]["type"] = "passthrough".into();
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([crb, crb]),
+            serde_json::json!([tis]),
+            serde_json::json!([passthrough]),
+            serde_json::json!({}),
+        ] {
+            assert!(check_tpm(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn overhead() {
         assert_eq!(overhead_mib(256, 2048), 256);
         assert_eq!(overhead_mib(256, 8192), 512);
@@ -2308,6 +2683,61 @@ mod tests {
         m.running.lock().unwrap().clear();
         m.remove_image(id).await.unwrap();
         assert!(!images::iso_path(&m.paths, id).exists());
+    }
+
+    /// A Windows VM gets Secure Boot variables and a CD-ROM drive (never a
+    /// seed), whatever its image lookup says.
+    #[tokio::test]
+    async fn windows_firmware_and_drive() {
+        use crate::config::{DaemonConfig, Mode};
+        use images::{Firmware, Os};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        let (_d, running, _) = fake_vm("running", None).await;
+        let linux = VmConfig {
+            image: "left-the-catalog".into(),
+            ..running.config.clone()
+        };
+        let win = VmConfig {
+            machine: Os::Windows,
+            ..linux.clone()
+        };
+        for fw in [Firmware::Uefi, Firmware::SecureBoot] {
+            assert_eq!(vars_firmware(&win, fw), Firmware::SecureBoot);
+            assert_eq!(vars_firmware(&linux, fw), fw);
+        }
+        // An image the catalog does not know: a seed for Linux, an empty
+        // drive for Windows.
+        assert_eq!(m.cdrom(&linux).unwrap(), None);
+        assert_eq!(m.cdrom(&win).unwrap(), Some(None));
+        // An imported ISO has a drive, whatever its OS.
+        let local = VmConfig {
+            image: "local-arch".into(),
+            ..linux.clone()
+        };
+        assert_eq!(m.cdrom(&local).unwrap(), Some(None));
+        let id = "fedora-44-workstation";
+        let with_iso = VmConfig {
+            cdrom: Some(id.into()),
+            ..win
+        };
+        assert_eq!(
+            m.cdrom(&with_iso).unwrap(),
+            Some(Some(images::iso_path(&m.paths, id)))
+        );
     }
 
     /// `set_resources`: limits and host checks of `new`, stopped VMs only,
@@ -2421,5 +2851,210 @@ mod tests {
         assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
         let e = err(m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await);
         assert!(e.contains("RAM snapshots (s1)"), "{e}");
+    }
+
+    /// `set_net`: stopped VMs from an ISO only, no run clones, the network
+    /// checks of `new`, no forwards offline, no RAM snapshots; saved in
+    /// vm.toml.
+    #[tokio::test]
+    async fn net_setting() {
+        use crate::config::{DaemonConfig, Mode};
+        let manager = |mode| {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap();
+            for d in ["data", "run", "cg"] {
+                fs::create_dir(root.join(d)).unwrap();
+            }
+            let paths = Paths::new(root.join("data"), root.join("run"))
+                .unwrap()
+                .prepare()
+                .unwrap();
+            let config = DaemonConfig::default();
+            (
+                tmp,
+                Manager::new(paths, config, Cgroups::at(root.join("cg")), mode),
+            )
+        };
+        let (_t, m) = manager(Mode::Dev);
+        let (_t2, prod) = manager(Mode::Production);
+        let (_d, running, _) = fake_vm("paused", None).await;
+        let cloud = running.config.clone();
+        let win = VmConfig {
+            name: "win".into(),
+            image: "local-win11".into(),
+            machine: images::Os::Windows,
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            net: NetProfile::Internet,
+            ..cloud.clone()
+        };
+        let fwd = VmConfig {
+            name: "fwd".into(),
+            forwards: vec![crate::net::parse_forward("8080:80", [127, 0, 0, 1].into()).unwrap()],
+            ..win.clone()
+        };
+        let off = VmConfig {
+            name: "off".into(),
+            net: NetProfile::Offline,
+            ..win.clone()
+        };
+        let clone = VmConfig {
+            name: "run-0a1b2c3d".into(),
+            throwaway_of: Some("win".into()),
+            ..win.clone()
+        };
+        for m in [&m, &prod] {
+            m.cleanup_leftovers().await.unwrap();
+            for cfg in [&cloud, &win, &fwd, &off, &clone] {
+                let dir = m.paths.vm_dir(&cfg.name);
+                fs::create_dir(&dir).unwrap();
+                cfg.save(&dir).unwrap();
+            }
+        }
+        let err = |r: Result<VmConfig>| r.unwrap_err().to_string();
+        use NetProfile::{Internet, Offline};
+
+        assert!(err(m.set_net("nope", Offline).await).contains("nope"));
+        let e = err(m.set_net("dev", Offline).await);
+        assert!(e.contains("made from cloud image ubuntu-26.04"), "{e}");
+        // An image that left the catalog is refused, not taken for one.
+        let gone = VmConfig {
+            name: "gone".into(),
+            image: "no-such-image".into(),
+            ..cloud.clone()
+        };
+        let dir = m.paths.vm_dir("gone");
+        fs::create_dir(&dir).unwrap();
+        gone.save(&dir).unwrap();
+        let e = err(m.set_net("gone", Offline).await);
+        assert!(
+            e.contains("gone is made from an image this build does not know"),
+            "{e}"
+        );
+        let e = err(m.set_net("run-0a1b2c3d", Offline).await);
+        assert!(e.contains("clone"), "{e}");
+        let e = err(m.set_net("fwd", Offline).await);
+        assert!(e.contains("recreate the VM to make it offline"), "{e}");
+        assert_eq!(m.load("fwd").unwrap(), fwd, "nothing saved");
+        // Dev mode always refuses the internet profile; production mode
+        // without the host's table (as here) too.
+        let e = err(m.set_net("off", Internet).await);
+        assert!(e.contains("dev mode"), "{e}");
+        let e = err(prod.set_net("off", Internet).await);
+        assert!(e.contains("isolation unavailable"), "{e}");
+        assert_eq!(m.load("off").unwrap(), off, "nothing saved");
+        // Unchanged: nothing to check.
+        assert_eq!(m.set_net("win", Internet).await.unwrap(), win);
+        // Paused counts as running.
+        m.running
+            .lock()
+            .unwrap()
+            .insert("win".into(), Arc::new(running));
+        let e = err(m.set_net("win", Offline).await);
+        assert!(e.contains("win is running; stop it first"), "{e}");
+        m.running.lock().unwrap().clear();
+        assert_eq!(m.load("win").unwrap(), win, "nothing saved");
+
+        // Below: snapshots are listed with a confined qemu-img.
+        if !confine::available() {
+            return;
+        }
+        let dir = m.paths.vm_dir("win");
+        for (file, size) in [(qemu::DISK, "1G"), (qemu::VARS, "1M")] {
+            let ok = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(dir.join(file))
+                .arg(size)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        // A RAM snapshot holds the network card's device state.
+        crate::snapshot::create_offline(&dir, "s1").await.unwrap();
+        ensure_private_dir(&dir.join(qemu::STATES)).unwrap();
+        fs::write(crate::snapshot::state_file(&dir, "s1"), b"ram").unwrap();
+        let e = err(m.set_net("win", Offline).await);
+        assert!(e.contains("RAM snapshots (s1)"), "{e}");
+        assert_eq!(m.load("win").unwrap(), win, "nothing saved");
+        fs::remove_file(crate::snapshot::state_file(&dir, "s1")).unwrap();
+        // A disk-only snapshot does not hold it.
+        let cfg = m.set_net("win", Offline).await.unwrap();
+        assert_eq!(
+            cfg,
+            VmConfig {
+                net: Offline,
+                ..win.clone()
+            }
+        );
+        assert_eq!(m.load("win").unwrap(), cfg, "vm.toml round-trip");
+    }
+
+    /// An import is refused at once while a pull, removal, VM creation or
+    /// another import holds the images lock, and when its ISO would not fit
+    /// above the disk floor; neither leaves anything behind.
+    #[tokio::test]
+    async fn import_admission() {
+        use crate::config::{DaemonConfig, Mode};
+        use images::Os;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let manager = |floor_gib, dir: &str| {
+            for d in ["data", "run", "cg"] {
+                fs::create_dir_all(root.join(dir).join(d)).unwrap();
+            }
+            let paths = Paths::new(root.join(dir).join("data"), root.join(dir).join("run"))
+                .unwrap()
+                .prepare()
+                .unwrap();
+            let mut config = DaemonConfig::default();
+            config.host.disk_floor_gib = floor_gib;
+            Manager::new(
+                paths,
+                config,
+                Cgroups::at(root.join(dir).join("cg")),
+                Mode::Dev,
+            )
+        };
+        let data = vec![0u8; 0x9000];
+        let size = data.len() as u64;
+        let left = |m: &Manager| fs::read_dir(m.paths.images_dir()).unwrap().count();
+
+        let full = manager(u64::MAX >> 30, "full");
+        let e = full
+            .import_iso("local-x", Os::Linux, "", size, &mut &data[..])
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("not enough disk space"), "{e:#}");
+        assert_eq!(left(&full), 0);
+
+        let m = manager(0, "ok");
+        for exclusive in [true, false] {
+            let _held = if exclusive {
+                (Some(m.images.write().await), None)
+            } else {
+                (None, Some(m.images.read().await))
+            };
+            let e = m
+                .import_iso("local-x", Os::Linux, "", size, &mut &data[..])
+                .await
+                .unwrap_err();
+            assert!(format!("{e:#}").contains("in progress"), "{e:#}");
+        }
+        // A second import while the first waits for its client.
+        let (_client, mut body) = tokio::io::duplex(64);
+        let mut second = &data[..];
+        tokio::select! {
+            biased;
+            r = m.import_iso("local-a", Os::Linux, "", size, &mut body) => {
+                panic!("the first import ended: {r:?}")
+            }
+            r = m.import_iso("local-b", Os::Linux, "", size, &mut second) => {
+                let e = r.unwrap_err();
+                assert!(format!("{e:#}").contains("in progress"), "{e:#}");
+            }
+        }
+        assert!(!images::iso_path(&m.paths, "local-b").exists());
     }
 }
