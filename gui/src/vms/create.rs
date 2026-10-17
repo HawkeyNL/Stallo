@@ -17,6 +17,9 @@ use super::{Vms, name_spinner};
 use crate::client;
 use crate::model::{self, Action, ImageChoice, NewVm, Op};
 
+const LIVE_SCREEN_NOTE: &str =
+    "See and use the VM's screen here. Anyone in the stallo group can too.";
+
 /// The New VM action (`vms.new`), its header button, and the progress
 /// strip in the sidebar.
 pub(super) struct Create {
@@ -202,6 +205,8 @@ struct Form {
     wanted: [Cell<f64>; 3],
     /// The values are being fitted to the caps, not chosen.
     fitting: Cell<bool>,
+    /// The selected image is an installer: its defaults are in `wanted`.
+    installer: Cell<bool>,
 }
 
 impl Form {
@@ -220,6 +225,12 @@ impl Form {
         let image_group = adw::PreferencesGroup::builder()
             .title("Operating System")
             .build();
+        // Fixed text only: descriptions are markup.
+        let installer_group = adw::PreferencesGroup::builder()
+            .title("Installers")
+            .description(model::INSTALLER_NOTE)
+            .visible(images.iter().any(|i| i.installer))
+            .build();
         let mut checks: Vec<gtk::CheckButton> = Vec::new();
         for (i, image) in images.iter().enumerate() {
             let check = gtk::CheckButton::builder()
@@ -237,7 +248,11 @@ impl Form {
             // Through `Widget`: the binding does not mark rows as `Accessible`.
             let label = row.upcast_ref::<gtk::Widget>().upcast_ref();
             check.update_relation(&[gtk::accessible::Relation::LabelledBy(&[label])]);
-            image_group.add(&row);
+            if image.installer {
+                installer_group.add(&row);
+            } else {
+                image_group.add(&row);
+            }
             checks.push(check);
         }
 
@@ -262,7 +277,7 @@ impl Form {
         // Its own group: the name's hint stays right under the name.
         let live_screen = adw::SwitchRow::builder()
             .title("Live Screen")
-            .subtitle("See and use the VM's screen here. Anyone in the stallo group can too.")
+            .subtitle(LIVE_SCREEN_NOTE)
             .use_markup(false)
             .active(true)
             .build();
@@ -285,9 +300,11 @@ impl Form {
                 .numeric(true)
                 .build()
         };
-        let vcpus = spin("Processors", model::NEW_VCPUS.into(), 1);
-        let memory = spin("Memory (GiB)", model::NEW_MEMORY_GIB, 1);
-        let disk = spin("Disk Size (GiB)", model::NEW_DISK_GIB, model::MIN_DISK_GIB);
+        let (v0, m0, d0) = model::new_defaults(&images[selected]);
+        let installer = images[selected].installer;
+        let vcpus = spin("Processors", v0.into(), 1);
+        let memory = spin("Memory (GiB)", m0, 1);
+        let disk = spin("Disk Size (GiB)", d0, model::MIN_DISK_GIB);
         let internet = adw::SwitchRow::builder()
             .title("Internet Access")
             .use_markup(false)
@@ -305,6 +322,7 @@ impl Form {
 
         let page = adw::PreferencesPage::new();
         page.add(&image_group);
+        page.add(&installer_group);
         page.add(&name_group);
         page.add(&screen_group);
         page.add(&advanced_group);
@@ -331,10 +349,11 @@ impl Form {
             taken,
             suggested: RefCell::new(suggested),
             wanted: [
-                Cell::new(model::NEW_VCPUS.into()),
-                Cell::new(model::NEW_MEMORY_GIB as f64),
-                Cell::new(model::NEW_DISK_GIB as f64),
+                Cell::new(v0.into()),
+                Cell::new(m0 as f64),
+                Cell::new(d0 as f64),
             ],
+            installer: Cell::new(installer),
             fitting: Cell::new(false),
         });
         // Fit the values to the first image before any handler runs.
@@ -390,7 +409,16 @@ impl Form {
     }
 
     fn image_changed(&self) {
-        let new = model::suggest_vm_name(&self.images[self.selected()].id, &self.taken);
+        let image = &self.images[self.selected()];
+        // An installer and a cloud image have different defaults; a switch
+        // between them starts over from the new one's.
+        if self.installer.replace(image.installer) != image.installer {
+            let (v, m, d) = model::new_defaults(image);
+            for (wanted, value) in self.wanted.iter().zip([f64::from(v), m as f64, d as f64]) {
+                wanted.set(value);
+            }
+        }
+        let new = model::suggest_vm_name(&image.id, &self.taken);
         let old = self.suggested.replace(new.clone());
         if self.name.text() == old {
             self.name.set_text(&new);
@@ -401,7 +429,7 @@ impl Form {
     /// Fits the limits, the network and the Create button to the choices.
     fn update(&self) {
         let image = &self.images[self.selected()];
-        let limits = model::limits(&self.host, image.download_bytes);
+        let limits = model::limits(&self.host, image.download_bytes, image.download_reserve);
         let notes = limits.notes();
         for (((row, upper), note), wanted) in [
             (&self.vcpus, u64::from(limits.vcpus)),
@@ -424,6 +452,13 @@ impl Form {
                 row.set_subtitle(note);
             }
         }
+        let lock = model::live_screen_lock(image);
+        if lock.is_some() && !self.live_screen.is_active() {
+            self.live_screen.set_active(true);
+        }
+        self.live_screen.set_sensitive(lock.is_none());
+        self.live_screen
+            .set_subtitle(lock.unwrap_or(LIVE_SCREEN_NOTE));
         let block = model::internet_block(image, self.production);
         if block.is_some() && self.internet.is_active() {
             self.internet.set_active(false);
@@ -472,7 +507,7 @@ impl Form {
         let Ok(name) = model::vm_name(&self.name.text(), &self.taken) else {
             return;
         };
-        if model::limits(&self.host, image.download_bytes)
+        if model::limits(&self.host, image.download_bytes, image.download_reserve)
             .block()
             .is_some()
         {
@@ -489,6 +524,7 @@ impl Form {
             disk_gib,
             internet: self.internet.is_active(),
             live_screen: self.live_screen.is_active(),
+            installer: image.installer,
         };
         if let Some(d) = self.dialog.upgrade() {
             d.close();
