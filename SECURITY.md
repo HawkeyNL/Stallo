@@ -83,7 +83,9 @@ SHA-256), but are otherwise untrusted guest input: the host never mounts or
 parses them (no `qemu-img`); only QEMU reads them, as a raw (never
 probed), read-only CD-ROM. Landlock grants that QEMU read access to the one
 ISO in its drive, and the AppArmor profile allows `images/*.iso`
-read-only. `images rm` is refused while a VM has the ISO in its drive.
+read-only. `images rm` is refused while a VM has the ISO in its drive,
+including a running VM whose drive was ejected in its settings but not
+yet restarted.
 Such a guest is the user's own system: it gets none of the SMBIOS systemd
 credentials that tune the boot of Stallo's cloud guests.
 

@@ -321,7 +321,7 @@ mod tests {
             let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("cannot tell whether half uses image ubuntu-26.04; if a `stallo run` is in progress"),
+                    .contains("cannot tell whether half uses image ubuntu-26.04; if a `stallo run` is in progress, try again when it ends, otherwise remove it first (stallo rm half) or move it out of the vms directory"),
                 "{err}"
             );
         }
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(m.load("dev").unwrap(), vm("dev", None));
     }
 
-    /// A pull is refused before any download unless twice the image fits
+    /// A pull is refused before any download unless its pull reserve fits
     /// above the disk floor; a cached image needs no space.
     #[tokio::test]
     async fn pull_needs_free_space() {

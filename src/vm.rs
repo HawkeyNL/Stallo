@@ -333,8 +333,10 @@ impl Manager {
     /// Deletes a cached image (`stallo images rm`). Refused while any VM,
     /// stopped or a `stallo run` clone included, was made from it or has it
     /// in its CD-ROM drive: by its `vm.toml` or by its disk's backing file.
-    /// Fails closed: a VM directory whose `vm.toml` or disk cannot be read
-    /// refuses the removal.
+    /// A running VM counts with the ISO it started with: an eject in its
+    /// `vm.toml` empties the drive only at the next start. Fails closed: a
+    /// VM directory whose `vm.toml` or disk cannot be read refuses the
+    /// removal.
     pub async fn remove_image(&self, id: &str) -> Result<()> {
         validate_image_id(id)?;
         let _guard = self.images.write().await;
@@ -349,7 +351,7 @@ impl Manager {
             let name = name.to_string_lossy();
             let cfg = VmConfig::load(&dir).with_context(|| {
                 format!(
-                    "cannot tell whether {name} uses image {id}; if a `stallo run` is in progress, try again when it ends, otherwise remove it first: stallo rm {name}"
+                    "cannot tell whether {name} uses image {id}; if a `stallo run` is in progress, try again when it ends, otherwise remove it first (stallo rm {name}) or move it out of the vms directory"
                 )
             })?;
             let by_config = cfg.image == id || cfg.cdrom.as_deref() == Some(id);
@@ -362,7 +364,14 @@ impl Manager {
                 users.push(name.into_owned());
             }
         }
+        // Started before an eject: the ISO is still in the live drive.
+        for vm in self.all_running() {
+            if vm.config.cdrom.as_deref() == Some(id) {
+                users.push(vm.config.name.clone());
+            }
+        }
         users.sort();
+        users.dedup();
         ensure!(
             users.is_empty(),
             "image {id} is in use by {}; remove those VMs first (stallo rm)",
@@ -2252,6 +2261,53 @@ mod tests {
             "--scope --quiet --collect --expand-environment=no -p KillSignal=SIGKILL -p RuntimeMaxSec=1500ms -- \
              setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
         );
+    }
+
+    /// `images rm` keeps an ISO that a running VM started with, even after
+    /// an eject in its vm.toml (it applies at the next start).
+    #[tokio::test]
+    async fn image_rm_sees_the_live_drive() {
+        use crate::config::{DaemonConfig, Mode};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        m.cleanup_leftovers().await.unwrap();
+        let id = "fedora-44-workstation";
+        ensure_private_dir(&m.paths.images_dir()).unwrap();
+        fs::write(images::iso_path(&m.paths, id), b"iso").unwrap();
+        let (_d, mut running, _) = fake_vm("running", None).await;
+        // Made from another ISO, so only the drive names this one.
+        running.config.image = "ubuntu-26.04-desktop".into();
+        running.config.cdrom = Some(id.into());
+        let ejected = VmConfig {
+            cdrom: None,
+            ..running.config.clone()
+        };
+        let dir = m.paths.vm_dir("dev");
+        fs::create_dir(&dir).unwrap();
+        ejected.save(&dir).unwrap();
+        m.running
+            .lock()
+            .unwrap()
+            .insert("dev".into(), Arc::new(running));
+        let e = m.remove_image(id).await.unwrap_err().to_string();
+        assert!(e.contains("in use by dev;"), "{e}");
+        // Stopped, the eject has applied.
+        m.running.lock().unwrap().clear();
+        m.remove_image(id).await.unwrap();
+        assert!(!images::iso_path(&m.paths, id).exists());
     }
 
     /// `set_resources`: limits and host checks of `new`, stopped VMs only,
