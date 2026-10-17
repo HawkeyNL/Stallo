@@ -653,11 +653,21 @@ impl Manager {
                     "{} has no copy of {name}'s TPM state; it cannot be restored, delete it",
                     snap.name
                 );
-                apply_offline(&vm_dir, &snap.name, &names_offline(&vm_dir).await?).await?;
+                // The TPM state is built first and swapped in after the
+                // images: nothing of it changes unless they did.
                 if windows {
-                    tpm::restore_copy(&vm_dir, &snap.name)
-                        .context("the restore stopped halfway; restore again")?;
+                    tpm::prepare_copy(&vm_dir, &snap.name)?;
                 }
+                let applied =
+                    apply_offline(&vm_dir, &snap.name, &names_offline(&vm_dir).await?).await;
+                if windows {
+                    match &applied {
+                        Ok(()) => tpm::swap_in(&vm_dir)
+                            .context("the restore stopped halfway; restore again")?,
+                        Err(_) => tpm::discard_new(&vm_dir)?,
+                    }
+                }
+                applied?;
                 None
             }
         };

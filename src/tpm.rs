@@ -126,8 +126,17 @@ fn copy_dir(vm_dir: &Path, tag: &str) -> PathBuf {
     vm_dir.join(SNAPSHOTS).join(tag)
 }
 
-/// Copies the TPM state (the regular files of `tpm/` but swtpm's `.lock`)
-/// for disk-only snapshot `tag` of a stopped VM. The state is a few KiB.
+/// swtpm's state files (TPM 2.0); nothing else in `tpm/` is copied.
+const STATE_FILES: [&str; 3] = [
+    "tpm2-00.permall",
+    "tpm2-00.volatilestate",
+    "tpm2-00.savestate",
+];
+/// Where a restore builds the TPM state before swapping it in.
+const NEW: &str = "tpm.new";
+
+/// Copies the TPM state for disk-only snapshot `tag` of a stopped VM. The
+/// state is a few KiB.
 pub fn save_copy(vm_dir: &Path, tag: &str) -> Result<()> {
     validate_tag(tag)?;
     let to = copy_dir(vm_dir, tag);
@@ -143,28 +152,45 @@ pub fn has_copy(vm_dir: &Path, tag: &str) -> bool {
     copy_dir(vm_dir, tag).is_dir()
 }
 
-/// Makes the copy of snapshot `tag` the TPM state of a stopped VM: built
-/// beside `tpm/` and swapped in with two renames.
-pub fn restore_copy(vm_dir: &Path, tag: &str) -> Result<()> {
+/// First half of restoring snapshot `tag`'s TPM copy into a stopped VM:
+/// builds it in `tpm.new/`, beside `tpm/`. Until [`swap_in`] (or
+/// [`discard_new`]) the VM does not start.
+pub fn prepare_copy(vm_dir: &Path, tag: &str) -> Result<()> {
     validate_tag(tag)?;
     ensure!(
         has_copy(vm_dir, tag),
         "snapshot {tag} has no copy of the TPM state"
     );
-    let (tpm, new, old) = (
-        vm_dir.join(DIR),
-        vm_dir.join("tpm.new"),
-        vm_dir.join("tpm.old"),
-    );
-    for d in [&new, &old] {
-        safe_remove(vm_dir, d)?;
-    }
+    let new = vm_dir.join(NEW);
+    safe_remove(vm_dir, &new)?;
     ensure_private_dir(&new)?;
-    copy_files(&copy_dir(vm_dir, tag), &new).context("cannot copy the TPM state back")?;
+    copy_files(&copy_dir(vm_dir, tag), &new).context("cannot copy the TPM state back")
+}
+
+/// Second half: exchanges `tpm.new/` and `tpm/` in one atomic rename, then
+/// removes the old state.
+pub fn swap_in(vm_dir: &Path) -> Result<()> {
+    let (tpm, new) = (vm_dir.join(DIR), vm_dir.join(NEW));
     ensure_private_dir(&tpm)?;
-    fs::rename(&tpm, &old)?;
-    fs::rename(&new, &tpm)?;
-    safe_remove(vm_dir, &old)?;
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, &new, CWD, &tpm, RenameFlags::EXCHANGE)
+        .context("cannot swap in the TPM state")?;
+    safe_remove(vm_dir, &new)?;
+    Ok(())
+}
+
+/// Drops a `tpm.new/` that will not be swapped in.
+pub fn discard_new(vm_dir: &Path) -> Result<()> {
+    safe_remove(vm_dir, &vm_dir.join(NEW))?;
+    Ok(())
+}
+
+/// Refuses a start while a TPM restore is unfinished.
+pub fn check_no_restore_pending(vm_dir: &Path) -> Result<()> {
+    ensure!(
+        fs::symlink_metadata(vm_dir.join(NEW)).is_err(),
+        "a TPM state restore did not finish; restore the snapshot again"
+    );
     Ok(())
 }
 
@@ -175,14 +201,19 @@ pub fn remove_copy(vm_dir: &Path, tag: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copies the regular files of `from` (never links, never `.lock`) into
-/// the new, empty directory `to`.
+/// Copies swtpm's state files from `from` into the new, empty directory
+/// `to`: regular files only (never links) of at most [`MAX_FILE_BYTES`],
+/// the most swtpm can write.
 fn copy_files(from: &Path, to: &Path) -> Result<()> {
-    for e in fs::read_dir(from)? {
-        let e = e?;
-        let name = e.file_name();
-        if name != ".lock" && e.file_type()?.is_file() {
-            fs::copy(e.path(), to.join(&name))?;
+    for name in STATE_FILES {
+        let path = from.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES => {
+                fs::copy(&path, to.join(name))?;
+            }
+            Ok(_) => tracing::warn!("{}: not copied (not a small file)", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -213,8 +244,9 @@ mod tests {
         assert!(args(Path::new("/d/a\nb/tpm"), 7).is_err());
     }
 
-    /// A disk-only snapshot's TPM copy goes back exactly: files added
-    /// since are gone, links and the lock are never copied.
+    /// A disk-only snapshot's TPM copy goes back exactly: state files
+    /// added since are gone; links, the lock, other and oversized files are
+    /// never copied.
     #[test]
     fn snapshot_copies() {
         let tmp = tempfile::tempdir().unwrap();
@@ -223,7 +255,12 @@ mod tests {
         crate::paths::ensure_private_dir(&tpm).unwrap();
         fs::write(tpm.join("tpm2-00.permall"), b"old").unwrap();
         fs::write(tpm.join(".lock"), b"").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", tpm.join("link")).unwrap();
+        fs::write(tpm.join("other"), b"x").unwrap();
+        fs::File::create(tpm.join("tpm2-00.savestate"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", tpm.join("tpm2-00.volatilestate")).unwrap();
         assert!(!has_copy(&vm, "s1"));
         save_copy(&vm, "s1").unwrap();
         assert!(has_copy(&vm, "s1"));
@@ -238,16 +275,23 @@ mod tests {
         assert_eq!(names(&vm.join("tpm-snapshots/s1")), ["tpm2-00.permall"]);
 
         fs::write(tpm.join("tpm2-00.permall"), b"new").unwrap();
-        fs::write(tpm.join("tpm2-00.volatilestate"), b"v").unwrap();
-        restore_copy(&vm, "s1").unwrap();
+        prepare_copy(&vm, "s1").unwrap();
+        // Nothing changed yet, and the VM may not start.
+        assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"new");
+        assert!(check_no_restore_pending(&vm).is_err());
+        swap_in(&vm).unwrap();
+        check_no_restore_pending(&vm).unwrap();
         assert_eq!(names(&tpm), ["tpm2-00.permall"]);
         assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"old");
-        assert!(!vm.join("tpm.new").exists() && !vm.join("tpm.old").exists());
+        // A prepared restore can be dropped instead.
+        prepare_copy(&vm, "s1").unwrap();
+        discard_new(&vm).unwrap();
+        check_no_restore_pending(&vm).unwrap();
         // The copy stays for the next restore, until the snapshot goes.
         assert!(has_copy(&vm, "s1"));
         remove_copy(&vm, "s1").unwrap();
         assert!(!has_copy(&vm, "s1"));
-        assert!(restore_copy(&vm, "s1").is_err());
+        assert!(prepare_copy(&vm, "s1").is_err());
         assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"old");
         assert!(save_copy(&vm, "../x").is_err());
     }

@@ -105,6 +105,7 @@ fn windows_vm_runs_with_swtpm() {
     let log = || fs::read_to_string(d.base.join("stallod.log")).unwrap();
     assert!(log().contains("win: swtpm exited"), "{}", log());
     assert!(!log().contains("win: swtpm exited:"), "{}", log());
+    assert!(!log().contains("stopping win"), "{}", log());
 
     // A disk-only snapshot keeps a copy of the TPM state and puts it back.
     let permall = || fs::read(tpm_dir.join("tpm2-00.permall")).unwrap();
