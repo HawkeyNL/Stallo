@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use stallo::api::{ImageInfo, Request, VmDetails, VmInfo};
 use stallo::config::NetProfile;
 use stallo::host::HostInfo;
+use stallo::images::Os;
 use stallo::printable;
 use stallo::snapshot::Snapshot;
 
@@ -1179,7 +1180,9 @@ pub const NEW_INSTALLER_DISK_GIB: u64 = 32;
 /// The processors, memory (GiB) and disk (GiB) a VM from `image` gets
 /// unless changed, as `stallo new` gives it.
 pub fn new_defaults(image: &ImageChoice) -> (u32, u64, u64) {
-    if image.installer {
+    if image.windows {
+        minimums(image)
+    } else if image.installer {
         (NEW_VCPUS, NEW_INSTALLER_MEMORY_GIB, NEW_INSTALLER_DISK_GIB)
     } else {
         (NEW_VCPUS, NEW_MEMORY_GIB, NEW_DISK_GIB)
@@ -1197,6 +1200,26 @@ pub fn live_screen_lock(image: &ImageChoice) -> Option<&'static str> {
 /// The smallest disk offered: above the virtual size of every catalog
 /// image, which the daemon requires.
 pub const MIN_DISK_GIB: u64 = 10;
+
+/// The least processors, memory (GiB) and disk (GiB) a VM from `image`
+/// may have: Windows has its own, which the daemon enforces.
+pub fn minimums(image: &ImageChoice) -> (u32, u64, u64) {
+    if image.windows {
+        let (vcpus, memory_mib, disk_gib) = stallo::config::WINDOWS_MIN;
+        (vcpus, memory_mib >> 10, disk_gib)
+    } else {
+        (1, 1, MIN_DISK_GIB)
+    }
+}
+
+/// Under the processors, memory and disk when Windows is chosen.
+pub const WINDOWS_MINIMUMS: &str =
+    "Windows 11 needs at least 2 processors, 4 GiB memory and 64 GiB disk.";
+/// Under the installers when Windows is chosen, instead of
+/// [`INSTALLER_NOTE`].
+pub const WINDOWS_NOTE: &str =
+    "You install Windows yourself, like on a real PC. Choose a local account during setup.";
+
 /// The largest disk the daemon accepts (`VmConfig::validate`).
 pub const MAX_DISK_GIB: u64 = 16384;
 /// The time limit of a create: a first download of a few GiB on a slow
@@ -1221,6 +1244,8 @@ pub struct ImageChoice {
     pub download_reserve: u64,
     /// An installer ISO: installed by hand on the VM's screen.
     pub installer: bool,
+    /// Installs Windows.
+    pub windows: bool,
     /// The internet profile was verified with this image.
     pub internet: bool,
 }
@@ -1257,11 +1282,14 @@ pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
             let installer =
                 i.kind.or(entry.as_ref().map(|e| e.kind)) == Some(stallo::images::Kind::Iso);
             let (title, detail) = split_name(&i.name);
+            let local = stallo::images::is_local(&i.id);
             let os = i.os.map(|os| match os {
                 stallo::images::Os::Linux => "Linux".to_owned(),
                 stallo::images::Os::Windows => "Windows".to_owned(),
             });
             let state = match (i.cached, i.size_bytes) {
+                (true, Some(b)) if local => format!("Imported ({})", size(b)),
+                (true, _) if local => "Imported".to_owned(),
                 (true, Some(b)) => format!("Downloaded ({})", size(b)),
                 (true, None) => "Downloaded".to_owned(),
                 _ if download_bytes > 0 => {
@@ -1282,6 +1310,7 @@ pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
                 download_bytes,
                 download_reserve,
                 installer,
+                windows: i.os == Some(stallo::images::Os::Windows),
                 internet: entry.is_some_and(|e| e.internet),
             }
         })
@@ -1358,15 +1387,15 @@ impl Limits {
         ]
     }
 
-    /// Why no VM fits now, if so.
-    pub fn block(&self) -> Option<&'static str> {
-        if self.vcpus < 1 {
-            Some("This computer has too few processor cores for a VM.")
-        } else if self.memory_gib < 1 {
-            Some("Not enough free memory for another VM. Stop a VM first.")
+    /// Why no VM with at least `min` (see [`minimums`]) fits now, if so.
+    pub fn block(&self, min: (u32, u64, u64)) -> Option<&'static str> {
+        if self.vcpus < min.0 {
+            Some("This computer has too few processor cores for this VM.")
+        } else if self.memory_gib < min.1 {
+            Some("Not enough free memory for this VM. Stop a VM first.")
         } else if !self.download_fits {
             Some("Not enough free disk space to download this image. Free up space first.")
-        } else if self.disk_gib < MIN_DISK_GIB {
+        } else if self.disk_gib < min.2 {
             Some("Not enough free disk space for this VM. Free up space first.")
         } else {
             None
@@ -1377,7 +1406,10 @@ impl Limits {
 /// Why the internet cannot be turned on for `image`, if so. Only the
 /// production daemon has the isolation the internet profile needs.
 pub fn internet_block(image: &ImageChoice, production: bool) -> Option<&'static str> {
-    if !production {
+    // As the daemon's `check_net`.
+    if image.windows || stallo::images::is_local(&image.id) {
+        Some("Offline for now: VMs from Windows or your own ISO have no internet yet.")
+    } else if !production {
         Some("Not available: the dev-mode daemon keeps VMs offline.")
     } else if !image.internet {
         Some("Not available for this image yet.")
@@ -1394,6 +1426,8 @@ pub fn production(socket: &Path) -> bool {
 /// A free name for a VM from `image`: `ubuntu`, then `ubuntu-2`...
 pub fn suggest_vm_name(image: &str, taken: &[String]) -> String {
     let base: String = image
+        .strip_prefix(stallo::images::LOCAL_PREFIX)
+        .unwrap_or(image)
         .chars()
         .take_while(char::is_ascii_lowercase)
         .take(24)
@@ -1436,6 +1470,68 @@ pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64, internet: bo
     let s = if vcpus == 1 { "" } else { "s" };
     let net = if internet { "Internet" } else { "Offline" };
     format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk · {net}")
+}
+
+/// The system an ISO probably installs, from its file name: a guess the
+/// user confirms before the import.
+pub fn guess_os(file_name: &str) -> Os {
+    if file_name.to_ascii_lowercase().contains("win") {
+        Os::Windows
+    } else {
+        Os::Linux
+    }
+}
+
+/// An import's progress: done as a share, 0 to 1, and in words.
+pub fn import_progress(done: u64, total: u64) -> (f64, String) {
+    let share = match total {
+        0 => 1.0,
+        t => (done as f64 / t as f64).min(1.0),
+    };
+    let text = format!(
+        "{} of {} ({:.0}%)",
+        bytes(done),
+        bytes(total),
+        (share * 100.0).floor()
+    );
+    (share, text)
+}
+
+/// An ISO with the same id is there already.
+pub const IMPORTED_ALREADY: &str =
+    "An ISO with this file name is imported already. Choose it under Installers.";
+
+/// Why an ISO import failed, in plain sentences with what to do next.
+// ponytail: matches the daemon's English text, as `next_step` does.
+pub fn import_error(e: &CallError) -> String {
+    let m = match e {
+        CallError::Failed(m) => m.as_str(),
+        CallError::Timeout => return "The import took too long. Try again.".to_owned(),
+        _ => {
+            return format!(
+                "Could not import the ISO. {}",
+                next_step(e).unwrap_or_default()
+            );
+        }
+    };
+    if m.contains("not an ISO image") || m.contains("too small to be an ISO") {
+        "This file is not an ISO image. Choose another file.".to_owned()
+    } else if m.contains(" exists;") {
+        IMPORTED_ALREADY.to_owned()
+    } else if m.contains("not enough disk space") {
+        "Not enough free disk space for this ISO. Free up space, then try again.".to_owned()
+    } else if m.contains("pull or import is in progress") {
+        "Another image is being downloaded or imported. Try again when it ends.".to_owned()
+    } else if m.contains("not a regular file") {
+        "Only regular files can be imported. Choose an ISO file.".to_owned()
+    } else if m.contains("larger than") {
+        format!(
+            "This file is larger than {} GiB, the most Stallo imports.",
+            stallo::images::MAX_IMPORT_BYTES >> 30
+        )
+    } else {
+        format!("Could not import the ISO: {}", printable(m, 200))
+    }
 }
 
 /// A VM to create, as the dialog has it. `name` and `image` are raw.
@@ -3532,6 +3628,9 @@ mod tests {
         }
     }
 
+    /// The minimums of any image but Windows.
+    const LINUX: (u32, u64, u64) = (1, 1, MIN_DISK_GIB);
+
     fn roomy_host() -> HostInfo {
         HostInfo {
             cores: 16,
@@ -3573,7 +3672,7 @@ mod tests {
                 download_fits: true,
             }
         );
-        assert_eq!(l.block(), None);
+        assert_eq!(l.block(LINUX), None);
         assert_eq!(
             l.notes(),
             [
@@ -3610,18 +3709,28 @@ mod tests {
             cores: 2,
             ..host.clone()
         };
-        assert!(limits(&small, 0, 0).block().unwrap().contains("processor"));
+        assert!(
+            limits(&small, 0, 0)
+                .block(LINUX)
+                .unwrap()
+                .contains("processor")
+        );
         let full = HostInfo {
             memory_used_mib: 16000,
             ..host.clone()
         };
-        assert!(limits(&full, 0, 0).block().unwrap().contains("memory"));
+        assert!(limits(&full, 0, 0).block(LINUX).unwrap().contains("memory"));
         let disk = HostInfo {
             disk_free_bytes: 29 << 30,
             ..host.clone()
         };
         assert_eq!(limits(&disk, 0, 0).disk_gib, 9);
-        assert!(limits(&disk, 0, 0).block().unwrap().contains("for this VM"));
+        assert!(
+            limits(&disk, 0, 0)
+                .block(LINUX)
+                .unwrap()
+                .contains("for this VM")
+        );
         // The daemon wants room for the download's reserve above the floor
         // (twice a cloud image, once an installer ISO).
         let edge = HostInfo {
@@ -3629,10 +3738,10 @@ mod tests {
             ..host.clone()
         };
         assert!(limits(&edge, 10 << 30, 20 << 30).download_fits);
-        assert_eq!(limits(&edge, 10 << 30, 20 << 30).block(), None);
+        assert_eq!(limits(&edge, 10 << 30, 20 << 30).block(LINUX), None);
         let short = limits(&edge, 10 << 30, (20 << 30) + 1);
         assert!(!short.download_fits);
-        assert!(short.block().unwrap().contains("download this image"));
+        assert!(short.block(LINUX).unwrap().contains("download this image"));
         // Below the floor: no underflow.
         let below = HostInfo {
             disk_free_bytes: 1 << 30,
@@ -3679,7 +3788,7 @@ mod tests {
         ];
         for host in hosts {
             let l = limits(&host, 0, 0);
-            assert_eq!(l.block(), None, "{host:?}");
+            assert_eq!(l.block(LINUX), None, "{host:?}");
             // With the internet profile: the most overhead there is.
             let admit = |vcpus: u32, gib: u64, disk_gib: u64| {
                 let mib = gib << 10;
@@ -3844,6 +3953,174 @@ mod tests {
         };
         let l = limits(&host, rows[2].download_bytes, rows[2].download_reserve);
         assert!(l.download_fits);
+    }
+
+    /// Imported ISOs are installers; Windows has its own defaults,
+    /// minimums, notes and stays offline.
+    #[test]
+    fn windows_and_own_isos() {
+        let own = |id: &str, os| ImageInfo {
+            name: "Win11_25H2".into(),
+            kind: Some(stallo::images::Kind::Iso),
+            os: Some(os),
+            ..image(id, true, Some(6 << 30))
+        };
+        let rows = image_choices(&[
+            own("local-win11", Os::Windows),
+            image("ubuntu-26.04", true, None),
+            own("local-mint", Os::Linux),
+        ]);
+        let order: Vec<(&str, bool, bool)> = rows
+            .iter()
+            .map(|r| (r.id.as_str(), r.installer, r.windows))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("ubuntu-26.04", false, false),
+                ("local-win11", true, true),
+                ("local-mint", true, false),
+            ]
+        );
+        assert_eq!(rows[1].subtitle, "Windows · Imported (6.0 GiB)");
+        assert_eq!((rows[1].download_bytes, rows[1].download_reserve), (0, 0));
+        assert!(rows[1].cached && !rows[1].internet);
+
+        // Windows starts at its minimums, which the daemon enforces.
+        let (vcpus, memory_mib, disk_gib) = stallo::config::WINDOWS_MIN;
+        assert_eq!(minimums(&rows[1]), (vcpus, memory_mib >> 10, disk_gib));
+        assert_eq!(new_defaults(&rows[1]), minimums(&rows[1]));
+        assert_eq!(
+            WINDOWS_MINIMUMS,
+            format!(
+                "Windows 11 needs at least {vcpus} processors, {} GiB memory and {disk_gib} GiB disk.",
+                memory_mib >> 10
+            )
+        );
+        // An imported Linux ISO is a desktop, like the catalog's.
+        assert_eq!(new_defaults(&rows[2]), (2, 4, 32));
+        for row in [&rows[0], &rows[2]] {
+            assert_eq!(minimums(row), LINUX);
+        }
+        // Room for a Linux VM is not room for Windows.
+        let host = HostInfo {
+            disk_free_bytes: 60 << 30,
+            ..roomy_host()
+        };
+        let l = limits(&host, 0, 0);
+        assert_eq!(l.block(minimums(&rows[2])), None);
+        assert_eq!(
+            l.block(minimums(&rows[1])),
+            Some("Not enough free disk space for this VM. Free up space first.")
+        );
+        let two_cores = HostInfo {
+            cores: 2,
+            ..roomy_host()
+        };
+        assert!(
+            limits(&two_cores, 0, 0)
+                .block(minimums(&rows[1]))
+                .unwrap()
+                .contains("processor")
+        );
+        let tight = HostInfo {
+            memory_used_mib: 16384 - 3500,
+            ..roomy_host()
+        };
+        assert_eq!(limits(&tight, 0, 0).block(LINUX), None);
+        assert!(
+            limits(&tight, 0, 0)
+                .block(minimums(&rows[1]))
+                .unwrap()
+                .contains("memory")
+        );
+
+        // Offline only, as the daemon's `check_net`, in production too.
+        for row in &rows[1..] {
+            assert_eq!(
+                internet_block(row, true),
+                Some("Offline for now: VMs from Windows or your own ISO have no internet yet.")
+            );
+        }
+        assert_eq!(internet_block(&rows[0], true), None);
+
+        // The prefix is no name.
+        assert_eq!(suggest_vm_name("local-win11-25h2", &[]), "win");
+        assert_eq!(suggest_vm_name("local-2604", &[]), "vm");
+        assert_eq!(
+            suggest_vm_name("local-mint", &["mint".to_owned()]),
+            "mint-2"
+        );
+    }
+
+    #[test]
+    fn import_wording() {
+        for (file, os) in [
+            ("Win11_25H2_English_x64.iso", Os::Windows),
+            ("windows-server.iso", Os::Windows),
+            ("en-us_WINDOWS_10.iso", Os::Windows),
+            ("ubuntu-26.04-desktop-amd64.iso", Os::Linux),
+            ("Fedora-Workstation.iso", Os::Linux),
+            ("", Os::Linux),
+        ] {
+            assert_eq!(guess_os(file), os, "{file}");
+        }
+
+        assert_eq!(
+            import_progress(0, 6 << 30),
+            (0.0, "0 bytes of 6.0 GiB (0%)".to_owned())
+        );
+        assert_eq!(
+            import_progress(3 << 29, 6 << 30),
+            (0.25, "1.5 GiB of 6.0 GiB (25%)".to_owned())
+        );
+        // 99.9% is not done yet.
+        assert_eq!(
+            import_progress(999, 1000).1,
+            "999 bytes of 1000 bytes (99%)"
+        );
+        assert_eq!(import_progress(0, 0).0, 1.0);
+
+        let failed = |m: &str| import_error(&CallError::Failed(m.into()));
+        assert_eq!(
+            failed("not an ISO image (no ISO 9660 volume descriptor)"),
+            "This file is not an ISO image. Choose another file."
+        );
+        assert_eq!(
+            failed("the file is too small to be an ISO"),
+            "This file is not an ISO image. Choose another file."
+        );
+        assert_eq!(
+            failed(
+                "image local-x exists; pick another id or remove it first (stallo images rm local-x)"
+            ),
+            IMPORTED_ALREADY
+        );
+        assert!(
+            failed("not enough disk space to download the image: 1.0 GiB free")
+                .starts_with("Not enough free disk space for this ISO.")
+        );
+        assert!(
+            failed("an image pull or import is in progress; try again when it ends")
+                .starts_with("Another image")
+        );
+        assert!(failed("not a regular file").starts_with("Only regular files"));
+        assert_eq!(
+            failed("larger than 12 GiB"),
+            "This file is larger than 12 GiB, the most Stallo imports."
+        );
+        assert_eq!(
+            failed("cannot open /x.iso: Permission denied\u{1b}[2J"),
+            "Could not import the ISO: cannot open /x.iso: Permission denied[2J"
+        );
+        assert_eq!(
+            import_error(&CallError::NotRunning),
+            "Could not import the ISO. Start the Stallo service, then try again."
+        );
+        assert_eq!(
+            import_error(&CallError::Timeout),
+            "The import took too long. Try again."
+        );
     }
 
     #[test]

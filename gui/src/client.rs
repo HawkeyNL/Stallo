@@ -4,15 +4,19 @@
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use stallo::api::{Envelope, ImageInfo, Request, Via, VmDetails, VmInfo};
 use stallo::host::HostInfo;
+use stallo::images::{IMPORT_TOTAL, MAX_IMPORT_BYTES, Os};
 use stallo::paths::Paths;
 use stallo::snapshot::Snapshot;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 
 use crate::model::{self, Action, CallError, Probe, Production};
@@ -92,20 +96,19 @@ async fn send(
     };
     match tokio::time::timeout(limit, stallo::api::call(socket, &envelope)).await {
         Err(_) => Err(CallError::Timeout),
-        Ok(Ok(data)) => Ok(data),
-        Ok(Err(e)) => Err(
-            match e
-                .chain()
-                .find_map(|c| c.downcast_ref::<io::Error>())
-                .map(io::Error::kind)
-            {
-                Some(io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
-                    CallError::NotRunning
-                }
-                Some(io::ErrorKind::PermissionDenied) => CallError::Denied,
-                _ => CallError::Failed(format!("{e:#}")),
-            },
-        ),
+        Ok(result) => result.map_err(call_error),
+    }
+}
+
+fn call_error(e: anyhow::Error) -> CallError {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<io::Error>())
+        .map(io::Error::kind)
+    {
+        Some(io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => CallError::NotRunning,
+        Some(io::ErrorKind::PermissionDenied) => CallError::Denied,
+        _ => CallError::Failed(format!("{e:#}")),
     }
 }
 
@@ -176,6 +179,95 @@ pub async fn create(socket: &Path, request: Request) -> Result<serde_json::Value
 pub async fn file(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
     let _slot = FILES.acquire().await;
     send(socket, request, model::FILE_LIMIT).await
+}
+
+/// The time limit of an ISO import: the daemon's own, and its answer.
+const IMPORT_LIMIT: Duration = Duration::from_secs(IMPORT_TOTAL.as_secs() + 60);
+
+/// Imports the ISO at `path` as image `id` (`import_iso`), as `stallo
+/// images import` does: opened with the user's own rights, then exactly
+/// its size streamed to the daemon, which never sees the path. File reads
+/// run on the blocking pool, 1 MiB at a time; `sent` follows the bytes
+/// read, and the size. Dropping the future (an aborted task) closes the
+/// stream, and the daemon drops what it got. No slot: the New VM dialog
+/// runs one import at a time.
+pub async fn import(
+    socket: PathBuf,
+    path: PathBuf,
+    id: String,
+    os: Os,
+    sent: watch::Sender<(u64, u64)>,
+) -> Result<serde_json::Value, CallError> {
+    let host = |e: io::Error| CallError::Failed(format!("cannot open {}: {e}", path.display()));
+    // Non-blocking, so a FIFO cannot hang open(); regular files ignore it.
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(&path)
+        .await
+        .map_err(host)?;
+    let meta = file.metadata().await.map_err(host)?;
+    let size = meta.len();
+    if !meta.is_file() {
+        return Err(CallError::Failed("not a regular file".to_owned()));
+    }
+    if size > MAX_IMPORT_BYTES {
+        return Err(CallError::Failed(format!(
+            "larger than {} GiB",
+            MAX_IMPORT_BYTES >> 30
+        )));
+    }
+    sent.send_replace((0, size));
+    let name = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let envelope = Envelope {
+        via: Via::Cli,
+        request: Request::ImportIso { id, os, name, size },
+    };
+    // `take`: a file that grows meanwhile sends `size` bytes all the same.
+    let body = Counted {
+        inner: tokio::io::BufReader::with_capacity(1 << 20, file.take(size)),
+        done: 0,
+        size,
+        sent,
+    };
+    tokio::time::timeout(IMPORT_LIMIT, stallo::api::upload(&socket, &envelope, body))
+        .await
+        .map_err(|_| CallError::Timeout)?
+        .map_err(call_error)
+}
+
+/// Counts the bytes read through it into `sent`: every 16 MiB and at the
+/// end, which is all a progress bar needs.
+struct Counted<R> {
+    inner: R,
+    done: u64,
+    size: u64,
+    sent: watch::Sender<(u64, u64)>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Counted<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = poll {
+            let n = (buf.filled().len() - before) as u64;
+            let old = this.done;
+            this.done += n;
+            if n == 0 || old >> 24 != this.done >> 24 {
+                this.sent.send_replace((this.done, this.size));
+            }
+        }
+        poll
+    }
 }
 
 /// Runs host file work off the I/O thread.
@@ -473,6 +565,123 @@ mod tests {
             run(async { blocking(|| -> Result<(), CallError> { panic!("boom") }).await }),
             Err(CallError::Failed(_))
         ));
+    }
+
+    /// A one-connection fake daemon for a request with a body: `then`
+    /// gets the request line and the stream right after it.
+    fn upload_daemon<T: Send + 'static>(
+        then: impl FnOnce(String, BufReader<UnixStream>) -> T + Send + 'static,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<T>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            then(line, r)
+        });
+        (dir, socket, fake)
+    }
+
+    fn iso_file(dir: &Path, len: usize) -> PathBuf {
+        let path = dir.join("Win11 25H2.iso");
+        std::fs::write(&path, (0..len).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+        path
+    }
+
+    #[test]
+    fn import_streams_the_file() {
+        // Over two progress steps, and not a whole number of reads.
+        let len = (40 << 20) + 5;
+        let (dir, socket, fake) = upload_daemon(move |line, mut r| {
+            let mut body = Vec::new();
+            r.read_to_end(&mut body).unwrap(); // up to the half-close
+            let answer =
+                format!("{{\"ok\":true,\"data\":{{\"id\":\"local-win11\",\"size\":{len}}}}}\n");
+            r.get_mut().write_all(answer.as_bytes()).unwrap();
+            (line, body)
+        });
+        let path = iso_file(dir.path(), len);
+        let (sent, progress) = watch::channel((0, 0));
+        let p = path.clone();
+        let got =
+            run(async move { import(socket, p, "local-win11".into(), Os::Windows, sent).await });
+        assert_eq!(got.unwrap()["size"], len as u64);
+        let (line, body) = fake.join().unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "{{\"via\":\"cli\",\"request\":{{\"op\":\"import_iso\",\"id\":\"local-win11\",\"os\":\"windows\",\"name\":\"Win11 25H2\",\"size\":{len}}}}}\n"
+            )
+        );
+        assert!(
+            body == std::fs::read(&path).unwrap(),
+            "the body is the file"
+        );
+        assert_eq!(*progress.borrow(), (len as u64, len as u64));
+    }
+
+    #[test]
+    fn import_cancel_closes_the_stream() {
+        let len = 8 << 20;
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        // Reads nothing until the client gave up, then all there is.
+        let (dir, socket, fake) = upload_daemon(move |_, mut r| {
+            wait.recv().unwrap();
+            let mut body = Vec::new();
+            r.read_to_end(&mut body).unwrap();
+            body.len()
+        });
+        let path = iso_file(dir.path(), len);
+        let (sent, mut progress) = watch::channel((0, 0));
+        let task = spawn(import(socket, path, "local-x".into(), Os::Linux, sent));
+        // Sending: the size is known, the socket's buffer fills up.
+        runtime()
+            .block_on(progress.wait_for(|&(_, size)| size == len as u64))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!task.is_finished(), "a daemon that reads nothing holds it");
+        task.abort();
+        assert!(runtime().block_on(task).unwrap_err().is_cancelled());
+        go.send(()).unwrap();
+        // The stream ended (EOF) short of the size: the daemon drops it.
+        assert!(fake.join().unwrap() < len);
+    }
+
+    #[test]
+    fn import_errors() {
+        // Refused before the body is read: the answer, not a broken pipe.
+        let refusal = "an image pull or import is in progress; try again when it ends";
+        let (dir, socket, fake) = upload_daemon(move |_, mut r| {
+            let answer = format!("{{\"ok\":false,\"error\":\"{refusal}\"}}\n");
+            r.get_mut().write_all(answer.as_bytes()).unwrap();
+        });
+        let path = iso_file(dir.path(), 4 << 20);
+        let (sent, _) = watch::channel((0, 0));
+        let got = run(async move { import(socket, path, "local-x".into(), Os::Linux, sent).await });
+        fake.join().unwrap();
+        assert_eq!(got, Err(CallError::Failed(refusal.into())));
+
+        // Refused here, before any connection.
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = dir.path().join("api.sock");
+        let local = |path: PathBuf| {
+            let (sent, _) = watch::channel((0, 0));
+            let socket = nowhere.clone();
+            run(async move { import(socket, path, "local-x".into(), Os::Linux, sent).await })
+        };
+        assert_eq!(
+            local(dir.path().to_owned()),
+            Err(CallError::Failed("not a regular file".into()))
+        );
+        assert!(matches!(
+            local(dir.path().join("missing.iso")),
+            Err(CallError::Failed(e)) if e.starts_with("cannot open ")
+        ));
+        // No daemon.
+        assert_eq!(local(iso_file(dir.path(), 10)), Err(CallError::NotRunning));
     }
 
     #[test]
