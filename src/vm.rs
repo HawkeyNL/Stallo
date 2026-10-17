@@ -37,7 +37,8 @@ use crate::{confine, images, input, net, qemu, seed, tpm};
 /// passt's messages, in the VM directory.
 const PASST_LOG: &str = "passt.log";
 /// How long after swtpm's exit QEMU's exit may follow and still count as
-/// the cause (QEMU closes swtpm's channel as it exits).
+/// the cause (QEMU closes swtpm's channel as it exits, and its watcher
+/// reports it right after).
 const SWTPM_GRACE: Duration = Duration::from_secs(2);
 /// Graceful power-off budget before QEMU is told to quit.
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -560,6 +561,7 @@ impl Manager {
         }
         // VMs created before snapshots existed have no directory for them.
         ensure_private_dir(&vm_dir.join(qemu::STATES))?;
+        tpm::check_no_restore_pending(&vm_dir)?;
         // (swtpm's end, QEMU's end) of a Windows VM's TPM link; swtpm
         // creates the TPM's state at the first start.
         let tpm_link = if cfg.machine.is_linux() {
@@ -852,11 +854,14 @@ impl Manager {
             }
         }
         let (tx, rx) = watch::channel(false);
+        // Set the moment QEMU is reaped, before the cleanup that `rx` waits
+        // for.
+        let (qemu_tx, qemu_rx) = watch::channel(false);
         let tpm = swtpm.map(|mut t| {
             let pid = t.id().expect("a child that was not waited for has a pid");
             let gone = Arc::new(AtomicBool::new(false));
             let (this, name, done, mut exited) =
-                (self.clone(), name.clone(), gone.clone(), rx.clone());
+                (self.clone(), name.clone(), gone.clone(), qemu_rx);
             // Reaps swtpm. It exits when QEMU closes its socket, or with
             // the cgroup. Otherwise the guest has lost its TPM: the VM is
             // killed rather than left running without it.
@@ -925,7 +930,7 @@ impl Manager {
             .lock()
             .unwrap()
             .insert(name.to_owned(), running.clone());
-        tokio::spawn(self.clone().watch(name.clone(), child, tx));
+        tokio::spawn(self.clone().watch(name.clone(), child, tx, qemu_tx));
         tracing::info!("{name}: started, pid {pid}");
         Ok(running)
     }
@@ -1152,8 +1157,10 @@ impl Manager {
         name: String,
         mut child: tokio::process::Child,
         tx: watch::Sender<bool>,
+        qemu_tx: watch::Sender<bool>,
     ) {
         let status = child.wait().await;
+        let _ = qemu_tx.send(true);
         tracing::info!("{name}: QEMU exited ({status:?})");
         if let Err(e) = self.cgroups.remove_vm(&name).await {
             tracing::error!("{name}: cgroup cleanup failed: {e:#}");
