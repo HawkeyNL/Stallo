@@ -330,6 +330,32 @@ impl Manager {
         images::pull(&self.paths, &entry).await
     }
 
+    /// Imports an ISO a client streams (`stallo images import`, see
+    /// [`images::import`]). Refused unless `size` bytes fit above the disk
+    /// floor, and while a pull, removal or other import runs: the client
+    /// sets the pace, so nothing queues behind it.
+    pub async fn import_iso(
+        &self,
+        id: &str,
+        os: images::Os,
+        name: &str,
+        size: u64,
+        body: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> Result<images::Pulled> {
+        let _guard = self.images.try_write().map_err(|_| {
+            anyhow::anyhow!("an image pull or import is in progress; try again when it ends")
+        })?;
+        let dir = self.paths.images_dir();
+        ensure_private_dir(&dir)?;
+        host::check_pull_space(
+            host::disk_free(&dir)?,
+            self.config.host.disk_floor_gib,
+            size,
+            0,
+        )?;
+        images::import(&self.paths, id, os, name, size, body).await
+    }
+
     /// Deletes a cached image (`stallo images rm`). Refused while any VM,
     /// stopped or a `stallo run` clone included, was made from it or has it
     /// in its CD-ROM drive: by its `vm.toml` or by its disk's backing file.
@@ -395,8 +421,7 @@ impl Manager {
             !new.name.starts_with(RUN_PREFIX),
             "names starting with {RUN_PREFIX} are kept for `stallo run`"
         );
-        let entry = images::find(&new.image)?;
-        let iso = entry.kind == images::Kind::Iso;
+        let iso = images::is_iso(&new.image)?;
         // The agent gate refuses this already; fail closed here too.
         ensure!(
             !(iso && new.agent_control),
@@ -415,14 +440,14 @@ impl Manager {
             forwards: new.forwards.clone(),
             vnc: new.vnc || iso,
             cdrom: iso.then(|| new.image.clone()),
-            machine: entry.os,
+            machine: images::image_os(&self.paths, &new.image)?,
         };
         cfg.validate()?;
         cfg.check_min_size()?;
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
-        if new.may_pull {
+        if new.may_pull && !images::is_local(&cfg.image) {
             self.pull(&cfg.image).await?;
         }
 
@@ -455,14 +480,14 @@ impl Manager {
 
     async fn populate(&self, cfg: &VmConfig) -> Result<()> {
         let dir = self.paths.vm_dir(&cfg.name);
-        let entry = images::find(&cfg.image)?;
-        let firmware = vars_firmware(cfg, entry.firmware);
-        if entry.kind == images::Kind::Iso {
+        let firmware = vars_firmware(cfg, images::image_firmware(&cfg.image)?);
+        if images::is_iso(&cfg.image)? {
             qemu::create_disk(None, &dir.join(qemu::DISK), cfg.disk_gib).await?;
             qemu::create_vars(&dir.join(qemu::VARS), firmware).await?;
             ensure_private_dir(&dir.join(qemu::STATES))?;
             return cfg.save(&dir);
         }
+        let entry = images::find(&cfg.image)?;
         let base = images::image_path(&self.paths, &cfg.image);
         let info = images::check_image(&base).await?;
         ensure!(
@@ -615,18 +640,16 @@ impl Manager {
     /// ISO's path, or `None` if empty. `None` for a VM from a cloud image
     /// (or from an image that left the catalog), which has a seed instead.
     /// A Windows VM is always made from an ISO. Fails closed unless the
-    /// drive holds a catalog ISO.
+    /// drive holds a catalog or imported ISO.
     fn cdrom(&self, cfg: &VmConfig) -> Result<Option<Option<PathBuf>>> {
-        if cfg.machine.is_linux()
-            && !images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso)
-        {
+        if cfg.machine.is_linux() && !images::is_iso(&cfg.image).unwrap_or(false) {
             return Ok(None);
         }
         let Some(id) = &cfg.cdrom else {
             return Ok(Some(None));
         };
         ensure!(
-            images::find(id)?.kind == images::Kind::Iso,
+            images::is_iso(id)?,
             "{id} in the CD-ROM drive of {} is not an installer ISO",
             cfg.name
         );
@@ -642,6 +665,10 @@ impl Manager {
             "Windows VMs are offline only for now: the internet profile is not verified with Windows yet"
         );
         if cfg.net != NetProfile::Offline {
+            ensure!(
+                !images::is_local(&cfg.image),
+                "VMs from an imported ISO are offline only for now"
+            );
             images::find(&cfg.image)?.check_net(cfg.net)?;
         }
         match (cfg.net, self.mode) {
@@ -912,10 +939,10 @@ impl Manager {
         cfg.save(&self.paths.vm_dir(name))
     }
 
-    /// Puts pulled installer ISO `iso` into the CD-ROM drive of a VM made
-    /// from an ISO, or empties the drive (`None`); it takes effect at the
-    /// next start. A RAM snapshot restored later runs with the drive as it
-    /// is then, as if the disc had been swapped while the guest ran.
+    /// Puts pulled or imported installer ISO `iso` into the CD-ROM drive of
+    /// a VM made from an ISO, or empties the drive (`None`); it takes effect
+    /// at the next start. A RAM snapshot restored later runs with the drive
+    /// as it is then, as if the disc had been swapped while the guest ran.
     pub async fn set_cdrom(&self, name: &str, iso: Option<&str>) -> Result<()> {
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
@@ -925,7 +952,7 @@ impl Manager {
             "{name} is a `stallo run` clone; change the VM it was made from"
         );
         ensure!(
-            images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso),
+            images::is_iso(&cfg.image).unwrap_or(false),
             "{name} has no CD-ROM drive; only VMs made from an installer ISO have one"
         );
         // Held until vm.toml names the ISO, so `images rm` sees it. Not
@@ -935,9 +962,8 @@ impl Manager {
             anyhow::anyhow!("an image pull or removal is in progress; try again when it ends")
         })?;
         if let Some(id) = iso {
-            let entry = images::find(id)?;
             ensure!(
-                entry.kind == images::Kind::Iso,
+                images::is_iso(id)?,
                 "{id} is not an installer ISO; see `stallo images`"
             );
             images::ensure_pulled(&self.paths, id)?;
@@ -2360,7 +2386,7 @@ mod tests {
         );
         let (_d, running, _) = fake_vm("running", None).await;
         let linux = VmConfig {
-            image: "local-win11".into(),
+            image: "left-the-catalog".into(),
             ..running.config.clone()
         };
         let win = VmConfig {
@@ -2375,6 +2401,12 @@ mod tests {
         // drive for Windows.
         assert_eq!(m.cdrom(&linux).unwrap(), None);
         assert_eq!(m.cdrom(&win).unwrap(), Some(None));
+        // An imported ISO has a drive, whatever its OS.
+        let local = VmConfig {
+            image: "local-arch".into(),
+            ..linux.clone()
+        };
+        assert_eq!(m.cdrom(&local).unwrap(), Some(None));
         let id = "fedora-44-workstation";
         let with_iso = VmConfig {
             cdrom: Some(id.into()),
@@ -2497,5 +2529,72 @@ mod tests {
         assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
         let e = err(m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await);
         assert!(e.contains("RAM snapshots (s1)"), "{e}");
+    }
+
+    /// An import is refused at once while a pull, removal, VM creation or
+    /// another import holds the images lock, and when its ISO would not fit
+    /// above the disk floor; neither leaves anything behind.
+    #[tokio::test]
+    async fn import_admission() {
+        use crate::config::{DaemonConfig, Mode};
+        use images::Os;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let manager = |floor_gib, dir: &str| {
+            for d in ["data", "run", "cg"] {
+                fs::create_dir_all(root.join(dir).join(d)).unwrap();
+            }
+            let paths = Paths::new(root.join(dir).join("data"), root.join(dir).join("run"))
+                .unwrap()
+                .prepare()
+                .unwrap();
+            let mut config = DaemonConfig::default();
+            config.host.disk_floor_gib = floor_gib;
+            Manager::new(
+                paths,
+                config,
+                Cgroups::at(root.join(dir).join("cg")),
+                Mode::Dev,
+            )
+        };
+        let data = vec![0u8; 0x9000];
+        let size = data.len() as u64;
+        let left = |m: &Manager| fs::read_dir(m.paths.images_dir()).unwrap().count();
+
+        let full = manager(u64::MAX >> 30, "full");
+        let e = full
+            .import_iso("local-x", Os::Linux, "", size, &mut &data[..])
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("not enough disk space"), "{e:#}");
+        assert_eq!(left(&full), 0);
+
+        let m = manager(0, "ok");
+        for exclusive in [true, false] {
+            let _held = if exclusive {
+                (Some(m.images.write().await), None)
+            } else {
+                (None, Some(m.images.read().await))
+            };
+            let e = m
+                .import_iso("local-x", Os::Linux, "", size, &mut &data[..])
+                .await
+                .unwrap_err();
+            assert!(format!("{e:#}").contains("in progress"), "{e:#}");
+        }
+        // A second import while the first waits for its client.
+        let (_client, mut body) = tokio::io::duplex(64);
+        let mut second = &data[..];
+        tokio::select! {
+            biased;
+            r = m.import_iso("local-a", Os::Linux, "", size, &mut body) => {
+                panic!("the first import ended: {r:?}")
+            }
+            r = m.import_iso("local-b", Os::Linux, "", size, &mut second) => {
+                let e = r.unwrap_err();
+                assert!(format!("{e:#}").contains("in progress"), "{e:#}");
+            }
+        }
+        assert!(!images::iso_path(&m.paths, "local-b").exists());
     }
 }

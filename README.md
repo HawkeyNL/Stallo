@@ -325,6 +325,25 @@ Disk space: the cached ISO stays until you remove it
 its drive). The VM's disk grows as you install, up to its full size, and
 each RAM snapshot of it takes up to its memory size.
 
+### Importing your own ISO
+
+For an ISO that is not in the catalog, download it yourself and import it
+(humans only). `--os` says what it installs; Stallo does not look inside:
+
+```sh
+stallo images import ~/Downloads/Win11_25H2_English_x64.iso --os windows
+stallo new win --image local-win11-25h2-english-x64
+```
+
+The id is `local-` plus the file name (choose one with `--id`, a label
+with `--name`). The `stallo` command reads the file with your own rights
+and sends it to stallod, which keeps a read-only copy of up to 12 GiB:
+that needs the ISO's size above the disk floor. Nothing verifies an
+imported ISO; `stallo images` shows its SHA-256 to compare with the one
+its publisher lists. It then works like a pulled ISO: `stallo new`,
+`stallo set --cdrom` and `stallo images rm`. A Linux ISO boots without
+Secure Boot, a Windows ISO with it.
+
 ## Agents (MCP)
 
 `stallo mcp` is an MCP server on stdin/stdout. Register it with Claude Code
