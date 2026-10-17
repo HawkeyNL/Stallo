@@ -1,0 +1,22 @@
+# Fedora 44 Workstation live installer ISO, x86_64. Installed by hand over
+# VNC: no cloud-init, no seed, no guest agent until the user installs one.
+id = "fedora-44-workstation"
+name = "Fedora 44 Workstation (installer ISO)"
+kind = "iso"
+os = "linux"
+firmware = "secure-boot"
+url = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso"
+# 2,851,612,672 bytes on 2026-10-17.
+max_size = 4_294_967_296
+
+trust = "signed-sums"
+sums_url = "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-44-1.7-x86_64-CHECKSUM"
+# The checksum list is clearsigned: no separate signature file.
+sig_url = ""
+sums_format = "bsd"
+# The same vendored "Fedora (44)" key as fedora-44; gpgv checked the
+# clearsigned list against it on 2026-10-17 (signed 2026-04-24).
+keyring = "fedora.gpg"
+signing_key = "36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6"
+
+agent = "manual"

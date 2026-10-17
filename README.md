@@ -71,6 +71,8 @@ Guest images (`stallo images` lists them):
 | `fedora-44` | Fedora 44 Cloud Base Generic (44-1.7) | The guest agent's SELinux domain is made permissive (see `catalog/fedora-44.toml`). Offline only for now. |
 | `arch` | Arch Linux cloud image (arch-boxes) | No Secure Boot (its boot loader is not signed for it). Rolling: `latest/` moves every two weeks, and the first pull is kept. Offline only for now. |
 | `debian-13` | Debian 13 generic cloud image (20261015-2632) | Pinned (upstream unsigned): Debian signs no checksums for its cloud images, so Stallo checks a SHA-512 built into it, and a newer build needs a Stallo release. So does a new Debian archive key: the archive keyring that checks the guest-agent package is vendored, and fetches fail until a release ships the new one. Offline only for now. |
+| `ubuntu-26.04-desktop` | Ubuntu 26.04.1 LTS Desktop installer ISO | Installed by hand over VNC; no guest agent until you install one. Pinned to the point release: the next one needs a catalog bump. Offline only for now. |
+| `fedora-44-workstation` | Fedora 44 Workstation live installer ISO (44-1.7) | Installed by hand over VNC; no guest agent until you install one. Offline only for now. |
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
 Ubuntu images are checked with the host's Ubuntu keyrings; other

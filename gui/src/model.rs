@@ -3400,6 +3400,7 @@ mod tests {
             id: id.into(),
             name: format!("{id} cloud"),
             cached,
+            kind: None,
             os: Some(stallo::images::Os::Linux),
             trust: None,
             size_bytes,

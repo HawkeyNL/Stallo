@@ -76,6 +76,10 @@ host below the floor. Signatures on moving URLs are refused when too old:
 over 90 days for Ubuntu's `current/` checksum lists, over 45 days for
 Arch's `latest/` image.
 
+Installer ISOs are verified like images (a signed checksum list, then the
+SHA-256), but are otherwise untrusted guest input: the host never mounts or
+parses them (no `qemu-img`); only QEMU reads them.
+
 ## Agent policy
 
 Agents reach Stallo through `stallo mcp`, which marks its requests
