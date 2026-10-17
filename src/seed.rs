@@ -218,6 +218,7 @@ mod tests {
             throwaway_of: None,
             forwards: vec![],
             vnc: false,
+            cdrom: None,
         }
     }
 

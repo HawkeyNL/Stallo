@@ -50,9 +50,11 @@ const WANTED: ABI = ABI::V9;
 /// One rule: `access` to `path` and, for a directory, everything below it.
 pub type Rule = (PathBuf, BitFlags<AccessFs>);
 
-/// The rules for one VM's QEMU. `backing` are the read-only images below
-/// its disk: the base image and, for a `stallo run` clone, the source VM's
-/// disk. All paths must exist when the ruleset is built.
+/// The rules for one VM's QEMU. `backing` are the read-only files it
+/// reads besides its own: the base image below its disk, for a `stallo run`
+/// clone the source VM's disk, and an installer ISO in its CD-ROM drive.
+/// All paths must exist when the ruleset is built; the seed is covered only
+/// if the VM has one (VMs from ISOs do not).
 pub fn qemu_rules(
     vm_dir: &Path,
     rt_dir: &Path,
@@ -82,12 +84,16 @@ pub fn qemu_rules(
         // read and write them, never create, link or remove files there.
         // (It is asked to open one only during a snapshot job.)
         (vm_dir.join(crate::qemu::STATES), disk),
-        (vm_dir.join(crate::qemu::SEED), ReadFile.into()),
         // QEMU removes a stale socket and creates a new one at start, and
         // removes it again at exit.
         (rt_dir.into(), MakeSock | RemoveFile),
     ]
     .into_iter()
+    .chain(
+        Some(vm_dir.join(crate::qemu::SEED))
+            .filter(|seed| seed.exists())
+            .map(|seed| (seed, ReadFile.into())),
+    )
     // The VNC socket, like the others (`stallo set <vm> --vnc on`).
     .chain(vnc_dir.map(|d| (d.into(), MakeSock | RemoveFile)))
     .chain(backing.iter().map(|b| (b.clone(), ReadFile.into())))
@@ -592,6 +598,29 @@ mod tests {
             let script = format!("rm {screen} && {swap} {screen}");
             assert_eq!(confined(&rules, &script), Some(false), "{script}");
             assert!(!rt.join("screen.png").exists(), "{script}");
+        }
+
+        // A VM from an ISO has no seed and reads its ISO, never writes it.
+        let iso = root.join("x.iso");
+        fs::write(&iso, b"iso").unwrap();
+        fs::remove_file(own.join(crate::qemu::SEED)).unwrap();
+        screen_files(&rt);
+        let iso_rules = qemu_rules(&own, &rt, None, std::slice::from_ref(&iso));
+        assert!(
+            !iso_rules
+                .iter()
+                .any(|(p, _)| p.ends_with(crate::qemu::SEED))
+        );
+        assert_eq!(
+            confined(&iso_rules, &format!("cat {}", q(&iso))),
+            Some(true)
+        );
+        for denied in [
+            format!("echo y >> {}", q(&iso)),
+            format!("cat {}", q(&img)),
+            format!("touch {}", q(&own.join(crate::qemu::SEED))),
+        ] {
+            assert_eq!(confined(&iso_rules, &denied), Some(false), "{denied}");
         }
     }
 

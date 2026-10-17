@@ -346,7 +346,8 @@ impl Manager {
             }
             let (dir, name) = (entry.path(), entry.file_name());
             let name = name.to_string_lossy();
-            let by_config = VmConfig::load(&dir).is_ok_and(|c| c.image == id);
+            let by_config =
+                VmConfig::load(&dir).is_ok_and(|c| c.image == id || c.cdrom.as_deref() == Some(id));
             // A disk is written by its QEMU: only its file name counts, and
             // a disk that cannot be read refuses the removal.
             let by_disk = images::backing_file(&dir.join(qemu::DISK))
@@ -371,11 +372,20 @@ impl Manager {
 
     /// Creates the VM's directory, disk, firmware variables, password and
     /// seed. On failure nothing is left behind.
+    ///
+    /// A VM from an installer ISO gets a blank disk, the ISO in its CD-ROM
+    /// drive, VNC (the install is done by hand) and no seed or password.
     pub async fn create(&self, new: &NewVm) -> Result<VmConfig> {
         validate_name(&new.name)?;
         ensure!(
             !new.name.starts_with(RUN_PREFIX),
             "names starting with {RUN_PREFIX} are kept for `stallo run`"
+        );
+        let iso = images::find(&new.image)?.kind == images::Kind::Iso;
+        // The agent gate refuses this already; fail closed here too.
+        ensure!(
+            !(iso && new.agent_control),
+            "agents may not create VMs from installer ISOs"
         );
         let cfg = VmConfig {
             name: new.name.clone(),
@@ -388,14 +398,10 @@ impl Manager {
             agent_control: new.agent_control,
             throwaway_of: None,
             forwards: new.forwards.clone(),
-            vnc: new.vnc,
+            vnc: new.vnc || iso,
+            cdrom: iso.then(|| new.image.clone()),
         };
         cfg.validate()?;
-        ensure!(
-            images::find(&cfg.image)?.kind == images::Kind::CloudImage,
-            "{} is an installer ISO: VMs from ISOs are not supported yet",
-            cfg.image
-        );
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
@@ -433,6 +439,12 @@ impl Manager {
     async fn populate(&self, cfg: &VmConfig) -> Result<()> {
         let dir = self.paths.vm_dir(&cfg.name);
         let entry = images::find(&cfg.image)?;
+        if entry.kind == images::Kind::Iso {
+            qemu::create_disk(None, &dir.join(qemu::DISK), cfg.disk_gib).await?;
+            qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
+            ensure_private_dir(&dir.join(qemu::STATES))?;
+            return cfg.save(&dir);
+        }
         let base = images::image_path(&self.paths, &cfg.image);
         let info = images::check_image(&base).await?;
         ensure!(
@@ -441,7 +453,7 @@ impl Manager {
             info.virtual_size.div_ceil(1 << 30),
             cfg.image
         );
-        qemu::create_disk(&base, &dir.join(qemu::DISK), cfg.disk_gib).await?;
+        qemu::create_disk(Some(&base), &dir.join(qemu::DISK), cfg.disk_gib).await?;
         qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
         ensure_private_dir(&dir.join(qemu::STATES))?;
 
@@ -515,7 +527,20 @@ impl Manager {
         // An image that left the catalog gets no drop-in: on a disk that
         // already booted, the guest agent need not wait for cloud-init.
         let agent = images::find(&cfg.image).map_or(images::Agent::Deb, |e| e.agent);
-        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd, vnc.as_deref(), agent)?;
+        let iso = self.cdrom(&cfg)?;
+        let media = match &iso {
+            Some(iso) => qemu::Media::Cdrom(iso.as_deref()),
+            None => qemu::Media::Seed,
+        };
+        let mut argv = qemu::argv(
+            &cfg,
+            &vm_dir,
+            &rt_dir,
+            qemu_fd,
+            vnc.as_deref(),
+            agent,
+            media,
+        )?;
         // Production: the guest's CPUs wait until the spawn checks (AppArmor
         // label, VNC socket, passt) have passed, so no guest code runs in
         // a QEMU that is about to be refused.
@@ -561,6 +586,25 @@ impl Manager {
                 Err(e)
             }
         }
+    }
+
+    /// For a VM made from an installer ISO, its CD-ROM drive: the attached
+    /// ISO's path, or `None` if empty. `None` for a VM from a cloud image
+    /// (or from an image that left the catalog), which has a seed instead.
+    /// Fails closed unless the drive holds a catalog ISO.
+    fn cdrom(&self, cfg: &VmConfig) -> Result<Option<Option<PathBuf>>> {
+        if !images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso) {
+            return Ok(None);
+        }
+        let Some(id) = &cfg.cdrom else {
+            return Ok(Some(None));
+        };
+        ensure!(
+            images::find(id)?.kind == images::Kind::Iso,
+            "{id} in the CD-ROM drive of {} is not an installer ISO",
+            cfg.name
+        );
+        Ok(Some(Some(images::iso_path(&self.paths, id))))
     }
 
     /// Whether `cfg`'s network profile may start here. Fail closed: the
@@ -634,7 +678,11 @@ impl Manager {
         if self.mode == Mode::Production {
             confine::apparmor_on_exec(&mut cmd);
         }
-        let mut backing = vec![images::image_path(&self.paths, &cfg.image)];
+        // A VM from an ISO has a blank disk: no base image, the ISO instead.
+        let mut backing = match self.cdrom(cfg)? {
+            Some(iso) => iso.into_iter().collect(),
+            None => vec![images::image_path(&self.paths, &cfg.image)],
+        };
         if let Some(source) = &cfg.throwaway_of {
             backing.push(self.paths.vm_dir(source).join(qemu::DISK));
         }
@@ -1901,6 +1949,7 @@ mod tests {
                 throwaway_of: None,
                 forwards: vec![],
                 vnc: false,
+                cdrom: None,
             },
             pid: 0,
             qmp,

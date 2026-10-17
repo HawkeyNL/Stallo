@@ -36,14 +36,15 @@ enum Cmd {
         name: String,
         #[arg(long, default_value = "ubuntu-26.04")]
         image: String,
-        #[arg(long, default_value_t = 2)]
-        cpus: u32,
-        /// Memory, e.g. 2G or 1536M.
-        #[arg(long, default_value = "2G", value_parser = parse_mib)]
-        mem: u64,
-        /// Disk size, e.g. 20G.
-        #[arg(long, default_value = "20G", value_parser = parse_gib)]
-        disk: u64,
+        /// [default: 2]
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory, e.g. 2G or 1536M [default: 2G; 4G for an installer ISO].
+        #[arg(long, value_parser = parse_mib)]
+        mem: Option<u64>,
+        /// Disk size, e.g. 20G [default: 20G; 32G for an installer ISO].
+        #[arg(long, value_parser = parse_gib)]
+        disk: Option<u64>,
         #[arg(long, value_enum, default_value = "offline")]
         net: Net,
         /// Forward a host TCP port into the guest (`--net internet` only),
@@ -293,12 +294,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .iter()
                 .map(|f| stallo::net::parse_forward(f, bind))
                 .collect::<Result<_>>()?;
+            let (def_cpus, def_mem, def_disk) = new_defaults(&image);
             let v = call(Request::New {
+                vcpus: cpus.unwrap_or(def_cpus),
+                memory_mib: mem.unwrap_or(def_mem),
+                disk_gib: disk.unwrap_or(def_disk),
                 name,
                 image,
-                vcpus: cpus,
-                memory_mib: mem,
-                disk_gib: disk,
                 net,
                 forwards,
                 wait: !no_wait,
@@ -852,6 +854,15 @@ fn snaps_table(list: &[Snapshot], now: u64) -> String {
     out
 }
 
+/// `stallo new`'s (vcpus, memory MiB, disk GiB) for `image`: a desktop
+/// installed from an ISO needs more than a cloud image.
+fn new_defaults(image: &str) -> (u32, u64, u64) {
+    match stallo::images::find(image).map(|e| e.kind) {
+        Ok(stallo::images::Kind::Iso) => (2, 4096, 32),
+        _ => (2, 2048, 20),
+    }
+}
+
 fn images_table(images: &[ImageInfo]) -> String {
     let w = images.iter().map(|i| i.id.len()).fold(16, usize::max);
     let mut s = format!(
@@ -1065,6 +1076,15 @@ mod tests {
         assert!(parse_gib("20bib").is_err());
         assert!(parse_gib("20B").is_err());
         assert_eq!(parse_gib("20GiB").unwrap(), 20);
+    }
+
+    #[test]
+    fn defaults_per_image_kind() {
+        assert_eq!(new_defaults("ubuntu-26.04"), (2, 2048, 20));
+        assert_eq!(new_defaults("fedora-44-workstation"), (2, 4096, 32));
+        assert_eq!(new_defaults("ubuntu-26.04-desktop"), (2, 4096, 32));
+        // An image only a newer daemon knows: the cloud defaults.
+        assert_eq!(new_defaults("other"), (2, 2048, 20));
     }
 
     #[test]

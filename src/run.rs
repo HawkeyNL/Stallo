@@ -107,7 +107,7 @@ impl Manager {
     /// The clone's files: an overlay on the source disk (`-u`: qemu-img
     /// never opens the source, which a compromised QEMU may have crafted),
     /// a copy of the firmware variables, a fresh state image, a hard link
-    /// to the seed, and `vm.toml` last.
+    /// to the seed (VMs from ISOs have none), and `vm.toml` last.
     async fn clone_files(&self, src: &VmConfig, name: &str) -> Result<()> {
         let (from, to) = (self.paths.vm_dir(&src.name), self.paths.vm_dir(name));
         run_tool(
@@ -122,7 +122,9 @@ impl Manager {
         .context("cannot create the clone's disk")?;
         fs::copy(from.join(qemu::VARS), to.join(qemu::VARS))?;
         crate::paths::ensure_private_dir(&to.join(qemu::STATES))?;
-        fs::hard_link(from.join(qemu::SEED), to.join(qemu::SEED))?;
+        if from.join(qemu::SEED).exists() {
+            fs::hard_link(from.join(qemu::SEED), to.join(qemu::SEED))?;
+        }
         VmConfig {
             name: name.to_owned(),
             uuid: new_uuid()?,
@@ -177,6 +179,7 @@ mod tests {
             throwaway_of: throwaway_of.map(Into::into),
             forwards: vec![],
             vnc: false,
+            cdrom: None,
         }
     }
 
@@ -310,6 +313,82 @@ mod tests {
         assert!(!crate::images::debs_dir(&m.paths, "ubuntu-26.04").exists());
         assert!(m.remove_image("ubuntu-26.04").await.is_err());
         assert!(m.remove_image("../x").await.is_err());
+    }
+
+    /// VMs from installer ISOs: agents may not create one, even from a
+    /// pulled ISO; its blank disk backs onto nothing; a run clone of it
+    /// needs no seed; and `images rm` keeps an ISO that is in a drive.
+    #[tokio::test]
+    async fn iso_vms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        m.cleanup_leftovers().await.unwrap();
+        let id = "fedora-44-workstation";
+        crate::paths::ensure_private_dir(&m.paths.images_dir()).unwrap();
+        fs::write(crate::images::iso_path(&m.paths, id), b"iso").unwrap();
+        let new = crate::vm::NewVm {
+            name: "desk".into(),
+            image: id.into(),
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 32,
+            net: NetProfile::Offline,
+            forwards: vec![],
+            agent_control: true,
+            may_pull: false,
+            vnc: false,
+        };
+        let err = m.create(&new).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "agents may not create VMs from installer ISOs"
+        );
+        assert!(!m.paths.vm_dir("desk").exists());
+
+        // The files `create` makes (but the firmware variables, which need
+        // OVMF on the host).
+        let dir = m.paths.vm_dir("desk");
+        fs::create_dir(&dir).unwrap();
+        qemu::create_disk(None, &dir.join(qemu::DISK), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::images::backing_file(&dir.join(qemu::DISK)).unwrap(),
+            None
+        );
+        fs::write(dir.join(qemu::VARS), b"vars").unwrap();
+        let cfg = VmConfig {
+            image: id.into(),
+            cdrom: Some(id.into()),
+            vnc: true,
+            ..vm("desk", None)
+        };
+        cfg.save(&dir).unwrap();
+
+        let clone = "run-0a1b2c3d";
+        fs::create_dir(m.paths.vm_dir(clone)).unwrap();
+        m.clone_files(&cfg, clone).await.unwrap();
+        assert_eq!(m.load(clone).unwrap().cdrom.as_deref(), Some(id));
+        assert!(!m.paths.vm_dir(clone).join(qemu::SEED).exists());
+
+        let err = m.remove_image(id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("in use by desk, run-0a1b2c3d"),
+            "{err}"
+        );
+        // The drive alone counts too (a VM made from another ISO).
+        fs::remove_dir_all(m.paths.vm_dir(clone)).unwrap();
+        VmConfig {
+            image: "ubuntu-26.04-desktop".into(),
+            ..cfg
+        }
+        .save(&dir)
+        .unwrap();
+        let err = m.remove_image(id).await.unwrap_err();
+        assert!(err.to_string().contains("in use by desk"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+        m.remove_image(id).await.unwrap();
+        assert!(!crate::images::iso_path(&m.paths, id).exists());
     }
 
     /// A pull is refused before any download unless twice the image fits

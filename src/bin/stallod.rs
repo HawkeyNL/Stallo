@@ -370,6 +370,7 @@ async fn dispatch(
                 // Agents never get here with vnc (Gate::Closed).
                 vnc,
             };
+            let wait = wait && has_agent(&new.image);
             let started = Instant::now();
             m.create(&new).await?;
             // `new` is all or nothing: a VM that never became ready is
@@ -405,7 +406,7 @@ async fn dispatch(
         }
         Request::Start { name, wait } => {
             m.start(&name).await?;
-            if wait {
+            if wait && has_agent(&m.load(&name)?.image) {
                 m.wait_ready(&name, READY_TIMEOUT).await?;
             }
             json!(info(m, &m.load(&name)?).await)
@@ -595,7 +596,7 @@ async fn dispatch(
                         notes.push("pinned (upstream unsigned)".into());
                     }
                     if e.kind == images::Kind::Iso {
-                        notes.push("installer ISO: install by hand over VNC".into());
+                        notes.push("install by hand over VNC; no guest agent".into());
                     }
                     if e.firmware == images::Firmware::Uefi {
                         notes.push("no Secure Boot".into());
@@ -642,6 +643,13 @@ fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
 }
 
 /// A VM as `ls` shows it; the state comes from QEMU when it runs.
+/// Whether a VM from `image` has a guest agent to wait for. A guest
+/// installed from an ISO has none unless its user installs one, so `wait`
+/// does not apply to it.
+fn has_agent(image: &str) -> bool {
+    images::find(image).map_or(true, |e| e.agent != images::Agent::Manual)
+}
+
 async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
     let state = match m.running(&cfg.name) {
         None => "stopped".to_owned(),
