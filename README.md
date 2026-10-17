@@ -39,6 +39,12 @@ EOF
 sudo apt update && sudo apt install stallo
 ```
 
+For the desktop app (an early preview), also install `stallo-gui`:
+
+```sh
+sudo apt install stallo-gui
+```
+
 - `edge` gets a new build on every change to `main`. There is no `stable`
   release yet.
 - Update with `sudo apt update && sudo apt upgrade`. An upgrade restarts
