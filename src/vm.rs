@@ -1548,10 +1548,12 @@ impl Running {
     }
 
     /// Stops the boot-prompt presses: a loaded snapshot is past the boot.
-    /// An Enter cut off before its release is harmless: the load replaces
-    /// the guest that saw it.
-    pub(crate) fn stop_boot_keys(&self) {
-        if let Some(task) = self.boot_key_task.lock().unwrap().take() {
+    /// Under the input lock, which the task holds for all its QMP calls, so
+    /// the abort never cuts a press off before its release.
+    pub(crate) async fn stop_boot_keys(&self) {
+        let _input = self.input_lock.lock().await;
+        let task = self.boot_key_task.lock().unwrap().take();
+        if let Some(task) = task {
             task.abort();
         }
     }
@@ -2389,9 +2391,16 @@ mod tests {
         let vm = Arc::new(vm);
         let task = tokio::spawn(vm.clone().boot_keys(ms(200), ms(1), ms(400)));
         *vm.boot_key_task.lock().unwrap() = Some(task.abort_handle());
-        vm.stop_boot_keys();
+        vm.stop_boot_keys().await;
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(summary(&log).is_empty());
+        // Mid-press, the stop waits for the release.
+        let task = tokio::spawn(vm.clone().boot_keys(ms(0), ms(200), ms(400)));
+        *vm.boot_key_task.lock().unwrap() = Some(task.abort_handle());
+        tokio::time::sleep(ms(20)).await;
+        vm.stop_boot_keys().await;
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(summary(&log), ["key ret true", "key ret false"]);
     }
 
     /// A fake guest agent that counts connections and answers sync and
