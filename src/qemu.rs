@@ -79,18 +79,21 @@ pub enum Media<'a> {
 /// Builds the QEMU argv (without the program) for `vm`. `net_fd` is QEMU's
 /// end of the passt socketpair: required for the `internet` profile, and
 /// refused for `offline`. `vnc` is the VNC socket: required when `vm.vnc`
-/// is on, and refused otherwise. `agent` is how the image gets its guest
-/// agent.
+/// is on, and refused otherwise. `tpm_fd` is QEMU's end of the swtpm
+/// socketpair (tpm.rs): required for a Windows VM, refused otherwise.
+/// `agent` is how the image gets its guest agent.
 ///
 /// `vm.machine` picks the hardware. A Windows VM (always from an ISO) gets
 /// devices Windows has drivers for out of the box: an AHCI disk, an e1000e
 /// NIC and a USB tablet instead of virtio ones, plus Hyper-V
-/// enlightenments and an RTC in local time.
+/// enlightenments, an RTC in local time and a TPM 2.0 (CRB interface).
+#[allow(clippy::too_many_arguments)]
 pub fn argv(
     vm: &VmConfig,
     vm_dir: &Path,
     rt_dir: &Path,
     net_fd: Option<RawFd>,
+    tpm_fd: Option<RawFd>,
     vnc: Option<&Path>,
     agent: Agent,
     media: Media,
@@ -190,6 +193,16 @@ pub fn argv(
     };
     // Windows keeps the RTC in local time.
     let rtc = windows.then(|| "-rtc base=localtime,driftfix=slew".to_owned());
+    // swtpm on an already connected socket, like passt: no connect().
+    let tpm = match (windows, tpm_fd) {
+        (true, Some(fd)) => vec![
+            format!("-chardev socket,id=tpm0-ctrl,fd={fd}"),
+            "-tpmdev emulator,id=tpm0,chardev=tpm0-ctrl".to_owned(),
+            "-device tpm-crb,tpmdev=tpm0".to_owned(),
+        ],
+        (false, None) => vec![],
+        (windows, fd) => bail!("windows {windows} with swtpm socket {fd:?}"),
+    };
 
     let args = [
         format!("-name guest={name},debug-threads=on"),
@@ -236,6 +249,7 @@ pub fn argv(
         .chain(&rtc)
         .chain(&media)
         .chain(&devices)
+        .chain(&tpm)
         .chain(&network)
         .chain(&time_sync)
         .chain(&qga_order)
@@ -333,6 +347,7 @@ mod tests {
             Path::new("/r/vms/dev"),
             None,
             None,
+            None,
             Agent::Deb,
             Media::Seed,
         )
@@ -373,7 +388,8 @@ mod tests {
     #[test]
     fn golden_cdrom() {
         let (d, r) = (Path::new("/d/vms/dev"), Path::new("/r/vms/dev"));
-        let with = |agent, media| argv(&vm(), d, r, None, None, agent, media).map(|a| a.join(" "));
+        let with =
+            |agent, media| argv(&vm(), d, r, None, None, None, agent, media).map(|a| a.join(" "));
         let credentials = " \
 -smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-networkd-wait-online.service= \
 -smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-time-wait-sync.service=";
@@ -410,6 +426,7 @@ mod tests {
             r,
             Some(9),
             None,
+            None,
             Agent::Preinstalled,
             Media::Cdrom(None),
         )
@@ -434,7 +451,8 @@ mod tests {
     }
 
     /// The Windows profile: Hyper-V enlightenments, no HPET, an RTC in
-    /// local time, an AHCI disk, a USB tablet and no systemd credentials.
+    /// local time, an AHCI disk, a USB tablet, a TPM on swtpm's socket and
+    /// no systemd credentials.
     #[test]
     fn golden_windows() {
         let got = argv(
@@ -442,6 +460,7 @@ mod tests {
             Path::new("/d/vms/dev"),
             Path::new("/r/vms/dev"),
             None,
+            Some(8),
             Some(Path::new("/r/vnc/dev/vnc.sock")),
             Agent::Manual,
             Media::Cdrom(Some(Path::new("/d/images/local-win11.iso"))),
@@ -472,6 +491,9 @@ mod tests {
 -chardev socket,id=qga0,path=/r/vms/dev/qga.sock,server=on,wait=off \
 -device virtio-serial-pci \
 -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+-chardev socket,id=tpm0-ctrl,fd=8 \
+-tpmdev emulator,id=tpm0,chardev=tpm0-ctrl \
+-device tpm-crb,tpmdev=tpm0 \
 -nic none \
 -vnc unix:/r/vnc/dev/vnc.sock";
         assert_eq!(got.join(" "), want);
@@ -484,11 +506,43 @@ mod tests {
             net: NetProfile::Internet,
             ..windows()
         };
-        let a = argv(&inet, d, r, Some(9), vnc, Agent::Manual, Media::Cdrom(None)).unwrap();
+        let a = argv(
+            &inet,
+            d,
+            r,
+            Some(9),
+            Some(8),
+            vnc,
+            Agent::Manual,
+            Media::Cdrom(None),
+        )
+        .unwrap();
         assert!(a.contains(&"e1000e,netdev=net0,mac=52:54:00:4f:1c:2b,romfile=".to_owned()));
         assert!(!a.iter().any(|x| x.contains("virtio-net") || x == "-nic"));
         // A Windows VM always comes from an ISO.
-        assert!(argv(&windows(), d, r, None, vnc, Agent::Manual, Media::Seed).is_err());
+        assert!(
+            argv(
+                &windows(),
+                d,
+                r,
+                None,
+                Some(8),
+                vnc,
+                Agent::Manual,
+                Media::Seed
+            )
+            .is_err()
+        );
+        // A swtpm socket iff Windows.
+        let cd = Media::Cdrom(None);
+        assert!(argv(&windows(), d, r, None, None, vnc, Agent::Manual, cd).is_err());
+        assert!(argv(&vm(), d, r, None, Some(8), None, Agent::Manual, cd).is_err());
+        assert!(
+            !argv(&vm(), d, r, None, None, None, Agent::Manual, cd)
+                .unwrap()
+                .iter()
+                .any(|a| a.contains("tpm"))
+        );
     }
 
     /// S4: the security-relevant flags, checked one by one.
@@ -498,6 +552,7 @@ mod tests {
             &vm(),
             Path::new("/d"),
             Path::new("/r"),
+            None,
             None,
             None,
             Agent::Deb,
@@ -534,6 +589,7 @@ mod tests {
             Path::new("/r"),
             None,
             None,
+            None,
             Agent::Deb,
             Media::Seed,
         )
@@ -549,6 +605,7 @@ mod tests {
                     &bad,
                     Path::new("/d"),
                     Path::new("/r"),
+                    None,
                     None,
                     None,
                     Agent::Deb,
@@ -573,6 +630,7 @@ mod tests {
             Path::new("/r"),
             Some(9),
             None,
+            None,
             Agent::Deb,
             Media::Seed,
         )
@@ -581,6 +639,7 @@ mod tests {
             &vm(),
             Path::new("/d"),
             Path::new("/r"),
+            None,
             None,
             None,
             Agent::Deb,
@@ -605,6 +664,7 @@ mod tests {
                 Path::new("/r"),
                 None,
                 None,
+                None,
                 Agent::Deb,
                 Media::Seed
             )
@@ -617,6 +677,7 @@ mod tests {
                 Path::new("/r"),
                 Some(9),
                 None,
+                None,
                 Agent::Deb,
                 Media::Seed
             )
@@ -628,8 +689,18 @@ mod tests {
     #[test]
     fn preinstalled_agent_waits_for_cloud_init() {
         let (d, r) = (Path::new("/d"), Path::new("/r"));
-        let deb = argv(&vm(), d, r, None, None, Agent::Deb, Media::Seed).unwrap();
-        let pre = argv(&vm(), d, r, None, None, Agent::Preinstalled, Media::Seed).unwrap();
+        let deb = argv(&vm(), d, r, None, None, None, Agent::Deb, Media::Seed).unwrap();
+        let pre = argv(
+            &vm(),
+            d,
+            r,
+            None,
+            None,
+            None,
+            Agent::Preinstalled,
+            Media::Seed,
+        )
+        .unwrap();
         assert_eq!(pre[..deb.len()], deb[..]);
         // base64 of "[Unit]\nAfter=cloud-final.service\n".
         assert_eq!(
@@ -643,7 +714,17 @@ mod tests {
             net: NetProfile::Internet,
             ..vm()
         };
-        let a = argv(&inet, d, r, Some(9), None, Agent::Preinstalled, Media::Seed).unwrap();
+        let a = argv(
+            &inet,
+            d,
+            r,
+            Some(9),
+            None,
+            None,
+            Agent::Preinstalled,
+            Media::Seed,
+        )
+        .unwrap();
         assert!(a.contains(&pre[pre.len() - 1]));
     }
 
@@ -657,6 +738,7 @@ mod tests {
             Path::new("/d"),
             Path::new("/r"),
             None,
+            None,
             Some(sock),
             Agent::Deb,
             Media::Seed,
@@ -666,6 +748,7 @@ mod tests {
             &vm(),
             Path::new("/d"),
             Path::new("/r"),
+            None,
             None,
             None,
             Agent::Deb,
@@ -682,6 +765,7 @@ mod tests {
                 Path::new("/r"),
                 None,
                 None,
+                None,
                 Agent::Deb,
                 Media::Seed
             )
@@ -692,6 +776,7 @@ mod tests {
                 &vm(),
                 Path::new("/d"),
                 Path::new("/r"),
+                None,
                 None,
                 Some(sock),
                 Agent::Deb,
@@ -704,6 +789,7 @@ mod tests {
                 &on,
                 Path::new("/d"),
                 Path::new("/r"),
+                None,
                 None,
                 Some(Path::new("/a b")),
                 Agent::Deb,

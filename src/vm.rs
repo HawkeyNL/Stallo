@@ -32,7 +32,7 @@ use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
-use crate::{confine, images, input, net, qemu, seed};
+use crate::{confine, images, input, net, qemu, seed, tpm};
 
 /// passt's messages, in the VM directory.
 const PASST_LOG: &str = "passt.log";
@@ -120,6 +120,8 @@ pub struct NewVm {
 pub struct Running {
     pub config: VmConfig,
     pub pid: u32,
+    /// swtpm's pid (Windows VMs).
+    tpm_pid: Option<u32>,
     pub qmp: Qmp,
     qga_sock: PathBuf,
     rt_dir: PathBuf,
@@ -540,11 +542,6 @@ impl Manager {
         let cfg = self.load(name)?;
         ensure!(self.running(name).is_none(), "{name} is already running");
         self.check_net(&cfg)?;
-        // Windows 11 needs a TPM 2.0, which needs swtpm next to QEMU.
-        ensure!(
-            cfg.machine.is_linux(),
-            "Windows VMs need TPM support (not yet available)"
-        );
 
         let vm_dir = self.paths.vm_dir(name);
         let rt_dir = self.paths.vm_runtime_dir(name);
@@ -560,6 +557,15 @@ impl Manager {
         }
         // VMs created before snapshots existed have no directory for them.
         ensure_private_dir(&vm_dir.join(qemu::STATES))?;
+        // (swtpm's end, QEMU's end) of a Windows VM's TPM link; swtpm
+        // creates the TPM's state at the first start.
+        let tpm_link = if cfg.machine.is_linux() {
+            None
+        } else {
+            ensure_private_dir(&vm_dir.join(tpm::DIR))?;
+            Some(net::socketpair()?)
+        };
+        let tpm_fd = tpm_link.as_ref().map(|(_, q)| q.as_raw_fd());
         // (passt's end, QEMU's end) of the guest's network link.
         let link = match cfg.net {
             NetProfile::Internet => Some(net::socketpair()?),
@@ -585,13 +591,14 @@ impl Manager {
             &vm_dir,
             &rt_dir,
             qemu_fd,
+            tpm_fd,
             vnc.as_deref(),
             agent,
             media,
         )?;
         // Production: the guest's CPUs wait until the spawn checks (AppArmor
-        // label, VNC socket, passt) have passed, so no guest code runs in
-        // a QEMU that is about to be refused.
+        // labels, VNC socket, passt, swtpm) have passed, so no guest code
+        // runs in a QEMU that is about to be refused.
         let hold = paused || self.mode == Mode::Production;
         if hold {
             argv.push("-S".to_owned());
@@ -616,7 +623,7 @@ impl Manager {
                 );
             }
         }
-        match self.spawn(&cfg, &argv, link).await {
+        match self.spawn(&cfg, &argv, link, tpm_link).await {
             Ok(running) if hold && !paused => match running.qmp.execute("cont", None).await {
                 Ok(_) => Ok(running),
                 Err(e) => {
@@ -687,6 +694,7 @@ impl Manager {
         cfg: &VmConfig,
         argv: &[String],
         link: Option<(OwnedFd, OwnedFd)>,
+        tpm_link: Option<(OwnedFd, OwnedFd)>,
     ) -> Result<Arc<Running>> {
         let name = &cfg.name;
         let vm_dir = self.paths.vm_dir(name);
@@ -717,6 +725,15 @@ impl Manager {
             }
             None => (None, None),
         };
+        // Then swtpm, also in the cgroup, so it dies with the VM.
+        let (mut swtpm, tpm_end) = match tpm_link {
+            Some((swtpm_end, qemu_end)) => {
+                let log = private_log(&vm_dir.join(tpm::LOG))?;
+                let child = tpm::spawn(&vm_dir.join(tpm::DIR), swtpm_end, &cg, log, self.mode)?;
+                (Some(child), Some(qemu_end))
+            }
+            None => (None, None),
+        };
         let mut cmd = Command::new(qemu::QEMU);
         cmd.args(argv)
             .stdin(Stdio::null())
@@ -727,13 +744,13 @@ impl Manager {
             .process_group(0);
         // Order matters: the cgroup hook opens files the ruleset denies.
         crate::cgroup::move_on_exec(&mut cmd, &cg)?;
-        if let Some(fd) = qemu_end {
+        for fd in qemu_end.into_iter().chain(tpm_end) {
             net::inherit_on_exec(&mut cmd, fd);
         }
         // Production only: the profile is installed by the package and
         // names the production paths.
         if self.mode == Mode::Production {
-            confine::apparmor_on_exec(&mut cmd);
+            confine::apparmor_on_exec(&mut cmd, confine::QEMU_PROFILE);
         }
         // A VM from an ISO has a blank disk: no base image, the ISO instead.
         let mut backing = match self.cdrom(cfg)? {
@@ -753,7 +770,8 @@ impl Manager {
             ),
             Mode::Dev => "cannot start QEMU".to_owned(),
         })?;
-        // Closes our copy of QEMU's socket end, so passt sees QEMU exit.
+        // Closes our copies of QEMU's socket ends, so passt and swtpm see
+        // QEMU exit.
         drop(cmd);
         let pid = child
             .id()
@@ -770,7 +788,7 @@ impl Manager {
         // Fail closed if QEMU is not confined as asked (profile in complain
         // mode, or replaced by an unconfined one).
         if self.mode == Mode::Production
-            && let Err(e) = confine::check_qemu_profile(pid)
+            && let Err(e) = confine::check_profile(pid, confine::QEMU_PROFILE)
         {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -811,6 +829,37 @@ impl Manager {
                 return Err(e);
             }
         }
+        // swtpm answered QEMU's first commands before QMP came up; one that
+        // died since, or a TPM QEMU did not wire up, fails the start.
+        if let Some(t) = swtpm.as_mut() {
+            let wrong = match t.try_wait()? {
+                Some(status) => Some(anyhow::anyhow!(
+                    "swtpm exited ({status}); see {}",
+                    vm_dir.join(tpm::LOG).display()
+                )),
+                None => match qmp.execute("query-tpm", None).await {
+                    Ok(reply) => check_tpm(&reply).err(),
+                    Err(e) => Some(e.context("cannot query the TPM")),
+                },
+            };
+            if let Some(e) = wrong {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(e);
+            }
+        }
+        let tpm_pid = swtpm.as_ref().and_then(|t| t.id());
+        if let Some(mut t) = swtpm {
+            let name = name.clone();
+            // Reaps swtpm. It exits when QEMU closes its socket, or with
+            // the cgroup.
+            tokio::spawn(async move {
+                match t.wait().await {
+                    Ok(s) if s.success() => tracing::debug!("{name}: swtpm exited"),
+                    r => tracing::warn!("{name}: swtpm exited: {r:?}"),
+                }
+            });
+        }
         let net_down = Arc::new(AtomicBool::new(false));
         let cut_net = passt.map(|mut p| {
             let cut = Arc::new(tokio::sync::Notify::new());
@@ -840,6 +889,7 @@ impl Manager {
         let running = Arc::new(Running {
             config: cfg.clone(),
             pid,
+            tpm_pid,
             qmp,
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
             rt_dir: rt_dir.clone(),
@@ -1042,13 +1092,19 @@ impl Manager {
         Ok(())
     }
 
-    /// QEMU's overhead, plus passt's for `internet` VMs (one cgroup).
+    /// QEMU's overhead, plus passt's for `internet` VMs and swtpm's for
+    /// Windows VMs (one cgroup).
     fn overhead_mib(&self, cfg: &VmConfig) -> u64 {
         let passt = match cfg.net {
             NetProfile::Internet => net::PASST_MEMORY_MIB,
             NetProfile::Offline => 0,
         };
-        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt
+        let swtpm = if cfg.machine.is_linux() {
+            0
+        } else {
+            tpm::MEMORY_MIB
+        };
+        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt + swtpm
     }
 
     /// QEMU creates the QMP socket shortly after start.
@@ -1150,14 +1206,18 @@ impl Manager {
         Ok(())
     }
 
-    /// Production: kills every VM whose QEMU is no longer confined by its
-    /// AppArmor profile (e.g. the profile was reloaded in complain mode).
+    /// Production: kills every VM whose QEMU or swtpm is no longer confined
+    /// by its AppArmor profile (e.g. the profile was reloaded in complain
+    /// mode).
     pub fn check_confinement(&self) {
         if self.mode != Mode::Production {
             return;
         }
         for vm in self.all_running() {
-            if let Err(e) = confine::check_qemu_profile(vm.pid) {
+            let swtpm = vm.tpm_pid.map_or(Ok(()), |pid| {
+                confine::check_profile(pid, confine::SWTPM_PROFILE)
+            });
+            if let Err(e) = confine::check_profile(vm.pid, confine::QEMU_PROFILE).and(swtpm) {
                 tracing::error!("{}: {e:#}; killing it", vm.config.name);
                 if let Err(e) = self.cgroups.kill_vm(&vm.config.name) {
                     tracing::error!("{}: {e:#}", vm.config.name);
@@ -1867,6 +1927,16 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
     ("systemd-run".to_owned(), args)
 }
 
+/// QEMU's `query-tpm` reply for a Windows VM: exactly one TPM, the CRB
+/// device on swtpm (`qemu::argv`). QEMU's reply is not echoed.
+fn check_tpm(reply: &Value) -> Result<()> {
+    let ok = reply.as_array().is_some_and(|tpms| {
+        tpms.len() == 1 && tpms[0]["model"] == "tpm-crb" && tpms[0]["options"]["type"] == "emulator"
+    });
+    ensure!(ok, "QEMU did not attach the swtpm TPM (query-tpm)");
+    Ok(())
+}
+
 /// The firmware variable template for `cfg`'s disk: Windows always gets
 /// Secure Boot with Microsoft's keys, whatever its image says.
 fn vars_firmware(cfg: &VmConfig, image: images::Firmware) -> images::Firmware {
@@ -2053,6 +2123,7 @@ mod tests {
                 machine: images::Os::Linux,
             },
             pid: 0,
+            tpm_pid: None,
             qmp,
             qga_sock: dir.path().join("qga.sock"),
             rt_dir: "/nonexistent".into(),
@@ -2291,6 +2362,29 @@ mod tests {
         assert_eq!(lerp(0, 1279, 10, 10), 1279);
         assert_eq!(lerp(100, 0, 10, 10), 0);
         assert_eq!(lerp(100, 0, 3, 10), 70);
+    }
+
+    #[test]
+    fn tpm_reply() {
+        let crb = serde_json::json!({
+            "id": "tpm0",
+            "model": "tpm-crb",
+            "options": {"type": "emulator", "data": {"chardev": "tpm0-ctrl"}}
+        });
+        check_tpm(&Value::Array(vec![crb.clone()])).unwrap();
+        let mut tis = crb.clone();
+        tis["model"] = "tpm-tis".into();
+        let mut passthrough = crb.clone();
+        passthrough["options"]["type"] = "passthrough".into();
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([crb, crb]),
+            serde_json::json!([tis]),
+            serde_json::json!([passthrough]),
+            serde_json::json!({}),
+        ] {
+            assert!(check_tpm(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

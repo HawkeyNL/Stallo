@@ -1,5 +1,5 @@
-//! Confinement for QEMU, applied without root: Landlock plus a small
-//! seccomp filter.
+//! Confinement for QEMU (and swtpm, see [`swtpm_rules`]), applied without
+//! root: Landlock plus a small seccomp filter.
 //!
 //! QEMU runs under the daemon's UID, so without confinement a guest that
 //! escapes into QEMU could read and write everything that UID can: other
@@ -106,6 +106,25 @@ pub fn qemu_rules(
     .collect()
 }
 
+/// The rules for a Windows VM's swtpm (`crate::tpm`): the system files it
+/// loads and its own TPM state directory `tpm_dir`, where it writes a
+/// temporary file, renames it over the state file and keeps a `.lock`
+/// file. No directory listing, links, sockets or devices besides
+/// `/dev/urandom`. swtpm parses guest-controlled TPM commands (libtpms), so
+/// it gets nothing else: not the VM's disk, not another VM's TPM.
+pub fn swtpm_rules(tpm_dir: &Path) -> Vec<Rule> {
+    use AccessFs::*;
+    vec![
+        ("/usr".into(), ReadFile | ReadDir | Execute),
+        ("/etc/ld.so.cache".into(), ReadFile.into()),
+        ("/dev/urandom".into(), ReadFile.into()),
+        (
+            tpm_dir.into(),
+            ReadFile | WriteFile | Truncate | MakeReg | RemoveFile,
+        ),
+    ]
+}
+
 /// The rules for `qemu-img` on a VM's own files, which a compromised QEMU
 /// may have crafted: the system files it loads, and read-write access to
 /// `files` only.
@@ -139,18 +158,18 @@ pub fn build(rules: &[Rule]) -> Result<RulesetCreated> {
         .and_then(|r| r.log_new_exec(true))
         .with_context(|| {
             format!(
-                "cannot confine QEMU with Landlock (needs Landlock ABI {} / Linux 6.12 or newer)",
+                "cannot confine with Landlock (needs Landlock ABI {} / Linux 6.12 or newer)",
                 REQUIRED as u32
             )
         })?
         // A rule that cannot be added as written is a bug: fail.
         .set_compatibility(CompatLevel::HardRequirement);
     for (path, access) in rules {
-        let fd = PathFd::new(path)
-            .with_context(|| format!("cannot confine QEMU: {}", path.display()))?;
+        let fd =
+            PathFd::new(path).with_context(|| format!("cannot confine: {}", path.display()))?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, *access))
-            .with_context(|| format!("cannot confine QEMU: rule for {}", path.display()))?;
+            .with_context(|| format!("cannot confine: rule for {}", path.display()))?;
     }
     Ok(ruleset)
 }
@@ -283,25 +302,29 @@ fn filter() -> Vec<sock_filter> {
 /// The AppArmor profile of QEMU in production mode
 /// (`packaging/apparmor/stallo-qemu`).
 pub const QEMU_PROFILE: &str = "stallo-qemu";
+/// The AppArmor profile of swtpm in production mode
+/// (`packaging/apparmor/stallo-swtpm`).
+pub const SWTPM_PROFILE: &str = "stallo-swtpm";
 
-/// Makes `cmd` enter the [`QEMU_PROFILE`] AppArmor profile at `exec`
-/// (what libapparmor's `aa_change_onexec` does). The spawn fails if the
-/// profile is not loaded. Register it before [`confine_on_exec`], whose
-/// Landlock ruleset denies `/proc`.
-pub fn apparmor_on_exec(cmd: &mut Command) {
+/// Makes `cmd` enter AppArmor profile `profile` at `exec` (what
+/// libapparmor's `aa_change_onexec` does). The spawn fails if the profile
+/// is not loaded. Register it before [`confine_on_exec`], whose Landlock
+/// ruleset denies `/proc`.
+pub fn apparmor_on_exec(cmd: &mut Command, profile: &str) {
+    // Built before the fork: the child may not allocate.
+    let line = format!("exec {profile}").into_bytes();
     // SAFETY: the closure runs in the forked child before exec. It only makes
-    // raw syscalls through rustix (open, write, close) on static data, with
-    // no allocation, locking or logging.
+    // raw syscalls through rustix (open, write, close) on data built before
+    // the fork, with no allocation, locking or logging.
     #[allow(unsafe_code)]
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             let attr = rustix::fs::open(
                 c"/proc/self/attr/apparmor/exec",
                 rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )?;
-            const CMD: &[u8] = b"exec stallo-qemu";
-            if rustix::io::write(&attr, CMD)? != CMD.len() {
+            if rustix::io::write(&attr, &line)? != line.len() {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
             Ok(())
@@ -309,15 +332,15 @@ pub fn apparmor_on_exec(cmd: &mut Command) {
     }
 }
 
-/// Checks that process `pid` runs under the enforced [`QEMU_PROFILE`];
-/// anything else is an error (fail closed).
-pub fn check_qemu_profile(pid: u32) -> Result<()> {
+/// Checks that process `pid` runs under the enforced AppArmor profile
+/// `profile`; anything else is an error (fail closed).
+pub fn check_profile(pid: u32, profile: &str) -> Result<()> {
     let label = std::fs::read_to_string(format!("/proc/{pid}/attr/apparmor/current"))
-        .context("cannot read QEMU's AppArmor label")?;
+        .with_context(|| format!("cannot read the AppArmor label of process {pid}"))?;
+    let label = label.trim_end();
     ensure!(
-        is_qemu_label(label.trim_end()),
-        "QEMU runs as {:?}, not under the AppArmor profile {QEMU_PROFILE} in enforce mode",
-        label.trim_end()
+        is_label(label, profile),
+        "process {pid} runs as {label:?}, not under the AppArmor profile {profile} in enforce mode"
     );
     Ok(())
 }
@@ -325,8 +348,11 @@ pub fn check_qemu_profile(pid: u32) -> Result<()> {
 /// An unprivileged, unconfined process that changes profile gets the
 /// profile stacked on `unconfined` (lab, Ubuntu 26.04); the intersection
 /// is the profile itself.
-fn is_qemu_label(label: &str) -> bool {
-    label == "stallo-qemu (enforce)" || label == "stallo-qemu//&unconfined (enforce)"
+fn is_label(label: &str, profile: &str) -> bool {
+    label
+        .strip_suffix(" (enforce)")
+        .and_then(|l| l.strip_prefix(profile))
+        .is_some_and(|rest| rest.is_empty() || rest == "//&unconfined")
 }
 
 /// Makes `cmd` confine itself right before `exec`: first the Landlock
@@ -450,18 +476,28 @@ mod tests {
     }
 
     #[test]
-    fn qemu_label() {
-        assert!(is_qemu_label("stallo-qemu (enforce)"));
-        assert!(is_qemu_label("stallo-qemu//&unconfined (enforce)"));
+    fn profile_labels() {
+        assert!(is_label("stallo-qemu (enforce)", QEMU_PROFILE));
+        assert!(is_label("stallo-qemu//&unconfined (enforce)", QEMU_PROFILE));
+        assert!(is_label("stallo-swtpm (enforce)", SWTPM_PROFILE));
+        assert!(is_label(
+            "stallo-swtpm//&unconfined (enforce)",
+            SWTPM_PROFILE
+        ));
+        // The distro's own swtpm profile is not ours.
+        assert!(!is_label("swtpm (enforce)", SWTPM_PROFILE));
+        assert!(!is_label("stallo-qemu (enforce)", SWTPM_PROFILE));
+        assert!(!is_label("stallo-swtpm (enforce)", QEMU_PROFILE));
         for bad in [
             "unconfined",
             "stallo-qemu (complain)",
             "stallo-qemu//&unconfined (complain)",
             "stallo-qemu//&other (enforce)",
+            "stallo-qemu-x (enforce)",
             "other (enforce)",
             "",
         ] {
-            assert!(!is_qemu_label(bad), "{bad}");
+            assert!(!is_label(bad, QEMU_PROFILE), "{bad}");
         }
     }
 
@@ -622,6 +658,60 @@ mod tests {
         ] {
             assert_eq!(confined(&iso_rules, &denied), Some(false), "{denied}");
         }
+    }
+
+    /// swtpm reaches its own TPM state and nothing else of any VM.
+    #[test]
+    fn swtpm_sees_only_its_tpm_dir() {
+        let rules = swtpm_rules(Path::new("/d/vms/win/tpm"));
+        for (p, access) in &rules {
+            let p = p.to_str().unwrap();
+            assert!(!p.starts_with("/d/") || p == "/d/vms/win/tpm", "{p}");
+            assert!(!access.contains(AccessFs::Execute) || p == "/usr", "{p}");
+            assert!(!access.contains(AccessFs::MakeSym) && !access.contains(AccessFs::Refer));
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let (own, other) = (root.join("vms/win"), root.join("vms/other"));
+        for d in [&own, &other] {
+            fs::create_dir_all(d.join("tpm")).unwrap();
+            vm_files(d, b"x");
+            fs::write(d.join("tpm/tpm2-00.permall"), b"state\n").unwrap();
+        }
+        let rules = swtpm_rules(&own.join("tpm"));
+        let q = |p: &Path| format!("'{}'", p.display());
+        let (tpm, state) = (q(&own.join("tpm")), q(&own.join("tpm/tpm2-00.permall")));
+        // What swtpm does: read, write a temporary file and rename it over
+        // the state, lock and remove files.
+        let Some(ok) = confined(
+            &rules,
+            &format!(
+                "read -r x < {state} && echo new > {tpm}/TMP2-00.permall && \
+                 mv {tpm}/TMP2-00.permall {state} && : > {tpm}/.lock && rm {tpm}/.lock"
+            ),
+        ) else {
+            return;
+        };
+        assert!(ok, "swtpm's own state must be usable");
+        assert_eq!(fs::read(own.join("tpm/tpm2-00.permall")).unwrap(), b"new\n");
+        for denied in [
+            format!("cat {}", q(&other.join("tpm/tpm2-00.permall"))),
+            format!("echo y > {}", q(&other.join("tpm/tpm2-00.permall"))),
+            format!("cat {}", q(&own.join(crate::qemu::DISK))),
+            format!("touch {}", q(&own.join("new"))),
+            format!("ls {tpm}"),
+            format!("ln -s /etc/passwd {tpm}/link"),
+            format!("mkdir {tpm}/sub"),
+            format!("chmod 666 {state}"),
+            "cat /proc/self/environ".to_owned(),
+        ] {
+            assert_eq!(confined(&rules, &denied), Some(false), "{denied}");
+        }
+        assert_eq!(
+            fs::read(other.join("tpm/tpm2-00.permall")).unwrap(),
+            b"state\n"
+        );
     }
 
     /// The seccomp part: no `connect`, no sockets but Unix streams, no

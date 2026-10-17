@@ -1,0 +1,45 @@
+# AppArmor profile for the swtpm processes of stallod (production mode).
+#
+# A Windows VM gets its own swtpm (its TPM 2.0, see src/tpm.rs). stallod
+# switches it into this profile at exec (/proc/self/attr/apparmor/exec)
+# and refuses to start the VM if that fails or the profile is not in
+# enforce mode. Next to the per-VM Landlock ruleset (its own tpm/ only) and
+# the seccomp filter: TPM state files only, no network, no capabilities, no
+# other programs. swtpm runs libtpms on TPM commands from the guest.
+#
+# It replaces the distro's `swtpm` profile for these processes, which is
+# written for libvirt (its peers, paths and capabilities).
+#
+# Load: apparmor_parser -r /etc/apparmor.d/stallo-swtpm (the package does).
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile stallo-swtpm flags=(enforce) {
+  include <abstractions/base>
+
+  /usr/bin/swtpm mr,
+  /usr/lib/x86_64-linux-gnu/swtpm/*.so* mr,
+
+  # The VM's TPM state: state files, their temporary copies and the lock
+  # file. Landlock narrows this to one VM.
+  /var/lib/stallo/vms/*/tpm/ r,
+  /var/lib/stallo/vms/*/tpm/** rwk,
+  # Its log (stderr, opened by stallod).
+  /var/lib/stallo/vms/*/swtpm.log w,
+
+  # The control socket stallod hands over and the data socket QEMU sends
+  # on it: connected stream sockets without addresses.
+  unix (send, receive, getattr, getopt, setopt, shutdown) type=stream addr=none,
+
+  # The daemon (unconfined) stops it.
+  signal (receive) peer=unconfined,
+
+  audit deny network inet,
+  audit deny network inet6,
+  audit deny capability,
+  audit deny ptrace,
+  audit deny mount,
+  audit deny unix (connect, bind, listen, accept),
+}
