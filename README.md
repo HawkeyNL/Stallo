@@ -251,7 +251,9 @@ the VM's screen, as on a real PC. Stallo only boots the installer: there
 is no seed, no cloud-init and no guest password, and the VM is offline.
 
 1. Pull the ISO (humans only). Fedora's is about 2.7 GB, Ubuntu's about
-   6 GB. A pull needs the disk floor plus the ISO's largest size free:
+   6 GB. A pull needs the disk floor (`disk_floor_gib`, 20 GiB by
+   default) plus the ISO's largest size free: 4 GiB for Fedora, 8 GiB for
+   Ubuntu:
 
    ```sh
    stallo images pull fedora-44-workstation
@@ -282,23 +284,29 @@ is no seed, no cloud-init and no guest password, and the VM is offline.
    ```
 
    `stallo set desk --cdrom fedora-44-workstation` puts it back, for
-   example to repair the installed system.
+   example to repair the installed system. Restoring a RAM snapshot after
+   ejecting or swapping the installer can confuse the guest, which finds
+   another disc than it had: eject only once the install is done, and take
+   snapshots after that.
 
 The screen, keyboard and mouse work without anything in the guest. File
 copies (`stallo cp`) and commands (`stallo exec`) need the QEMU guest
-agent in the guest, which Stallo does not install. The VM is offline for
-now, so the package must come from the installed system or its ISO:
+agent in the guest, which Stallo does not install:
 
 - Check `systemctl status qemu-guest-agent`; if it is missing, install the
   `qemu-guest-agent` package, then
-  `sudo systemctl enable --now qemu-guest-agent`.
+  `sudo systemctl enable --now qemu-guest-agent`. The VM is offline for
+  now: if neither the installed system nor its ISO holds the package, it
+  cannot be installed yet.
 - Without `--admin`, Stallo runs commands and file copies as the guest
-  user `agent`. Create that user (`sudo useradd -m agent`), or use
-  `--admin` (root) for every call.
+  user `agent`. Create that user with a locked password, or use
+  `--admin` (root) for every call:
+  `sudo useradd -m -s /bin/bash agent && sudo passwd -l agent`. The
+  account shows on the login screen, but nobody can log in to it.
 - Fedora: SELinux confines the guest agent (`virt_qemu_ga_t`) and refuses
   what `exec` needs. Make only that domain permissive, as Stallo does for
   its Fedora cloud image:
-  `echo '(typepermissive virt_qemu_ga_t)' > /tmp/qga.cil && sudo semodule -i /tmp/qga.cil`.
+  `sudo sh -c "echo '(typepermissive virt_qemu_ga_t)' > /root/qga.cil && semodule -i /root/qga.cil"`.
 
 Stallo does not wait for a guest agent in a VM made from an ISO: not at
 `new`, `start` or snapshot restore, even after you install one. Agents
