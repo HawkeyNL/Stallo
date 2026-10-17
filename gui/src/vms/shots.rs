@@ -172,6 +172,14 @@ async fn script(ui: &Rc<Ui>, out: &Path, full: PathBuf, empty: PathBuf) -> anyho
     shot("agent-confirm").await?;
     close_dialog(ui).await?;
 
+    // A stopped VM from an installer ISO: Internet Access is a switch once
+    // its snapshots are listed (none hold memory).
+    let detail = select(&vms, "desk").await?;
+    let snaps = &detail.snaps;
+    wait_until("the snapshots of desk", || snaps.borrow().is_some()).await?;
+    detail.tabs.set_visible_child_name(super::OVERVIEW);
+    shot("overview-internet").await?;
+
     WidgetExt::activate_action(&vms.root, "vms.new", None)?;
     let windows = || find_row(ui.window.upcast_ref(), "Windows");
     wait_until("the images", || windows().is_some()).await?;

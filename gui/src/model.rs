@@ -465,6 +465,8 @@ fn next_step(e: &CallError) -> Option<&'static str> {
     };
     if msg.contains("guest agent") {
         Some("Check that qemu-guest-agent is installed and running in the VM.")
+    } else if msg.contains("only restore with its current network") {
+        Some("Delete the snapshots that hold memory in the Snapshots tab, then try again.")
     } else if msg.contains("RAM snapshots") {
         Some(
             "Delete the snapshots that hold memory in the Snapshots tab, or keep the current size.",
@@ -523,6 +525,8 @@ pub enum Action {
     },
     /// Empties the CD-ROM drive (the installer ISO) from the next start.
     Eject,
+    /// Turns internet access of a stopped VM on or off.
+    Internet(bool),
 }
 
 impl Action {
@@ -556,6 +560,14 @@ impl Action {
                 memory_mib: *memory_mib,
             }],
             Action::Eject => vec![Request::SetCdrom { name, iso: None }],
+            Action::Internet(on) => vec![Request::SetNet {
+                name,
+                net: if *on {
+                    NetProfile::Internet
+                } else {
+                    NetProfile::Offline
+                },
+            }],
             Action::Restart { live_screen: on } => on
                 .then(|| live_screen(true))
                 .into_iter()
@@ -583,6 +595,7 @@ impl Action {
                 | Action::Remove
                 | Action::Resize { .. }
                 | Action::Eject
+                | Action::Internet(_)
         )
     }
 
@@ -634,6 +647,13 @@ impl Action {
             Action::Remove => (format!("delete {vm}"), None),
             Action::Resize { .. } => (format!("change the resources of {vm}"), None),
             Action::Eject => (format!("eject the installer of {vm}"), None),
+            Action::Internet(on) => (
+                format!(
+                    "turn {} internet access of {vm}",
+                    if *on { "on" } else { "off" }
+                ),
+                None,
+            ),
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
                 Some(format!("Snapshot of {vm} still running")),
@@ -684,6 +704,8 @@ impl Action {
             Action::Remove => "Deleting VM…",
             Action::Resize { .. } => "Changing resources…",
             Action::Eject => "Ejecting installer…",
+            Action::Internet(true) => "Turning on internet access…",
+            Action::Internet(false) => "Turning off internet access…",
         }
     }
 
@@ -693,9 +715,11 @@ impl Action {
         let vm = printable(vm, 64);
         match self {
             // The Screen tab or the switch shows the outcome.
-            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. } | Action::Agent(_) => {
-                None
-            }
+            Action::Life(_)
+            | Action::LiveScreen(_)
+            | Action::Restart { .. }
+            | Action::Agent(_)
+            | Action::Internet(_) => None,
             Action::Remove => Some(format!("{vm} deleted")),
             Action::Resize { .. } => Some(format!("Resources of {vm} changed")),
             Action::Eject => Some(format!("Installer ejected from {vm}. {AT_NEXT_START}")),
@@ -1034,14 +1058,6 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
     let used = details.map_or("Unknown".to_owned(), |d| {
         format!("{:.1} GiB", d.disk_used_bytes as f64 / BYTES_PER_GIB)
     });
-    let net = match vm.net {
-        NetProfile::Offline => "Off",
-        // The daemon cut it: the network check failed.
-        NetProfile::Internet if vm.state.ends_with(" (no network)") => {
-            "Cut off until the VM restarts"
-        }
-        NetProfile::Internet => "On",
-    };
     let forwards = if vm.forwards.is_empty() {
         "None".to_owned()
     } else {
@@ -1081,13 +1097,10 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
                 ("Disk Used", used),
             ],
         ),
+        // Internet Access is a switch above these (`internet_switch_block`).
         (
             "Network",
-            vec![
-                ("Internet Access", net.to_owned()),
-                ("Port Forwards", forwards),
-                ("Addresses", addresses),
-            ],
+            vec![("Port Forwards", forwards), ("Addresses", addresses)],
         ),
         ("Guest", vec![("Guest Agent", agent.to_owned())]),
     ]
@@ -1869,6 +1882,7 @@ pub fn confirm_restart(vm: &VmInfo) -> Confirm {
 pub enum Setting {
     LiveScreen,
     Agent,
+    Internet,
 }
 
 impl Setting {
@@ -1877,6 +1891,7 @@ impl Setting {
         match self {
             Setting::LiveScreen => vm.vnc,
             Setting::Agent => vm.agent_control,
+            Setting::Internet => vm.net == NetProfile::Internet,
         }
     }
 
@@ -1884,14 +1899,17 @@ impl Setting {
         match self {
             Setting::LiveScreen => Action::LiveScreen(on),
             Setting::Agent => Action::Agent(on),
+            Setting::Internet => Action::Internet(on),
         }
     }
 
-    /// The question before turning it on.
-    pub fn confirm(self, vm: &VmInfo) -> Confirm {
+    /// The question before turning it on, if any. Internet access asks
+    /// none: the host stays isolated, and it turns off again as easily.
+    pub fn confirm(self, vm: &VmInfo) -> Option<Confirm> {
         match self {
-            Setting::LiveScreen => confirm_live_screen_switch(vm),
-            Setting::Agent => confirm_agent(vm),
+            Setting::LiveScreen => Some(confirm_live_screen_switch(vm)),
+            Setting::Agent => Some(confirm_agent(vm)),
+            Setting::Internet => None,
         }
     }
 
@@ -1902,12 +1920,13 @@ impl Setting {
 
     /// What its switch moving to `active` asks for: nothing when the
     /// switch only follows the VM (an update), the action when it turns
-    /// off, the question (`None` inside) when it turns on.
+    /// off, the question (`None` inside) when it turns on, unless there
+    /// is none to ask.
     pub fn moved(self, vm: &VmInfo, active: bool) -> Option<Option<Action>> {
         match (self.of(vm) == active, active) {
             (true, _) => None,
-            (false, false) => Some(Some(self.action(false))),
-            (false, true) => Some(None),
+            (false, true) if self.confirm(vm).is_some() => Some(None),
+            (false, _) => Some(Some(self.action(active))),
         }
     }
 
@@ -1951,6 +1970,62 @@ pub fn remove_note(vm: &VmInfo) -> (&'static str, bool) {
     match kind(&vm.state) {
         Kind::Stopped => ("Deletes its disk and all its snapshots for good.", true),
         _ => ("Stop the VM to delete it.", false),
+    }
+}
+
+/// The Overview's row for the network profile, a switch.
+pub const INTERNET_ACCESS: &str = "Internet Access";
+
+/// Why the Internet Access switch cannot move now, if so; as the daemon's
+/// `set_net`, which checks again. Only VMs from an installer ISO have
+/// the switch ([`internet_switchable`]). `snaps`: the VM's snapshots, if
+/// listed.
+pub fn internet_switch_block(
+    vm: &VmInfo,
+    snaps: Option<&[Snapshot]>,
+    production: bool,
+) -> Option<&'static str> {
+    if kind(&vm.state) != Kind::Stopped {
+        Some("Stop the VM to change this.")
+    } else if vm.net == NetProfile::Offline && !production {
+        Some("Not available: the dev-mode daemon keeps VMs offline.")
+    } else if !vm.forwards.is_empty() {
+        Some("Port forwards need it. To turn it off, create the VM again.")
+    } else if snaps.is_some_and(|s| s.iter().any(|s| s.ram_bytes > 0)) {
+        Some("Delete the snapshots that hold memory to change this.")
+    } else {
+        None
+    }
+}
+
+/// Whether `vm` gets the Internet Access switch: made from an installer
+/// ISO (catalog or imported), as the daemon's `set_net`. Reads the
+/// catalog: once per VM page.
+pub fn internet_switchable(vm: &VmInfo) -> bool {
+    vm.image
+        .as_deref()
+        .is_some_and(|i| stallo::images::is_iso(i).unwrap_or(false))
+}
+
+/// Why a VM without the switch keeps its setting.
+pub const INTERNET_FIXED: &str = "VMs from cloud images keep the setting they were created with.";
+
+/// The Internet Access value of a VM without the switch.
+pub fn internet_word(vm: &VmInfo) -> &'static str {
+    match vm.net {
+        NetProfile::Internet => "On",
+        NetProfile::Offline => "Off",
+    }
+}
+
+/// The Internet Access row's subtitle: a cut network, else why it
+/// cannot move, else what it means.
+pub fn internet_note(vm: &VmInfo, block: Option<&'static str>) -> &'static str {
+    // The daemon cut it: the network check failed.
+    if vm.net == NetProfile::Internet && vm.state.ends_with(" (no network)") {
+        "Cut off until the VM restarts."
+    } else {
+        block.unwrap_or("Reaches the internet, not this computer or your local network.")
     }
 }
 
@@ -3153,7 +3228,6 @@ mod tests {
                 "2 GiB",
                 "20 GiB",
                 "Unknown",
-                "Off",
                 "None",
                 "None",
                 "Not running"
@@ -3199,14 +3273,13 @@ mod tests {
                 "1536 MiB",
                 "20 GiB",
                 "1.5 GiB",
-                "On",
                 "127.0.0.1:8080 → 80\n[::1]:2222 → 22",
                 "eth0  10.0.2.15/24\nevil  fe80::1/64",
                 "Answering",
             ]
         );
         let addresses =
-            |d: Option<VmDetails>, state| values(facts(&vm(state), d.as_ref()))[7].clone();
+            |d: Option<VmDetails>, state| values(facts(&vm(state), d.as_ref()))[6].clone();
         assert_eq!(addresses(None, "running"), "Unknown");
         assert_eq!(
             addresses(Some(details(None)), "running"),
@@ -3225,8 +3298,8 @@ mod tests {
                 ..details(None)
             };
             let v = values(facts(&desk(image), Some(&d)));
-            assert!(v[7].starts_with("Unknown (install"), "{v:?}");
-            v[8].clone()
+            assert!(v[6].starts_with("Unknown (install"), "{v:?}");
+            v[7].clone()
         };
         assert_eq!(installed(Some("fedora-44-workstation")), NO_GUEST_AGENT);
         assert!(NO_GUEST_AGENT.starts_with("No guest agent answering"));
@@ -3234,23 +3307,7 @@ mod tests {
             assert!(installed(other).starts_with("Not answering"), "{other:?}");
         }
         let unknown = values(facts(&desk(Some("fedora-44-workstation")), None));
-        assert_eq!(unknown[8], "Unknown");
-        // The daemon cut the network of an internet VM.
-        let cut = VmInfo {
-            net: NetProfile::Internet,
-            ..vm("running (no network)")
-        };
-        assert_eq!(
-            values(facts(&cut, None))[..6],
-            [
-                "Running",
-                "2",
-                "2 GiB",
-                "20 GiB",
-                "Unknown",
-                "Cut off until the VM restarts"
-            ]
-        );
+        assert_eq!(unknown[7], "Unknown");
         assert_eq!(addresses(Some(details(Some(vec![]))), "running"), "None");
         // Old addresses of a VM that stopped since are not shown.
         let old = Some(vec![("eth0".into(), "10.0.2.15/24".into())]);
@@ -5036,7 +5093,7 @@ mod tests {
         ] {
             assert!(c.body.contains(word), "{word}");
         }
-        assert_eq!(Setting::Agent.confirm(&vm("running")), c);
+        assert_eq!(Setting::Agent.confirm(&vm("running")), Some(c));
         assert!(Setting::Agent.destructive() && !Setting::LiveScreen.destructive());
         assert_eq!(MCP_INSTALL, "stallo mcp install");
         assert_eq!(
@@ -5055,6 +5112,117 @@ mod tests {
         assert_eq!(
             Action::Agent(true).failed("dev", &CallError::Timeout).title,
             "Could not turn on agent control of dev"
+        );
+    }
+
+    /// Internet Access: a switch for stopped VMs from an installer ISO,
+    /// with no question either way; otherwise one line says why not.
+    #[test]
+    fn internet_switch() {
+        let win = VmInfo {
+            image: Some("local-win11".into()),
+            ..vm("stopped")
+        };
+        let on = VmInfo {
+            net: NetProfile::Internet,
+            ..win.clone()
+        };
+        assert_eq!(internet_switch_block(&win, None, true), None);
+        assert_eq!(
+            internet_switch_block(&on, None, false),
+            None,
+            "off in dev mode"
+        );
+        assert_eq!(
+            internet_note(&win, None),
+            "Reaches the internet, not this computer or your local network."
+        );
+        // Only VMs from an ISO get the switch; others show their value.
+        assert!(internet_switchable(&win));
+        assert!(internet_switchable(&VmInfo {
+            image: Some("fedora-44-workstation".into()),
+            ..vm("running")
+        }));
+        for image in [Some("ubuntu-26.04"), Some("nope"), None] {
+            let cloud = VmInfo {
+                image: image.map(Into::into),
+                ..vm("running")
+            };
+            assert!(!internet_switchable(&cloud), "{image:?}");
+        }
+        assert_eq!((internet_word(&win), internet_word(&on)), ("Off", "On"));
+        assert_eq!(internet_note(&win, Some(INTERNET_FIXED)), INTERNET_FIXED);
+        for state in ["running", "paused", "running (no network)"] {
+            let busy = VmInfo {
+                state: state.into(),
+                ..on.clone()
+            };
+            let why = internet_switch_block(&busy, None, true);
+            assert_eq!(why, Some("Stop the VM to change this."), "{state}");
+        }
+        let cut = VmInfo {
+            state: "running (no network)".into(),
+            ..on.clone()
+        };
+        assert_eq!(
+            internet_note(&cut, internet_switch_block(&cut, None, true)),
+            "Cut off until the VM restarts."
+        );
+        assert!(
+            internet_switch_block(&win, None, false)
+                .unwrap()
+                .contains("dev-mode")
+        );
+        let fwd = VmInfo {
+            forwards: vec![stallo::config::PortForward {
+                bind: "127.0.0.1".parse().unwrap(),
+                host: 8080,
+                guest: 80,
+            }],
+            ..on.clone()
+        };
+        assert!(
+            internet_switch_block(&fwd, None, true)
+                .unwrap()
+                .contains("create the VM again")
+        );
+        let snaps = [snap("disk", 0, 1, 0), snap("ram", 1 << 20, 2, 1)];
+        assert_eq!(internet_switch_block(&win, Some(&snaps[..1]), true), None);
+        let why = internet_switch_block(&win, Some(&snaps), true);
+        assert_eq!(
+            why,
+            Some("Delete the snapshots that hold memory to change this.")
+        );
+        assert_eq!(internet_note(&win, why), why.unwrap());
+
+        // No question either way; the switch following the VM sends nothing.
+        let s = Setting::Internet;
+        assert_eq!(s.confirm(&win), None);
+        assert_eq!(s.moved(&win, true), Some(Some(Action::Internet(true))));
+        assert_eq!(s.moved(&on, false), Some(Some(Action::Internet(false))));
+        assert_eq!(s.moved(&on, true), None);
+        assert_eq!(
+            serde_json::to_string(&Action::Internet(true).requests("win")[0]).unwrap(),
+            r#"{"op":"set_net","name":"win","net":"internet"}"#
+        );
+        assert!(Action::Internet(false).lifecycle());
+        assert_eq!(
+            Action::Internet(true).progress(),
+            "Turning on internet access…"
+        );
+        assert_eq!(
+            Action::Internet(true).done("win", &serde_json::Value::Null),
+            None
+        );
+        let f = Action::Internet(false).failed(
+            "win",
+            &CallError::Failed("win has RAM snapshots (s1) that only restore with its current network; delete them first: stallo snap win --delete <name>".into()),
+        );
+        assert_eq!(f.title, "Could not turn off internet access of win");
+        assert!(
+            f.details
+                .unwrap()
+                .ends_with("in the Snapshots tab, then try again.")
         );
     }
 
