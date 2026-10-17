@@ -21,11 +21,12 @@ jobs:
         with:
           persist-credentials: false
       # qemu-img and xorriso for image and seed ISO checks in the unit tests
-      # (no VM is started); GTK and libadwaita to build the GUI; the
-      # validators for its desktop file and AppStream metadata.
+      # (no VM is started); swtpm for its confinement tests; GTK and
+      # libadwaita to build the GUI; the validators for its desktop file and
+      # AppStream metadata.
       - run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          qemu-utils xorriso libgtk-4-dev libadwaita-1-dev pkg-config
+          qemu-utils xorriso swtpm libgtk-4-dev libadwaita-1-dev pkg-config
           desktop-file-utils appstream
       - run: desktop-file-validate packaging/gui/io.github.hawkeynl.Stallo.desktop
       - run: appstreamcli validate --no-net packaging/gui/io.github.hawkeynl.Stallo.metainfo.xml
