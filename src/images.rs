@@ -422,6 +422,24 @@ pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
         && (entry.agent != Agent::Deb || debs_dir(paths, &entry.id).is_dir())
 }
 
+/// Disk space a pull of `entry` may take: a cloud image twice its largest
+/// size (the download plus as much headroom for its conversion), an ISO,
+/// cached as downloaded, once.
+pub fn pull_reserve(entry: &CatalogEntry) -> u64 {
+    match entry.kind {
+        Kind::CloudImage => entry.max_size.saturating_mul(2),
+        Kind::Iso => entry.max_size,
+    }
+}
+
+/// Whether a VM from image `id` has a guest agent to wait for. A guest
+/// installed from an ISO has none unless its user installs one, and
+/// nothing tells a missing agent from a slow one, so waits skip it. An
+/// image that left the catalog counts as having one.
+pub fn has_agent(id: &str) -> bool {
+    find(id).map_or(true, |e| e.agent != Agent::Manual)
+}
+
 /// Refuses an image that is not cached: agents create VMs only from
 /// images a human pulled.
 pub fn ensure_pulled(paths: &Paths, id: &str) -> Result<()> {
@@ -1260,6 +1278,21 @@ mod tests {
         let entry: CatalogEntry = t.try_into()?;
         entry.validate()?;
         Ok(entry)
+    }
+
+    /// An ISO is cached as downloaded: its pull reserves it once, a cloud
+    /// image (converted) twice. Only images known to have no guest agent
+    /// skip the waits for one.
+    #[test]
+    fn pull_reserve_and_agent_waits() {
+        let iso = find("fedora-44-workstation").unwrap();
+        assert_eq!(pull_reserve(&iso), iso.max_size);
+        let cloud = find("ubuntu-26.04").unwrap();
+        assert_eq!(pull_reserve(&cloud), 2 * cloud.max_size);
+        assert!(!has_agent("fedora-44-workstation"));
+        assert!(!has_agent("ubuntu-26.04-desktop"));
+        assert!(has_agent("ubuntu-26.04"));
+        assert!(has_agent("left-the-catalog"));
     }
 
     #[test]

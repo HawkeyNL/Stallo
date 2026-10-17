@@ -97,9 +97,13 @@ pub fn argv(
     let vnc = vnc
         .map(|p| Ok::<_, anyhow::Error>(format!("-vnc unix:{}", opt_path(p)?)))
         .transpose()?;
+    // The SMBIOS systemd credentials below tune the boot of the cloud
+    // guests Stallo sets up. A guest installed from an ISO is the user's
+    // own system: it gets none.
+    let managed = media == Media::Seed;
     // systemd >= 256 reads `systemd.unit-dropin.*` credentials. Base64
     // has no spaces or commas.
-    let qga_order = (agent == Agent::Preinstalled).then(|| {
+    let qga_order = (managed && agent == Agent::Preinstalled).then(|| {
         format!(
             "-smbios type=11,value=io.systemd.credential.binary:systemd.unit-dropin.qemu-guest-agent.service={}",
             BASE64.encode(QGA_AFTER_CLOUD_INIT)
@@ -110,12 +114,14 @@ pub fn argv(
         // waits 2 minutes for systemd-networkd-wait-online. An empty
         // `systemd.extra-unit.*` credential masks a unit (systemd >= 256;
         // for older systemd see the offline network-config in seed.rs).
-        (NetProfile::Offline, None) => vec![
-            "-nic none".to_owned(),
-            format!(
-                "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{WAIT_ONLINE}="
-            ),
-        ],
+        (NetProfile::Offline, None) => ["-nic none".to_owned()]
+            .into_iter()
+            .chain(managed.then(|| {
+                format!(
+                    "-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{WAIT_ONLINE}="
+                )
+            }))
+            .collect(),
         // An already connected socket (see net.rs). `romfile=`: no iPXE
         // option ROM, so no network boot code in the firmware.
         (NetProfile::Internet, Some(fd)) => vec![
@@ -127,8 +133,9 @@ pub fn argv(
         ],
         (net, fd) => bail!("network profile {net:?} with passt socket {fd:?}"),
     };
-    let time_sync =
-        format!("-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}=");
+    let time_sync = managed.then(|| {
+        format!("-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}=")
+    });
     let file = |dir: &Path, name: &str| opt_path(&dir.join(name));
     let (disk, vars) = (file(vm_dir, DISK)?, file(vm_dir, VARS)?);
     // The disk boots first; a blank one falls through to the CD-ROM. The
@@ -196,7 +203,7 @@ pub fn argv(
         .chain(&media)
         .chain(&devices)
         .chain(&network)
-        .chain([&time_sync])
+        .chain(&time_sync)
         .chain(&qga_order)
         .chain(&vnc)
         .flat_map(|a| a.split(' ').map(str::to_owned))
@@ -325,15 +332,23 @@ mod tests {
     }
 
     /// A VM from an ISO: the seed's two arguments make way for a CD-ROM
-    /// drive, with the ISO (raw, read-only) or empty; nothing else changes.
+    /// drive, with the ISO (raw, read-only) or empty, and the guest gets
+    /// none of the systemd credentials for Stallo's cloud guests; nothing
+    /// else changes.
     #[test]
     fn golden_cdrom() {
         let (d, r) = (Path::new("/d/vms/dev"), Path::new("/r/vms/dev"));
         let with = |agent, media| argv(&vm(), d, r, None, None, agent, media).map(|a| a.join(" "));
-        let seed = with(Agent::Deb, Media::Seed).unwrap();
+        let credentials = " \
+-smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-networkd-wait-online.service= \
+-smbios type=11,value=io.systemd.credential:systemd.extra-unit.systemd-time-wait-sync.service=";
+        let full = with(Agent::Deb, Media::Seed).unwrap();
+        assert!(full.ends_with(credentials));
+        let seed = full.replace(credentials, "");
         let seed_args = "-blockdev driver=file,node-name=seed,filename=/d/vms/dev/seed.iso,read-only=on \
                          -device virtio-blk-pci,drive=seed";
         assert!(seed.contains(seed_args));
+        assert!(seed.ends_with("-nic none"));
         let iso = Path::new("/d/images/fedora-44-workstation.iso");
         assert_eq!(
             with(Agent::Manual, Media::Cdrom(Some(iso))).unwrap(),
@@ -348,6 +363,23 @@ mod tests {
             with(Agent::Manual, Media::Cdrom(None)).unwrap(),
             seed.replace(seed_args, "-device ide-cd,id=cd0,bus=ide.0,bootindex=2")
         );
+        // Nor with the internet profile, or an agent that would be
+        // preinstalled.
+        let inet = VmConfig {
+            net: NetProfile::Internet,
+            ..vm()
+        };
+        let a = argv(
+            &inet,
+            d,
+            r,
+            Some(9),
+            None,
+            Agent::Preinstalled,
+            Media::Cdrom(None),
+        )
+        .unwrap();
+        assert!(!a.join(" ").contains("smbios"), "{a:?}");
         // The ISO's path is escaped or refused like the others.
         assert!(with(Agent::Manual, Media::Cdrom(Some(Path::new("/a b.iso")))).is_err());
         let comma = with(Agent::Manual, Media::Cdrom(Some(Path::new("/a,b.iso")))).unwrap();

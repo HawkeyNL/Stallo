@@ -323,7 +323,7 @@ impl Manager {
             host::check_pull_space(
                 host::disk_free(&dir)?,
                 self.config.host.disk_floor_gib,
-                entry.max_size,
+                images::pull_reserve(&entry),
                 images::resumable_bytes(&self.paths, &entry),
             )?;
         }
@@ -331,9 +331,10 @@ impl Manager {
     }
 
     /// Deletes a cached image (`stallo images rm`). Refused while any VM,
-    /// stopped or a `stallo run` clone included, was made from it: by its
-    /// `vm.toml`, or by its disk's backing file (also for a VM directory
-    /// whose `vm.toml` is missing or broken).
+    /// stopped or a `stallo run` clone included, was made from it or has it
+    /// in its CD-ROM drive: by its `vm.toml` or by its disk's backing file.
+    /// Fails closed: a VM directory whose `vm.toml` or disk cannot be read
+    /// refuses the removal.
     pub async fn remove_image(&self, id: &str) -> Result<()> {
         validate_image_id(id)?;
         let _guard = self.images.write().await;
@@ -346,8 +347,12 @@ impl Manager {
             }
             let (dir, name) = (entry.path(), entry.file_name());
             let name = name.to_string_lossy();
-            let by_config =
-                VmConfig::load(&dir).is_ok_and(|c| c.image == id || c.cdrom.as_deref() == Some(id));
+            let cfg = VmConfig::load(&dir).with_context(|| {
+                format!(
+                    "cannot tell whether {name} uses image {id}; remove it first: stallo rm {name}"
+                )
+            })?;
+            let by_config = cfg.image == id || cfg.cdrom.as_deref() == Some(id);
             // A disk is written by its QEMU: only its file name counts, and
             // a disk that cannot be read refuses the removal.
             let by_disk = images::backing_file(&dir.join(qemu::DISK))
@@ -879,6 +884,35 @@ impl Manager {
             "{name} is a `stallo run` clone; it has no VNC"
         );
         cfg.vnc = on;
+        cfg.save(&self.paths.vm_dir(name))
+    }
+
+    /// Puts pulled installer ISO `iso` into the CD-ROM drive of a VM made
+    /// from an ISO, or empties the drive (`None`); it takes effect at the
+    /// next start.
+    pub async fn set_cdrom(&self, name: &str, iso: Option<&str>) -> Result<()> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        ensure!(
+            images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso),
+            "{name} has no CD-ROM drive; only VMs made from an installer ISO have one"
+        );
+        // Held until vm.toml names the ISO, so `images rm` sees it.
+        let _image = self.images.read().await;
+        if let Some(id) = iso {
+            let entry = images::find(id)?;
+            ensure!(
+                entry.kind == images::Kind::Iso,
+                "{id} is not an installer ISO; see `stallo images`"
+            );
+            images::ensure_pulled(&self.paths, id)?;
+        }
+        cfg.cdrom = iso.map(str::to_owned);
         cfg.save(&self.paths.vm_dir(name))
     }
 

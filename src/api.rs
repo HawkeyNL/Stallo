@@ -40,7 +40,9 @@ pub struct Envelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    /// Create, start and (with `wait`) wait for the guest agent.
+    /// Create, start and (with `wait`) wait for the guest agent. `wait`
+    /// is ignored for images without one (`images::has_agent`), as for
+    /// `Start`.
     New {
         name: String,
         image: String,
@@ -190,6 +192,13 @@ pub enum Request {
         name: String,
         on: bool,
     },
+    /// Puts a pulled installer ISO into the CD-ROM drive of a VM made from
+    /// an ISO, or empties the drive (`iso: None`), from the VM's next start
+    /// (humans only).
+    SetCdrom {
+        name: String,
+        iso: Option<String>,
+    },
     /// Changes a stopped VM's vCPUs and/or memory (humans only).
     SetResources {
         name: String,
@@ -250,6 +259,12 @@ pub struct VmInfo {
     pub agent_control: bool,
     #[serde(default)]
     pub vnc: bool,
+    /// The image the VM was made from (an older stallod does not send it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// The installer ISO in the CD-ROM drive (VMs made from an ISO).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdrom: Option<String>,
 }
 
 /// `info`: a VM plus what only a running guest or the disk can tell.
@@ -374,6 +389,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | Resume { .. }
         | SetAgent { .. }
         | SetVnc { .. }
+        // What a VM boots from is a human's choice, as at `new`.
+        | SetCdrom { .. }
         // Growing a VM takes host CPU and memory budget that a human sized;
         // agent control of a small VM must not let an agent claim the host.
         | SetResources { .. }
@@ -523,6 +540,13 @@ mod tests {
         let resize = r#"{"op":"set_resources","name":"dev","vcpus":4,"memory_mib":null}"#;
         let r: Request = serde_json::from_str(resize).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), resize);
+        let eject = r#"{"op":"set_cdrom","name":"dev","iso":null}"#;
+        let r: Request = serde_json::from_str(eject).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), eject);
+        // A VM from an older stallod has no image or CD-ROM drive.
+        let old = r#"{"name":"dev","state":"stopped","vcpus":1,"memory_mib":512,"disk_gib":10,"net":"offline","agent_control":false}"#;
+        let vm: VmInfo = serde_json::from_str(old).unwrap();
+        assert_eq!((vm.image, vm.cdrom), (None, None));
         for bad in [
             r#"{"via":"cli","request":{"op":"stop","name":"dev","force":false,"x":1}}"#,
             r#"{"via":"root","request":{"op":"list"}}"#,
@@ -576,6 +600,12 @@ mod tests {
             }),
             Gate::Closed
         );
+        for iso in [None, Some("fedora-44-workstation".into())] {
+            assert_eq!(
+                agent_gate(&Request::SetCdrom { name: name(), iso }),
+                Gate::Closed
+            );
+        }
         assert_eq!(
             agent_gate(&Request::SnapshotDelete {
                 name: name(),

@@ -165,16 +165,16 @@ pub fn check_snapshot_space(free_bytes: u64, floor_gib: u64, need_bytes: u64) ->
     Ok(())
 }
 
-/// Whether an image download fits: twice its largest size (the download
-/// plus as much headroom), less what a partial download already holds,
+/// Whether an image download fits: what the pull may take
+/// (`images::pull_reserve`), less what a partial download already holds,
 /// must fit above the floor. Checked before every image download.
 pub fn check_pull_space(
     free_bytes: u64,
     floor_gib: u64,
-    max_size: u64,
+    reserve: u64,
     resumable: u64,
 ) -> Result<()> {
-    let image = max_size.saturating_mul(2).saturating_sub(resumable);
+    let image = reserve.saturating_sub(resumable);
     let need = floor_gib.saturating_mul(GIB).saturating_add(image);
     ensure!(
         free_bytes >= need,
@@ -339,13 +339,13 @@ mod tests {
 
     #[test]
     fn pull_space() {
-        // 20 GiB floor + 2 x 4 GiB image.
-        assert!(check_pull_space(28 * GIB, 20, 4 * GIB, 0).is_ok());
-        let err = check_pull_space(28 * GIB - 1, 20, 4 * GIB, 0).unwrap_err();
+        // 20 GiB floor + 8 GiB for the image.
+        assert!(check_pull_space(28 * GIB, 20, 8 * GIB, 0).is_ok());
+        let err = check_pull_space(28 * GIB - 1, 20, 8 * GIB, 0).unwrap_err();
         assert!(err.to_string().contains("28.0 GiB needed"), "{err}");
         // A partial download of 3 GiB already sits on the disk.
-        assert!(check_pull_space(25 * GIB, 20, 4 * GIB, 3 * GIB).is_ok());
-        assert!(check_pull_space(25 * GIB - 1, 20, 4 * GIB, 3 * GIB).is_err());
+        assert!(check_pull_space(25 * GIB, 20, 8 * GIB, 3 * GIB).is_ok());
+        assert!(check_pull_space(25 * GIB - 1, 20, 8 * GIB, 3 * GIB).is_err());
         assert!(check_pull_space(u64::MAX, u64::MAX, u64::MAX, 0).is_ok());
         assert!(check_pull_space(0, 0, u64::MAX, u64::MAX).is_ok());
     }
