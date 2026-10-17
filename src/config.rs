@@ -10,12 +10,18 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::images::Os;
+
 /// VM names match `^[a-z][a-z0-9-]{0,30}$`.
 pub const MAX_NAME_LEN: usize = 31;
 
 /// 16 TiB: far above any host, and small enough that byte maths never
 /// overflows.
 pub const MAX_MEMORY_MIB: u64 = 1 << 24;
+
+/// The smallest Windows VM, also its default: (vCPUs, memory MiB, disk
+/// GiB). Windows 11 Setup refuses less.
+pub const WINDOWS_MIN: (u32, u64, u64) = (2, 4096, 64);
 
 /// Checks a VM name. Names become directory names, cgroup names and QEMU
 /// arguments, so the alphabet is tiny on purpose.
@@ -113,6 +119,10 @@ pub struct VmConfig {
     /// empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdrom: Option<String>,
+    /// The virtual hardware profile, from the image's OS at create. Left
+    /// out of the vm.toml of a Linux VM, so older files read as Linux.
+    #[serde(default, skip_serializing_if = "Os::is_linux")]
+    pub machine: Os,
 }
 
 /// One TCP port forward: `bind:host` on the host to `guest` in the guest.
@@ -180,6 +190,13 @@ impl VmConfig {
             (1..=16384).contains(&self.disk_gib),
             "disk must be between 1 and 16384 GiB"
         );
+        if self.machine == Os::Windows {
+            let (cpus, mem, disk) = WINDOWS_MIN;
+            ensure!(
+                self.vcpus >= cpus && self.memory_mib >= mem && self.disk_gib >= disk,
+                "a Windows VM needs at least {cpus} vCPUs, {mem} MiB of memory and a {disk} GiB disk"
+            );
+        }
         ensure!(
             self.forwards.is_empty() || self.net == NetProfile::Internet,
             "port forwards need the internet network profile"
@@ -449,6 +466,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             cdrom: None,
+            machine: Os::Linux,
         }
     }
 
@@ -526,6 +544,52 @@ mod tests {
 
         let unknown = format!("{}extra = 1\n", toml::to_string(&vm()).unwrap());
         assert!(toml::from_str::<VmConfig>(&unknown).is_err());
+    }
+
+    /// `machine`: absent means Linux (vm.toml from before it existed), only
+    /// Windows is written, and a Windows VM has a minimum size.
+    #[test]
+    fn machine_profile() {
+        let text = toml::to_string(&vm()).unwrap();
+        assert!(!text.contains("machine"), "{text}");
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), vm());
+        let win = VmConfig {
+            machine: Os::Windows,
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            ..vm()
+        };
+        win.validate().unwrap();
+        let text = toml::to_string(&win).unwrap();
+        assert!(text.contains("machine = \"windows\""), "{text}");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dev");
+        fs::create_dir(&dir).unwrap();
+        win.save(&dir).unwrap();
+        assert_eq!(VmConfig::load(&dir).unwrap(), win);
+        for small in [
+            VmConfig {
+                vcpus: 1,
+                ..win.clone()
+            },
+            VmConfig {
+                memory_mib: 4095,
+                ..win.clone()
+            },
+            VmConfig {
+                disk_gib: 63,
+                ..win.clone()
+            },
+        ] {
+            let err = small.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("Windows VM needs at least"),
+                "{err}"
+            );
+        }
+        let bad = text.replace("\"windows\"", "\"macos\"");
+        assert!(toml::from_str::<VmConfig>(&bad).is_err());
     }
 
     #[test]

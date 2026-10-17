@@ -395,7 +395,8 @@ impl Manager {
             !new.name.starts_with(RUN_PREFIX),
             "names starting with {RUN_PREFIX} are kept for `stallo run`"
         );
-        let iso = images::find(&new.image)?.kind == images::Kind::Iso;
+        let entry = images::find(&new.image)?;
+        let iso = entry.kind == images::Kind::Iso;
         // The agent gate refuses this already; fail closed here too.
         ensure!(
             !(iso && new.agent_control),
@@ -414,6 +415,7 @@ impl Manager {
             forwards: new.forwards.clone(),
             vnc: new.vnc || iso,
             cdrom: iso.then(|| new.image.clone()),
+            machine: entry.os,
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
@@ -511,6 +513,11 @@ impl Manager {
         let cfg = self.load(name)?;
         ensure!(self.running(name).is_none(), "{name} is already running");
         self.check_net(&cfg)?;
+        // Windows 11 needs a TPM 2.0, which needs swtpm next to QEMU.
+        ensure!(
+            cfg.machine.is_linux(),
+            "Windows VMs need TPM support (not yet available)"
+        );
 
         let vm_dir = self.paths.vm_dir(name);
         let rt_dir = self.paths.vm_runtime_dir(name);
@@ -625,6 +632,10 @@ impl Manager {
     /// internet profile needs production mode and a passing isolation
     /// probe (`net::check_isolation`).
     fn check_net(&self, cfg: &VmConfig) -> Result<()> {
+        ensure!(
+            cfg.machine.is_linux() || cfg.net == NetProfile::Offline,
+            "Windows VMs are offline only for now: the internet profile is not verified with Windows yet"
+        );
         if cfg.net != NetProfile::Offline {
             images::find(&cfg.image)?.check_net(cfg.net)?;
         }
@@ -1998,6 +2009,7 @@ mod tests {
                 forwards: vec![],
                 vnc: false,
                 cdrom: None,
+                machine: images::Os::Linux,
             },
             pid: 0,
             qmp,

@@ -11,6 +11,7 @@ use serde_json::Value;
 use stallo::api::{self, Envelope, ExecResult, ImageInfo, NewResult, Request, Via, VmInfo};
 use stallo::config::NetProfile;
 use stallo::host::HostInfo;
+use stallo::images::{Kind, Os};
 use stallo::snapshot::{Restored, Snapshot, Taken};
 
 #[derive(Parser)]
@@ -40,10 +41,12 @@ enum Cmd {
         /// [default: 2]
         #[arg(long)]
         cpus: Option<u32>,
-        /// Memory, e.g. 2G or 1536M [default: 2G; 4G for an installer ISO].
+        /// Memory, e.g. 2G or 1536M [default: 2G; 4G for an installer ISO
+        /// or Windows].
         #[arg(long, value_parser = parse_mib)]
         mem: Option<u64>,
-        /// Disk size, e.g. 20G [default: 20G; 32G for an installer ISO].
+        /// Disk size, e.g. 20G [default: 20G; 32G for an installer ISO;
+        /// 64G for Windows].
         #[arg(long, value_parser = parse_gib)]
         disk: Option<u64>,
         #[arg(long, value_enum, default_value = "offline")]
@@ -300,7 +303,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .iter()
                 .map(|f| stallo::net::parse_forward(f, bind))
                 .collect::<Result<_>>()?;
-            let (def_cpus, def_mem, def_disk) = new_defaults(&image);
+            let (def_cpus, def_mem, def_disk) = catalog_defaults(&image);
             let v = call(Request::New {
                 vcpus: cpus.unwrap_or(def_cpus),
                 memory_mib: mem.unwrap_or(def_mem),
@@ -897,13 +900,21 @@ fn snaps_table(list: &[Snapshot], now: u64) -> String {
     out
 }
 
-/// `stallo new`'s (vcpus, memory MiB, disk GiB) for `image`: a desktop
-/// installed from an ISO needs more than a cloud image.
-fn new_defaults(image: &str) -> (u32, u64, u64) {
-    match stallo::images::find(image).map(|e| e.kind) {
-        Ok(stallo::images::Kind::Iso) => (2, 4096, 32),
+/// `stallo new`'s (vcpus, memory MiB, disk GiB) for an image of `kind` and
+/// `os` (`None`: unknown, as in `ImageInfo`): a desktop installed from an
+/// ISO needs more than a cloud image, and Windows more still.
+fn new_defaults(kind: Option<Kind>, os: Option<Os>) -> (u32, u64, u64) {
+    match (kind, os) {
+        (_, Some(Os::Windows)) => stallo::config::WINDOWS_MIN,
+        (Some(Kind::Iso), _) => (2, 4096, 32),
         _ => (2, 2048, 20),
     }
+}
+
+/// [`new_defaults`] for a catalog image id.
+fn catalog_defaults(image: &str) -> (u32, u64, u64) {
+    let entry = stallo::images::find(image).ok();
+    new_defaults(entry.as_ref().map(|e| e.kind), entry.map(|e| e.os))
 }
 
 fn images_table(images: &[ImageInfo]) -> String {
@@ -1123,11 +1134,15 @@ mod tests {
 
     #[test]
     fn defaults_per_image_kind() {
-        assert_eq!(new_defaults("ubuntu-26.04"), (2, 2048, 20));
-        assert_eq!(new_defaults("fedora-44-workstation"), (2, 4096, 32));
-        assert_eq!(new_defaults("ubuntu-26.04-desktop"), (2, 4096, 32));
+        assert_eq!(catalog_defaults("ubuntu-26.04"), (2, 2048, 20));
+        assert_eq!(catalog_defaults("fedora-44-workstation"), (2, 4096, 32));
+        assert_eq!(catalog_defaults("ubuntu-26.04-desktop"), (2, 4096, 32));
         // An image only a newer daemon knows: the cloud defaults.
-        assert_eq!(new_defaults("other"), (2, 2048, 20));
+        assert_eq!(catalog_defaults("other"), (2, 2048, 20));
+        // Windows: its minimums, from an ISO or not.
+        for kind in [Some(Kind::Iso), None] {
+            assert_eq!(new_defaults(kind, Some(Os::Windows)), (2, 4096, 64));
+        }
     }
 
     #[test]
