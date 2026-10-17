@@ -153,6 +153,10 @@ enum Cmd {
         /// Memory, e.g. 4G or 1536M (the VM must be stopped).
         #[arg(long, value_parser = parse_mib, group = "change")]
         mem: Option<u64>,
+        /// Network profile of a VM made from an installer ISO (the VM must
+        /// be stopped).
+        #[arg(long, value_enum, group = "change")]
+        net: Option<Net>,
         /// Empty the CD-ROM drive of a VM made from an installer ISO
         /// (`eject`), or put a pulled ISO in it (its image id).
         #[arg(long, value_name = "eject|ISO", group = "change")]
@@ -247,6 +251,15 @@ enum Net {
     Internet,
 }
 
+impl From<Net> for NetProfile {
+    fn from(net: Net) -> Self {
+        match net {
+            Net::Offline => Self::Offline,
+            Net::Internet => Self::Internet,
+        }
+    }
+}
+
 /// Exit code for errors of stallo itself (daemon unreachable, no such VM,
 /// timeout...), so they differ from a guest command's own exit code.
 const STALLO_ERROR: u8 = 125;
@@ -318,10 +331,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             no_wait,
             vnc,
         } => {
-            let net = match net {
-                Net::Offline => NetProfile::Offline,
-                Net::Internet => NetProfile::Internet,
-            };
+            let net = net.into();
             let forwards = forwards
                 .iter()
                 .map(|f| stallo::net::parse_forward(f, bind))
@@ -504,6 +514,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             vnc,
             cpus,
             mem,
+            net,
             cdrom,
         } => {
             // First, so a running VM is refused before VNC changes.
@@ -522,6 +533,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 None
             };
+            let mut net_result = None;
+            if let Some(net) = net {
+                let v = call(Request::SetNet {
+                    name: vm.clone(),
+                    net: net.into(),
+                })
+                .await
+                .map_err(|e| match resources {
+                    Some(_) => e.context(format!(
+                        "the CPU/memory change of {vm} was applied, the network change was not"
+                    )),
+                    None => e,
+                })?;
+                if !json {
+                    let info: VmInfo = serde_json::from_value(v.clone())?;
+                    println!("{vm}  {}", summary(&info));
+                }
+                net_result = Some(v);
+            }
             let mut vnc_result = None;
             if let Some(vnc) = vnc {
                 let on = matches!(vnc, OnOff::On);
@@ -530,11 +560,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     on,
                 })
                 .await
-                .map_err(|e| match resources {
-                    Some(_) => e.context(format!(
-                        "the CPU/memory change of {vm} was applied, VNC was not"
+                .map_err(|e| match (&resources, &net_result) {
+                    (None, None) => e,
+                    _ => e.context(format!(
+                        "the other changes of {vm} were applied, VNC was not"
                     )),
-                    None => e,
                 })?;
                 if !json {
                     let when = if v["running"] == true {
@@ -557,8 +587,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     iso: iso.clone(),
                 })
                 .await
-                .map_err(|e| match (&resources, &vnc_result) {
-                    (None, None) => e,
+                .map_err(|e| match (&resources, &net_result, &vnc_result) {
+                    (None, None, None) => e,
                     _ => e.context(format!(
                         "the other changes of {vm} were applied, the CD-ROM change was not"
                     )),
@@ -579,6 +609,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if json {
                 print_json(&serde_json::json!({
                     "resources": resources,
+                    "net": net_result,
                     "vnc": vnc_result,
                     "cdrom": cdrom_result,
                 }));
@@ -1469,6 +1500,15 @@ mod tests {
             } if c == "eject"
         ));
         assert!(set(&["--cdrom", "fedora-44-workstation"]).is_ok());
+        let c = set(&["--net", "internet"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                net: Some(Net::Internet),
+                ..
+            }
+        ));
+        assert!(set(&["--net", "lan"]).is_err());
         assert!(set(&["--cdrom"]).is_err());
         assert!(set(&[]).is_err(), "at least one setting");
         assert!(set(&["--mem", "2T"]).is_err());

@@ -581,6 +581,10 @@ async fn dispatch(
             let cfg = m.set_resources(&name, vcpus, memory_mib).await?;
             json!(info(m, &cfg).await)
         }
+        Request::SetNet { name, net } => {
+            let cfg = m.set_net(&name, net).await?;
+            json!(info(m, &cfg).await)
+        }
         Request::Resume { name } => {
             m.resume(&name).await?;
             Value::Null

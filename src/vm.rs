@@ -1100,13 +1100,7 @@ impl Manager {
         cfg.memory_mib = memory_mib.unwrap_or(cfg.memory_mib);
         cfg.validate()?;
         cfg.check_min_size()?;
-        let ram: Vec<String> = self
-            .list_snapshots(name)
-            .await?
-            .into_iter()
-            .filter(|s| s.ram_bytes > 0)
-            .map(|s| s.name)
-            .collect();
+        let ram = self.ram_snapshots(name).await?;
         ensure!(
             ram.is_empty(),
             "{name} has RAM snapshots ({}) that only restore at its current size; delete them first: stallo snap {name} --delete <name>",
@@ -1120,6 +1114,59 @@ impl Manager {
         }
         cfg.save(&self.paths.vm_dir(name))?;
         Ok(cfg)
+    }
+
+    /// Changes a stopped VM's network profile, with the checks of `new`.
+    /// Only for VMs made from an installer ISO: a cloud image's seed fixed
+    /// the guest's network config at create (`seed::render`). Refused while
+    /// the VM has RAM snapshots: their device state holds the network card
+    /// (or its absence), so they only restore with the current profile.
+    pub async fn set_net(&self, name: &str, net: NetProfile) -> Result<VmConfig> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        ensure!(
+            self.running(name).is_none(),
+            "{name} is running; stop it first to change its network: stallo stop {name}"
+        );
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        ensure!(
+            images::is_iso(&cfg.image).unwrap_or(false),
+            "{name} is made from cloud image {}, whose seed fixed the guest's network at `stallo new`; create a new VM with the profile instead",
+            cfg.image
+        );
+        if cfg.net == net {
+            return Ok(cfg);
+        }
+        ensure!(
+            net == NetProfile::Internet || cfg.forwards.is_empty(),
+            "{name} has port forwards, which need the internet profile; remove the port forwards first"
+        );
+        cfg.net = net;
+        cfg.validate()?;
+        self.check_net(&cfg)?;
+        let ram = self.ram_snapshots(name).await?;
+        ensure!(
+            ram.is_empty(),
+            "{name} has RAM snapshots ({}) that only restore with its current network; delete them first: stallo snap {name} --delete <name>",
+            ram.join(", ")
+        );
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok(cfg)
+    }
+
+    /// The names of a VM's RAM snapshots (lifecycle lock held).
+    async fn ram_snapshots(&self, name: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_snapshots(name)
+            .await?
+            .into_iter()
+            .filter(|s| s.ram_bytes > 0)
+            .map(|s| s.name)
+            .collect())
     }
 
     /// Continues a paused VM, unless the disk is still below the floor.
@@ -2794,6 +2841,130 @@ mod tests {
         assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
         let e = err(m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await);
         assert!(e.contains("RAM snapshots (s1)"), "{e}");
+    }
+
+    /// `set_net`: stopped VMs from an ISO only, no run clones, the network
+    /// checks of `new`, no forwards offline, no RAM snapshots; saved in
+    /// vm.toml.
+    #[tokio::test]
+    async fn net_setting() {
+        use crate::config::{DaemonConfig, Mode};
+        let manager = |mode| {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap();
+            for d in ["data", "run", "cg"] {
+                fs::create_dir(root.join(d)).unwrap();
+            }
+            let paths = Paths::new(root.join("data"), root.join("run"))
+                .unwrap()
+                .prepare()
+                .unwrap();
+            let config = DaemonConfig::default();
+            (
+                tmp,
+                Manager::new(paths, config, Cgroups::at(root.join("cg")), mode),
+            )
+        };
+        let (_t, m) = manager(Mode::Dev);
+        let (_t2, prod) = manager(Mode::Production);
+        let (_d, running, _) = fake_vm("paused", None).await;
+        let cloud = running.config.clone();
+        let win = VmConfig {
+            name: "win".into(),
+            image: "local-win11".into(),
+            machine: images::Os::Windows,
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            net: NetProfile::Internet,
+            ..cloud.clone()
+        };
+        let fwd = VmConfig {
+            name: "fwd".into(),
+            forwards: vec![crate::net::parse_forward("8080:80", [127, 0, 0, 1].into()).unwrap()],
+            ..win.clone()
+        };
+        let off = VmConfig {
+            name: "off".into(),
+            net: NetProfile::Offline,
+            ..win.clone()
+        };
+        let clone = VmConfig {
+            name: "run-0a1b2c3d".into(),
+            throwaway_of: Some("win".into()),
+            ..win.clone()
+        };
+        for m in [&m, &prod] {
+            m.cleanup_leftovers().await.unwrap();
+            for cfg in [&cloud, &win, &fwd, &off, &clone] {
+                let dir = m.paths.vm_dir(&cfg.name);
+                fs::create_dir(&dir).unwrap();
+                cfg.save(&dir).unwrap();
+            }
+        }
+        let err = |r: Result<VmConfig>| r.unwrap_err().to_string();
+        use NetProfile::{Internet, Offline};
+
+        assert!(err(m.set_net("nope", Offline).await).contains("nope"));
+        let e = err(m.set_net("dev", Offline).await);
+        assert!(e.contains("made from cloud image ubuntu-26.04"), "{e}");
+        let e = err(m.set_net("run-0a1b2c3d", Offline).await);
+        assert!(e.contains("clone"), "{e}");
+        let e = err(m.set_net("fwd", Offline).await);
+        assert!(e.contains("remove the port forwards first"), "{e}");
+        assert_eq!(m.load("fwd").unwrap(), fwd, "nothing saved");
+        // Dev mode always refuses the internet profile; production mode
+        // without the host's table (as here) too.
+        let e = err(m.set_net("off", Internet).await);
+        assert!(e.contains("dev mode"), "{e}");
+        let e = err(prod.set_net("off", Internet).await);
+        assert!(e.contains("isolation unavailable"), "{e}");
+        assert_eq!(m.load("off").unwrap(), off, "nothing saved");
+        // Unchanged: nothing to check.
+        assert_eq!(m.set_net("win", Internet).await.unwrap(), win);
+        // Paused counts as running.
+        m.running
+            .lock()
+            .unwrap()
+            .insert("win".into(), Arc::new(running));
+        let e = err(m.set_net("win", Offline).await);
+        assert!(e.contains("win is running; stop it first"), "{e}");
+        m.running.lock().unwrap().clear();
+        assert_eq!(m.load("win").unwrap(), win, "nothing saved");
+
+        // Below: snapshots are listed with a confined qemu-img.
+        if !confine::available() {
+            return;
+        }
+        let dir = m.paths.vm_dir("win");
+        for (file, size) in [(qemu::DISK, "1G"), (qemu::VARS, "1M")] {
+            let ok = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(dir.join(file))
+                .arg(size)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        // A RAM snapshot holds the network card's device state.
+        crate::snapshot::create_offline(&dir, "s1").await.unwrap();
+        ensure_private_dir(&dir.join(qemu::STATES)).unwrap();
+        fs::write(crate::snapshot::state_file(&dir, "s1"), b"ram").unwrap();
+        let e = err(m.set_net("win", Offline).await);
+        assert!(e.contains("RAM snapshots (s1)"), "{e}");
+        assert_eq!(m.load("win").unwrap(), win, "nothing saved");
+        fs::remove_file(crate::snapshot::state_file(&dir, "s1")).unwrap();
+        // A disk-only snapshot does not hold it.
+        let cfg = m.set_net("win", Offline).await.unwrap();
+        assert_eq!(
+            cfg,
+            VmConfig {
+                net: Offline,
+                ..win.clone()
+            }
+        );
+        assert_eq!(m.load("win").unwrap(), cfg, "vm.toml round-trip");
     }
 
     /// An import is refused at once while a pull, removal, VM creation or

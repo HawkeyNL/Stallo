@@ -182,6 +182,15 @@ pub fn describe(r: &Request) -> Described<'_> {
             ],
             None,
         ),
+        Request::SetNet { name, net } => (
+            "set_net",
+            Some(name),
+            vec![(
+                "internet",
+                u64::from(*net == crate::config::NetProfile::Internet),
+            )],
+            None,
+        ),
         Request::Host => ("host", None, vec![], None),
         Request::Images => ("images", None, vec![], None),
         Request::Pull { .. } => ("pull", None, vec![], None),
@@ -410,6 +419,15 @@ mod tests {
         let (op, vm, args, argv0) = describe(&resize);
         assert_eq!((op, vm, argv0), ("set_resources", Some("dev"), None));
         assert_eq!(args, [("memory_mib", 0), ("vcpus", 4)]);
+        let net = Request::SetNet {
+            name: "dev".into(),
+            net: crate::config::NetProfile::Internet,
+        };
+        assert_eq!(
+            describe(&net),
+            ("set_net", Some("dev"), vec![("internet", 1)], None)
+        );
+        assert!(entry(&net).contains(r#""op":"set_net","args":{"internet":1}"#));
         let mut new = Request::New {
             name: "dev".into(),
             image: "arch".into(),

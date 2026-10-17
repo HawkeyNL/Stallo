@@ -521,7 +521,9 @@ reference.
 **Not verified yet.** The lab above used Linux guests. Windows guests and
 VMs from any imported ISO take the `internet` profile with the same passt
 flags and the same table. So do VMs from a catalog ISO. This checklist is
-for the owner's first Windows VM on a production install.
+for the owner's first Windows VM on a production install. A VM installed
+offline gets the profile later with `stallo set <vm> --net internet`
+(stopped, no RAM snapshots); the same checks apply.
 
 **Why nothing changes for the isolation:**
 - Everything is enforced on the host. passt turns the guest's frames into
