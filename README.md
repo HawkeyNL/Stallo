@@ -352,9 +352,11 @@ its publisher lists. It then works like a pulled ISO: `stallo new`,
 `stallo set --cdrom` and `stallo images rm`. A Linux ISO boots without
 Secure Boot, a Windows ISO with it.
 
-A VM from an installer ISO (catalog or imported) may use `--net internet`
-(it cannot be changed after `stallo new`). Windows gets an e1000e network
-card, which it has a driver for. That emulated card is QEMU code the guest
+A VM from an installer ISO (catalog or imported) may use `--net internet`.
+Humans can change its profile while it is stopped and has no RAM
+snapshots: `stallo set <vm> --net internet` (or `offline`). A VM from a
+cloud image keeps the profile it was created with. Windows gets an e1000e
+network card, which it has a driver for. That emulated card is QEMU code the guest
 can reach, a larger surface than virtio-net; QEMU's seccomp filter, Landlock
 rules and AppArmor profile contain it. The isolation is the same as for
 every `internet` VM and is enforced on the host only; the checks to run
@@ -377,6 +379,10 @@ website and use your own licence.
    ```sh
    stallo new win --image local-win11-25h2-english-x64 --net internet
    ```
+
+   An offline install makes a local account easy (step 5). Afterwards,
+   stop the VM and give it internet, for example to install a browser:
+   `stallo set win --net internet` (production mode).
 
 3. Open the screen. You need not catch "Press any key to boot from CD or
    DVD": while the ISO is in the drive, the daemon presses Enter for you

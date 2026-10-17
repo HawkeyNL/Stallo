@@ -575,7 +575,9 @@ reference.
 **Not verified yet.** The lab above used Linux guests. Windows guests and
 VMs from any imported ISO take the `internet` profile with the same passt
 flags and the same table. So do VMs from a catalog ISO. This checklist is
-for the owner's first Windows VM on a production install.
+for the owner's first Windows VM on a production install. A VM installed
+offline gets the profile later with `stallo set <vm> --net internet`
+(stopped, no RAM snapshots); the same checks apply.
 
 **Why nothing changes for the isolation:**
 - Everything is enforced on the host. passt turns the guest's frames into
@@ -622,7 +624,8 @@ for the owner's first Windows VM on a production install.
    loopback: `python3 -m http.server 8000 --bind 127.0.0.1` in a
    terminal (loopback only; stop it with Ctrl+C afterwards).
 6. Create the VM: `stallo new win --image local-<id> --net internet`.
-   The profile is fixed at `new`; an offline VM must be made again.
+   An offline VM gets it with `stallo set <vm> --net internet` (stopped
+   VM, no RAM snapshots).
 
 **Inside Windows**, in PowerShell (during Setup: Shift+F10, then
 `powershell`):

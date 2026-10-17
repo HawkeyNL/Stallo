@@ -207,6 +207,11 @@ pub enum Request {
         vcpus: Option<u32>,
         memory_mib: Option<u64>,
     },
+    /// Changes a stopped VM's network profile (humans only).
+    SetNet {
+        name: String,
+        net: NetProfile,
+    },
     Host,
     Images,
     Pull {
@@ -407,6 +412,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         // Growing a VM takes host CPU and memory budget that a human sized;
         // agent control of a small VM must not let an agent claim the host.
         | SetResources { .. }
+        // Network access is a human's choice, as at `new`.
+        | SetNet { .. }
         | SnapshotDelete { .. } => Gate::Closed,
         Start { name, .. }
         | Stop { name, .. }
@@ -590,6 +597,9 @@ mod tests {
         let resize = r#"{"op":"set_resources","name":"dev","vcpus":4,"memory_mib":null}"#;
         let r: Request = serde_json::from_str(resize).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), resize);
+        let net = r#"{"op":"set_net","name":"dev","net":"internet"}"#;
+        let r: Request = serde_json::from_str(net).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), net);
         let eject = r#"{"op":"set_cdrom","name":"dev","iso":null}"#;
         let r: Request = serde_json::from_str(eject).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), eject);
@@ -811,6 +821,13 @@ mod tests {
         };
         assert!(err(Via::Mcp, &resize, true, on).contains("only available to humans"));
         assert!(check_agent(Via::Cli, &resize, false, off).is_ok());
+        let net = Request::SetNet {
+            name: "dev".into(),
+            net: NetProfile::Internet,
+        };
+        assert_eq!(agent_gate(&net), Gate::Closed);
+        assert!(err(Via::Mcp, &net, true, on).contains("only available to humans"));
+        assert!(check_agent(Via::Cli, &net, false, off).is_ok());
         let closed = Request::SetAgent {
             name: "dev".into(),
             on: true,
