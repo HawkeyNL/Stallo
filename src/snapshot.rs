@@ -654,20 +654,15 @@ impl Manager {
                     snap.name
                 );
                 // The TPM state is built first and swapped in after the
-                // images: nothing of it changes unless they did.
+                // images. If they fail, `tpm.new` stays and blocks starts
+                // until a restore succeeds: the images may be half-reverted.
                 if windows {
                     tpm::prepare_copy(&vm_dir, &snap.name)?;
                 }
-                let applied =
-                    apply_offline(&vm_dir, &snap.name, &names_offline(&vm_dir).await?).await;
+                apply_offline(&vm_dir, &snap.name, &names_offline(&vm_dir).await?).await?;
                 if windows {
-                    match &applied {
-                        Ok(()) => tpm::swap_in(&vm_dir)
-                            .context("the restore stopped halfway; restore again")?,
-                        Err(_) => tpm::discard_new(&vm_dir)?,
-                    }
+                    tpm::swap_in(&vm_dir).context("the restore stopped halfway; restore again")?;
                 }
-                applied?;
                 None
             }
         };
@@ -731,6 +726,8 @@ impl Manager {
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
         let vm_dir = self.paths.vm_dir(name);
+        // The snapshot an unfinished TPM restore needs must stay.
+        tpm::check_no_restore_pending(&vm_dir)?;
         let file = state_file(&vm_dir, tag);
         // A RAM image without tags (a delete that failed halfway) still goes.
         let only_file = std::fs::symlink_metadata(&file).is_ok();
@@ -1181,6 +1178,86 @@ mod tests {
             "1G",
         ]);
         qemu_img_create(&[dir.join(qemu::VARS).to_str().unwrap(), "1M"]);
+    }
+
+    /// A Windows VM's disk-only snapshots carry its TPM state. A restore
+    /// whose images fail keeps the prepared TPM state and blocks starts and
+    /// snapshot deletes, naming the snapshot, until a restore succeeds.
+    #[tokio::test]
+    async fn windows_disk_snapshots_and_failed_restores() {
+        if !confine::available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = crate::paths::Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        // A test's temporary directory may be on a small tmpfs.
+        let mut config = crate::config::DaemonConfig::default();
+        config.host.disk_floor_gib = 0;
+        let m = Manager::new(
+            paths,
+            config,
+            crate::cgroup::Cgroups::at(root.join("cg")),
+            crate::config::Mode::Dev,
+        );
+        m.cleanup_leftovers().await.unwrap();
+        let dir = m.paths.vm_dir("win");
+        std::fs::create_dir(&dir).unwrap();
+        offline_vm(&dir);
+        crate::config::VmConfig {
+            name: "win".into(),
+            uuid: "4f1c2b9e-0d3a-4c5e-8f7a-1b2c3d4e5f60".into(),
+            image: "local-win11".into(),
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            net: crate::config::NetProfile::Offline,
+            agent_control: false,
+            throwaway_of: None,
+            forwards: vec![],
+            vnc: true,
+            cdrom: None,
+            machine: crate::images::Os::Windows,
+        }
+        .save(&dir)
+        .unwrap();
+        let state = dir.join("tpm/tpm2-00.permall");
+        crate::paths::ensure_private_dir(&dir.join("tpm")).unwrap();
+        std::fs::write(&state, b"d1").unwrap();
+        assert!(!m.snapshot("win", Some("d1")).await.unwrap().ram);
+        std::fs::write(&state, b"d2").unwrap();
+        m.snapshot("win", Some("d2")).await.unwrap();
+        std::fs::write(&state, b"now").unwrap();
+
+        // d1 loses its tag on the variables: its restore fails in the images.
+        let out = std::process::Command::new("qemu-img")
+            .args(["snapshot", "-d", "d1"])
+            .arg(dir.join(qemu::VARS))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = m.restore("win", Some("d1")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("incomplete"), "{err:#}");
+        assert_eq!(std::fs::read(&state).unwrap(), b"now");
+        let blocked = |e: anyhow::Error| e.to_string().contains("restore snapshot d1 again");
+        assert!(blocked(m.start("win").await.err().unwrap()));
+        assert!(blocked(m.delete_snapshot("win", "d2").await.unwrap_err()));
+        assert!(blocked(m.delete_snapshot("win", "d1").await.unwrap_err()));
+
+        // A restore that succeeds clears it and brings that TPM state back.
+        let r = m.restore("win", Some("d2")).await.unwrap();
+        assert_eq!(r.state, "stopped");
+        assert_eq!(std::fs::read(&state).unwrap(), b"d2");
+        tpm::check_no_restore_pending(&dir).unwrap();
+        assert!(!dir.join("tpm/.tag").exists());
+        m.delete_snapshot("win", "d1").await.unwrap();
+        assert!(!tpm::has_copy(&dir, "d1") && tpm::has_copy(&dir, "d2"));
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use tokio::process::{Child, Command};
 
 use crate::config::{Mode, validate_tag};
@@ -134,6 +134,8 @@ const STATE_FILES: [&str; 3] = [
 ];
 /// Where a restore builds the TPM state before swapping it in.
 const NEW: &str = "tpm.new";
+/// In `tpm.new/`: the snapshot being restored.
+const TAG: &str = ".tag";
 
 /// Copies the TPM state for disk-only snapshot `tag` of a stopped VM. The
 /// state is a few KiB.
@@ -164,34 +166,45 @@ pub fn prepare_copy(vm_dir: &Path, tag: &str) -> Result<()> {
     let new = vm_dir.join(NEW);
     safe_remove(vm_dir, &new)?;
     ensure_private_dir(&new)?;
+    fs::write(new.join(TAG), tag)?;
     copy_files(&copy_dir(vm_dir, tag), &new).context("cannot copy the TPM state back")
 }
 
 /// Second half: exchanges `tpm.new/` and `tpm/` in one atomic rename, then
-/// removes the old state.
+/// removes the old state. Once exchanged the state is right: a cleanup
+/// that fails only leaves files behind.
 pub fn swap_in(vm_dir: &Path) -> Result<()> {
     let (tpm, new) = (vm_dir.join(DIR), vm_dir.join(NEW));
     ensure_private_dir(&tpm)?;
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, &new, CWD, &tpm, RenameFlags::EXCHANGE)
         .context("cannot swap in the TPM state")?;
-    safe_remove(vm_dir, &new)?;
+    let cleanup = fs::remove_file(tpm.join(TAG))
+        .map_err(anyhow::Error::from)
+        .and_then(|()| Ok(safe_remove(vm_dir, &new)?));
+    if let Err(e) = cleanup {
+        tracing::warn!(
+            "{}: cannot remove the old TPM state: {e:#}",
+            vm_dir.display()
+        );
+    }
     Ok(())
 }
 
-/// Drops a `tpm.new/` that will not be swapped in.
-pub fn discard_new(vm_dir: &Path) -> Result<()> {
-    safe_remove(vm_dir, &vm_dir.join(NEW))?;
-    Ok(())
-}
-
-/// Refuses a start while a TPM restore is unfinished.
+/// Refuses a start or a snapshot delete while a TPM restore is unfinished
+/// (a restore failed, or the daemon stopped in the middle of one).
 pub fn check_no_restore_pending(vm_dir: &Path) -> Result<()> {
-    ensure!(
-        fs::symlink_metadata(vm_dir.join(NEW)).is_err(),
-        "a TPM state restore did not finish; restore the snapshot again"
-    );
-    Ok(())
+    let new = vm_dir.join(NEW);
+    if fs::symlink_metadata(&new).is_err() {
+        return Ok(());
+    }
+    // The tag is only shown when it is one Stallo could have written.
+    match fs::read_to_string(new.join(TAG)) {
+        Ok(tag) if validate_tag(&tag).is_ok() => {
+            bail!("a TPM state restore did not finish; restore snapshot {tag} again to finish")
+        }
+        _ => bail!("a TPM state restore did not finish; restore the snapshot again to finish"),
+    }
 }
 
 /// Removes the TPM copy of snapshot `tag`, if any.
@@ -276,17 +289,15 @@ mod tests {
 
         fs::write(tpm.join("tpm2-00.permall"), b"new").unwrap();
         prepare_copy(&vm, "s1").unwrap();
-        // Nothing changed yet, and the VM may not start.
+        // Nothing changed yet, and the VM may not start: it names the
+        // snapshot to restore.
         assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"new");
-        assert!(check_no_restore_pending(&vm).is_err());
+        let err = check_no_restore_pending(&vm).unwrap_err().to_string();
+        assert!(err.contains("restore snapshot s1 again"), "{err}");
         swap_in(&vm).unwrap();
         check_no_restore_pending(&vm).unwrap();
         assert_eq!(names(&tpm), ["tpm2-00.permall"]);
         assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"old");
-        // A prepared restore can be dropped instead.
-        prepare_copy(&vm, "s1").unwrap();
-        discard_new(&vm).unwrap();
-        check_no_restore_pending(&vm).unwrap();
         // The copy stays for the next restore, until the snapshot goes.
         assert!(has_copy(&vm, "s1"));
         remove_copy(&vm, "s1").unwrap();
