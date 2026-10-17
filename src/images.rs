@@ -722,16 +722,56 @@ impl Partial {
 
 impl Drop for Partial {
     fn drop(&mut self) {
+        static TRASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(work) = self.work.take() else {
             return;
         };
         let root = std::mem::take(&mut self.root);
+        // Renamed at once, so an import of the same id that starts now
+        // finds no partial directory; the slow delete happens later.
+        let n = TRASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = work.file_name().unwrap_or_default().to_string_lossy();
+        let id = id.trim_start_matches(".partial-");
+        let trash = root.join(format!("{TRASH_PREFIX}{id}-{}-{n}", std::process::id()));
+        match fs::rename(&work, &trash) {
+            Ok(()) => {}
+            // Dropped before the directory was made.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!("cannot move {} aside: {e}", work.display());
+                return;
+            }
+        }
         // Not awaited: nothing is left to wait for it.
         match tokio::runtime::Handle::try_current() {
-            Ok(rt) => drop(rt.spawn_blocking(move || remove_partial(&root, &work))),
-            Err(_) => remove_partial(&root, &work),
+            Ok(rt) => drop(rt.spawn_blocking(move || remove_partial(&root, &trash))),
+            Err(_) => remove_partial(&root, &trash),
         }
     }
+}
+
+/// Partial directories of dropped imports, waiting to be deleted.
+const TRASH_PREFIX: &str = ".trash-";
+
+/// Removes what imports left when the daemon stopped in the middle of
+/// one: `.partial-local-*` and `.trash-*` in the images directory. For
+/// daemon start, before the API serves. Partial pulls stay: they resume.
+pub fn sweep_imports(paths: &Paths) -> Result<()> {
+    let root = paths.images_dir();
+    let Ok(dir) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    let partial = format!(".partial-{LOCAL_PREFIX}");
+    for entry in dir {
+        let name = entry?.file_name();
+        if name
+            .to_str()
+            .is_some_and(|n| n.starts_with(&partial) || n.starts_with(TRASH_PREFIX))
+        {
+            safe_remove(&root, &root.join(name))?;
+        }
+    }
+    Ok(())
 }
 
 fn remove_partial(root: &Path, work: &Path) {
@@ -1876,14 +1916,40 @@ mod tests {
                 }
             } => {}
         }
-        // Removed off the async workers, without waiting for it.
+        // Moved aside at once: an import of the same id right after works.
+        import(&paths, "local-x", Os::Linux, "", 0x9000, &mut &data[..])
+            .await
+            .unwrap();
+        // The rest is removed off the async workers, without waiting.
         for _ in 0..200 {
-            if image_files(&paths).is_empty() {
+            if image_files(&paths) == ["local-x.iso", "local-x.toml"] {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("left behind: {:?}", image_files(&paths));
+    }
+
+    /// At daemon start, imports cut off by a stop go; partial pulls stay.
+    #[test]
+    fn sweep_cut_off_imports() {
+        let (_d, paths) = import_paths();
+        sweep_imports(&paths).unwrap();
+        let root = paths.images_dir();
+        for d in [
+            ".partial-local-x",
+            ".trash-local-y-1-0",
+            ".partial-ubuntu-26.04",
+        ] {
+            ensure_private_dir(&root.join(d)).unwrap();
+            fs::write(root.join(d).join("iso.part"), b"x").unwrap();
+        }
+        fs::write(iso_path(&paths, "local-z"), b"iso").unwrap();
+        sweep_imports(&paths).unwrap();
+        assert_eq!(
+            image_files(&paths),
+            [".partial-ubuntu-26.04", "local-z.iso"]
+        );
     }
 
     /// A client that stalls, or trickles, is cut off and its partial file
