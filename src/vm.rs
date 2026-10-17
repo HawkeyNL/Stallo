@@ -165,7 +165,7 @@ pub struct Manager {
     /// VM creation shares it while it builds a disk on an image. Lock
     /// order: a VM's lifecycle lock, then this one. Pulls and removals
     /// take no VM lock.
-    images: tokio::sync::RwLock<()>,
+    pub(crate) images: tokio::sync::RwLock<()>,
     /// Serialises admission: checking what fits and starting it is atomic.
     admission: tokio::sync::Mutex<()>,
     /// VMs whose disk a `stallo run` clone uses; their lifecycle lock is
@@ -349,7 +349,7 @@ impl Manager {
             let name = name.to_string_lossy();
             let cfg = VmConfig::load(&dir).with_context(|| {
                 format!(
-                    "cannot tell whether {name} uses image {id}; remove it first: stallo rm {name}"
+                    "cannot tell whether {name} uses image {id}; if a `stallo run` is in progress, try again when it ends, otherwise remove it first: stallo rm {name}"
                 )
             })?;
             let by_config = cfg.image == id || cfg.cdrom.as_deref() == Some(id);
@@ -889,7 +889,8 @@ impl Manager {
 
     /// Puts pulled installer ISO `iso` into the CD-ROM drive of a VM made
     /// from an ISO, or empties the drive (`None`); it takes effect at the
-    /// next start.
+    /// next start. A RAM snapshot restored later runs with the drive as it
+    /// is then, as if the disc had been swapped while the guest ran.
     pub async fn set_cdrom(&self, name: &str, iso: Option<&str>) -> Result<()> {
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
@@ -902,8 +903,12 @@ impl Manager {
             images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso),
             "{name} has no CD-ROM drive; only VMs made from an installer ISO have one"
         );
-        // Held until vm.toml names the ISO, so `images rm` sees it.
-        let _image = self.images.read().await;
+        // Held until vm.toml names the ISO, so `images rm` sees it. Not
+        // waited for: a pull holds it for its whole download, and the VM's
+        // lock (stop, start) must not wait that long.
+        let _image = self.images.try_read().map_err(|_| {
+            anyhow::anyhow!("an image pull or removal is in progress; try again when it ends")
+        })?;
         if let Some(id) = iso {
             let entry = images::find(id)?;
             ensure!(

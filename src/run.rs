@@ -321,7 +321,7 @@ mod tests {
             let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
             assert!(
                 err.to_string()
-                    .contains("cannot tell whether half uses image ubuntu-26.04; remove it first: stallo rm half"),
+                    .contains("cannot tell whether half uses image ubuntu-26.04; if a `stallo run` is in progress"),
                 "{err}"
             );
         }
@@ -463,6 +463,11 @@ mod tests {
             let e = err(m.set_cdrom(vm, iso).await);
             assert!(e.contains(want), "{vm} {iso:?}: {e}");
         }
+        // A pull or removal holds the images lock: refused, not waited for.
+        let held = m.images.write().await;
+        let e = err(m.set_cdrom("desk", None).await);
+        assert!(e.contains("image pull or removal is in progress"), "{e}");
+        drop(held);
         assert_eq!(m.load("desk").unwrap(), desk, "nothing saved");
         assert_eq!(m.load("dev").unwrap(), vm("dev", None));
     }
