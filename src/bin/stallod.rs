@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
@@ -221,14 +221,10 @@ async fn connection(
     if !got {
         return Ok(());
     }
-    // The client sends nothing after its request: end of stream means it
-    // went away (only `run` acts on that; everything else completes).
-    // Clients must therefore not half-close while they wait.
-    let gone = async move {
-        let _ = tokio::io::copy(&mut r, &mut tokio::io::sink()).await;
-    };
+    // What follows the request line: an import's body, and otherwise
+    // nothing (see `dispatch`).
     let (response, audit) = match serde_json::from_slice::<Envelope>(&line) {
-        Ok(env) => handle(manager, env, &cred, gone).await,
+        Ok(env) => handle(manager, env, &cred, r).await,
         Err(e) => {
             tracing::info!(
                 "invalid request from uid {} pid {:?}",
@@ -264,12 +260,13 @@ async fn connection(
 /// Runs one API request and logs it (operation, caller, result, duration;
 /// never arguments). Returns the response and the open audit log with the
 /// entry to write (the caller adds the response size). An agent call that
-/// cannot be audited is refused.
+/// cannot be audited is refused. `client` is the rest of the client's
+/// stream.
 async fn handle(
     m: &Arc<Manager>,
     env: Envelope,
     peer: &UCred,
-    client_gone: impl Future<Output = ()>,
+    client: impl AsyncRead + Unpin,
 ) -> (Response, Option<(std::fs::File, audit::Entry)>) {
     let started = Instant::now();
     let (op, vm, args, argv0) = audit::describe(&env.request);
@@ -290,7 +287,7 @@ async fn handle(
         _ => match api::check_agent(env.via, &env.request, m.config.agents_can_create, |n| {
             Ok(m.load(n)?.agent_control)
         }) {
-            Ok(()) => dispatch(m, env.via, env.request, client_gone).await,
+            Ok(()) => dispatch(m, env.via, env.request, client).await,
             Err(e) => Err(e),
         },
     };
@@ -319,6 +316,7 @@ async fn handle(
             via: env.via,
             op,
             image,
+            sha256: result.as_ref().ok().and_then(|v| audit::sha256(op, v)),
             args: args.into_iter().collect(),
             argv0,
             result_bytes: 0,
@@ -342,7 +340,7 @@ async fn dispatch(
     m: &Arc<Manager>,
     via: Via,
     request: Request,
-    client_gone: impl Future<Output = ()>,
+    mut client: impl AsyncRead + Unpin,
 ) -> Result<Value> {
     Ok(match request {
         Request::New {
@@ -439,6 +437,12 @@ async fn dispatch(
             timeout_s,
         } => {
             let limit = timeout_s.map_or(EXEC_DEFAULT_TIMEOUT, Duration::from_secs);
+            // The client sends nothing after its request: end of stream
+            // means it went away. Clients must therefore not half-close
+            // while they wait.
+            let client_gone = async move {
+                let _ = tokio::io::copy(&mut client, &mut tokio::io::sink()).await;
+            };
             let out = m.run(&name, &argv, admin, limit, client_gone).await?;
             json!(ExecResult {
                 exit_code: out.exit_code,
@@ -623,6 +627,7 @@ async fn dispatch(
                         name: e.name,
                     }
                 })
+                .chain(images::local_images(&m.paths))
                 .collect::<Vec<_>>()
         ),
         Request::Pull { image } => {
@@ -632,6 +637,11 @@ async fn dispatch(
         Request::ImageRm { image } => {
             m.remove_image(&image).await?;
             Value::Null
+        }
+        // The body is the ISO; humans only (Gate::Closed).
+        Request::ImportIso { id, os, name, size } => {
+            let record = m.import_iso(&id, os, &name, size, &mut client).await?;
+            json!({"id": id, "sha256": record.sha256, "size": size})
         }
     })
 }

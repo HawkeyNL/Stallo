@@ -184,7 +184,7 @@ enum Cmd {
         #[arg(long, value_name = "FILE", requires = "http")]
         token_file: Option<PathBuf>,
     },
-    /// List images, download one or delete one.
+    /// List images, download, import or delete one.
     Images {
         #[command(subcommand)]
         action: Option<ImagesCmd>,
@@ -202,6 +202,23 @@ enum McpCmd {
 enum ImagesCmd {
     /// Download and verify an image.
     Pull { id: String },
+    /// Import an installer ISO you downloaded yourself. It is copied into
+    /// Stallo as is: nothing verifies it.
+    Import {
+        /// The ISO file (read with your own rights).
+        path: PathBuf,
+        /// What the ISO installs.
+        #[arg(long, value_enum)]
+        os: ImportOs,
+        /// The image id (`local-` is added if missing; default: from the
+        /// file name).
+        #[arg(long)]
+        id: Option<String>,
+        /// A label for `stallo images`: letters, digits, spaces, `.`, `_`
+        /// and `-` (default: the id).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Delete a cached image (refused while a VM uses it). To get a newer
     /// build of a moving image, delete it and pull it again.
     Rm {
@@ -216,6 +233,12 @@ enum ImagesCmd {
 enum OnOff {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ImportOs {
+    Windows,
+    Linux,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -617,10 +640,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             print!("{}", mcp_install(&exe, socket.as_deref(), &path)?);
         }
         Cmd::Images { action } => {
-            // Pull and rm answer null; show the catalog afterwards.
+            // Pull, import and rm: show the catalog afterwards.
             match action {
                 Some(ImagesCmd::Pull { id }) => {
                     call(Request::Pull { image: id }).await?;
+                }
+                Some(ImagesCmd::Import { path, os, id, name }) => {
+                    import(&socket, &path, os, id, name).await?;
                 }
                 Some(ImagesCmd::Rm { id, yes }) => {
                     if !yes {
@@ -918,6 +944,57 @@ fn new_defaults(kind: Option<Kind>, os: Option<Os>) -> (u32, u64, u64) {
         (Some(Kind::Iso), _) => (2, 4096, 32),
         _ => (2, 2048, 20),
     }
+}
+
+/// `stallo images import`: opens the file with the user's own rights and
+/// streams it to stallod, which never sees the path.
+async fn import(
+    socket: &std::path::Path,
+    path: &std::path::Path,
+    os: ImportOs,
+    id: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
+    use stallo::images::{self, LOCAL_PREFIX};
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let meta = file.metadata()?;
+    let size = meta.len();
+    ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    ensure!(
+        size <= images::MAX_IMPORT_BYTES,
+        "{} is larger than {} GiB",
+        path.display(),
+        images::MAX_IMPORT_BYTES >> 30
+    );
+    let id = match id {
+        Some(id) if images::is_local(&id) => id,
+        Some(id) => format!("{LOCAL_PREFIX}{id}"),
+        None => images::local_id(&path.file_stem().unwrap_or_default().to_string_lossy()),
+    };
+    let name = name.unwrap_or_else(|| id.clone());
+    let os = match os {
+        ImportOs::Windows => images::Os::Windows,
+        ImportOs::Linux => images::Os::Linux,
+    };
+    eprintln!(
+        "importing {} ({}) as {id}...",
+        path.display(),
+        mib(size >> 20)
+    );
+    let request = Request::ImportIso { id, os, name, size };
+    // `take`: a file that grows meanwhile sends `size` bytes all the same.
+    let body = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), size);
+    api::upload(
+        socket,
+        &Envelope {
+            via: Via::Cli,
+            request,
+        },
+        body,
+    )
+    .await?;
+    Ok(())
 }
 
 fn images_table(images: &[ImageInfo]) -> String {

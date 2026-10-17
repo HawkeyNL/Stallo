@@ -1,5 +1,6 @@
 //! The daemon API: one JSON request line and one JSON response line per
-//! connection, over a Unix socket. Peers are authorised by their kernel
+//! connection, over a Unix socket. `import_iso` alone has a body: the ISO's
+//! raw bytes follow its request line. Peers are authorised by their kernel
 //! credentials (`SO_PEERCRED`), never by anything they send.
 
 use std::path::Path;
@@ -7,8 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::net::unix::OwnedReadHalf;
 
 use crate::config::{NetProfile, PortForward};
 use crate::read_line;
@@ -214,6 +216,15 @@ pub enum Request {
     ImageRm {
         image: String,
     },
+    /// Imports an installer ISO (humans only): exactly `size` raw bytes
+    /// follow the request line, then the client half-closes. `id` starts
+    /// with `local-`; `name` is a label.
+    ImportIso {
+        id: String,
+        os: crate::images::Os,
+        name: String,
+        size: u64,
+    },
 }
 
 /// One response line: `{"ok":true,"data":...}` or `{"ok":false,"error":"..."}`.
@@ -386,6 +397,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         Rm { .. }
         | Pull { .. }
         | ImageRm { .. }
+        // An ISO is untrusted guest input that a human chooses.
+        | ImportIso { .. }
         | Resume { .. }
         | SetAgent { .. }
         | SetVnc { .. }
@@ -486,16 +499,53 @@ pub fn peer_groups(fd: impl std::os::fd::AsFd) -> std::io::Result<Vec<u32>> {
 
 /// Sends one request and reads the response (client side).
 pub async fn call(socket: &Path, envelope: &Envelope) -> Result<serde_json::Value> {
-    let stream = UnixStream::connect(socket).await.with_context(|| {
+    let (r, mut w) = connect(socket).await?.into_split();
+    w.write_all(&request_line(envelope)?).await?;
+    response(r).await
+}
+
+/// Sends a request with a body (`import_iso`): the request line, all of
+/// `body`, then a half-close; and reads the response meanwhile, since the
+/// daemon may refuse the request before it reads the body.
+pub async fn upload(
+    socket: &Path,
+    envelope: &Envelope,
+    mut body: impl AsyncRead + Unpin,
+) -> Result<serde_json::Value> {
+    let (r, mut w) = connect(socket).await?.into_split();
+    let line = request_line(envelope)?;
+    // Owns the write half: if reading `body` fails, dropping it ends the
+    // stream, so the daemon sees the import is short at once.
+    let send = async move {
+        w.write_all(&line).await?;
+        tokio::io::copy(&mut body, &mut w).await?;
+        w.shutdown().await
+    };
+    let (sent, answer) = tokio::join!(send, response(r));
+    // A refusal closes the connection: its answer says more than the
+    // broken pipe.
+    let data = answer?;
+    sent.context("cannot send the body to stallod")?;
+    Ok(data)
+}
+
+async fn connect(socket: &Path) -> Result<UnixStream> {
+    UnixStream::connect(socket).await.with_context(|| {
         format!(
             "cannot reach stallod at {}; is it running?",
             socket.display()
         )
-    })?;
-    let (r, mut w) = stream.into_split();
+    })
+}
+
+fn request_line(envelope: &Envelope) -> Result<Vec<u8>> {
     let mut line = serde_json::to_vec(envelope)?;
     line.push(b'\n');
-    w.write_all(&line).await?;
+    Ok(line)
+}
+
+async fn response(r: OwnedReadHalf) -> Result<serde_json::Value> {
+    let mut line = Vec::new();
     let mut r = BufReader::new(r);
     if !read_line(&mut r, &mut line, MAX_RESPONSE).await? {
         bail!("stallod closed the connection without an answer");
@@ -638,6 +688,75 @@ mod tests {
             timeout_s: None,
         };
         assert_eq!(agent_gate(&run), Gate::Vm("dev"));
+    }
+
+    /// Importing an ISO, or creating a VM from one, is for humans only.
+    #[test]
+    fn import_gates() {
+        let import = Request::ImportIso {
+            id: "local-win11".into(),
+            os: crate::images::Os::Windows,
+            name: "Win11".into(),
+            size: 1 << 30,
+        };
+        assert_eq!(agent_gate(&import), Gate::Closed);
+        let e = check_agent(Via::Mcp, &import, true, |_| Ok(true)).unwrap_err();
+        assert!(e.to_string().contains("only available to humans"));
+        check_agent(Via::Cli, &import, false, |_| Ok(false)).unwrap();
+        let new = Request::New {
+            name: "win".into(),
+            image: "local-win11".into(),
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            net: NetProfile::Offline,
+            forwards: vec![],
+            wait: false,
+            vnc: false,
+        };
+        assert_eq!(agent_gate(&new), Gate::Closed);
+        let wire = r#"{"op":"import_iso","id":"local-win11","os":"windows","name":"Win11","size":1073741824}"#;
+        assert_eq!(serde_json::to_string(&import).unwrap(), wire);
+    }
+
+    /// `upload` sends the line and the body, and shows a refusal that
+    /// comes before the body is read (not the broken pipe).
+    #[tokio::test]
+    async fn upload_body_and_early_refusal() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let env = Envelope {
+            via: Via::Cli,
+            request: Request::Images,
+        };
+        let body = vec![7u8; 4 << 20];
+        let server = tokio::spawn(async move {
+            // Reads it all.
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut r = BufReader::new(r);
+            let mut line = Vec::new();
+            assert!(read_line(&mut r, &mut line, MAX_REQUEST).await.unwrap());
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).await.unwrap();
+            let reply = format!("{{\"ok\":true,\"data\":{}}}\n", got.len());
+            w.write_all(reply.as_bytes()).await.unwrap();
+            // Refuses after the request line.
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut r = BufReader::new(r);
+            assert!(read_line(&mut r, &mut line, MAX_REQUEST).await.unwrap());
+            w.write_all(b"{\"ok\":false,\"error\":\"refused\"}\n")
+                .await
+                .unwrap();
+        });
+        let v = upload(&sock, &env, &body[..]).await.unwrap();
+        assert_eq!(v, serde_json::json!(4 << 20));
+        let e = upload(&sock, &env, &body[..]).await.unwrap_err();
+        assert_eq!(e.to_string(), "refused");
+        server.await.unwrap();
     }
 
     /// S8: the policy, without a VM.
