@@ -75,8 +75,10 @@ table inet stallo {
 		# entries are shared by all users, and UDP or ICMP "replies" could
 		# ride an entry another process created.
 		meta l4proto tcp ct direction reply accept
-		# The host resolver, for the daemon's own image downloads. Guests
-		# cannot reach it: passt maps no guest address to the host.
+		# The host resolver, for the daemon's own image downloads. Safe only
+		# because passt runs IPv4 only (-4): with IPv6, a guest reaches it
+		# via ::ffff:127.0.0.53. See "Known gaps" in
+		# docs/network-verification.md.
 		ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
 		# Any address of this host, on any interface.
 		fib daddr type { local, broadcast, multicast, anycast } drop

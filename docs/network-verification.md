@@ -243,7 +243,8 @@ ICMP with one `ping`. "Without table" is the control run.
 - **Not tested:** multicast and broadcast destinations (passt does not
   relay them, and the table drops them), and IPv4-mapped IPv6 destinations.
   A v4-mapped `sendto` leaves the host as an IPv4 packet, so `deny4` covers
-  it; the `::ffff:0:0/96` entry in `deny6` is only a backstop.
+  it; the `::ffff:0:0/96` entry in `deny6` is only a backstop. *Later
+  found:* the table's DNS exception does not, see "Known gaps".
 
 ## Throughput and latency
 
@@ -326,6 +327,59 @@ table inet stallo {
   the user is recreated with another uid, the table must be reloaded.
   Otherwise the probe fails and `internet` starts are refused, which is
   fail closed.
+
+## Known gaps
+
+### IPv4-mapped loopback DNS (found 2026-10-17; guests are IPv4 only since)
+
+- **The gap.** passt drops guest frames whose source or destination is
+  `127.0.0.0/8` or `::1` (passt `tap.c`, IPv4 and IPv6 handlers), but not
+  an IPv6 frame to the IPv4-mapped `::ffff:127.0.0.53`. passt treats that
+  address as IPv4 (`nat_outbound` in `fwd.c` passes it on unchanged) and
+  opens an IPv4 socket to `127.0.0.53:53` as user `stallo`. The table's
+  exception for the daemon's own downloads,
+  `ip daddr 127.0.0.53 … th dport 53 accept`, comes before the
+  `fib daddr type local` drop, so the query reaches the host's resolver
+  and its answer goes back to the guest. A guest that crafts such frames
+  (admin rights in the guest) could ask the host's split DNS: tailnet and
+  LAN names, `/etc/hosts`, and make resolved send LLMNR or mDNS queries
+  into the LAN. It needs IPv6 in passt, that is, IPv6 on the host.
+- **Evidence.** passt `0.0~git20260120.386b5f5-1` (Ubuntu's) in an offline
+  nested guest, our exact flags, `--fd` from a socketpair, a dummy uplink
+  with IPv4 and IPv6 default routes, and a logging UDP/TCP responder on
+  `127.0.0.53:53`. Frames sent by a test client:
+
+  | Frame | Without `-4` | With `-4` |
+  |---|---|---|
+  | IPv4 UDP to `127.0.0.53:53` | dropped (`Loopback address on tap interface`) | dropped |
+  | IPv6 UDP to `[::ffff:127.0.0.53]:53` | **relayed**: the responder logged a query from `127.0.0.1:40001`, and the guest got the DNS answer from `::ffff:127.0.0.53:53` | dropped, nothing reached the responder |
+  | IPv6 TCP SYN to `[::ffff:127.0.0.53]:53` | passt was killed by its seccomp filter (signal 31): the guest loses only its own network | dropped |
+
+- **Mitigation now.** passt runs with `-4` (`net::passt_args`): guests get
+  IPv4 only, no IPv6 internet. passt then refuses IPv6 listeners, so
+  IPv6 port forwards (`--bind ::1`) are refused at create and start.
+  passt has no option that drops IPv4-mapped destinations.
+- **Plan to get IPv6 back** (not done): allow the resolver only to the
+  daemon's helper programs, which run in the `tools/` leaf of the
+  daemon's cgroup (`src/cgroup.rs`), never in a `vm-<name>/` leaf where
+  passt runs:
+
+  ```
+  socket cgroupv2 level 3 "system.slice/stallod.service/tools" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+  ```
+
+  - nft resolves the path to a cgroup id when the rule is loaded. The
+    path must exist then, and the id changes whenever stallod restarts
+    (systemd recreates its cgroup). So the rule must load after stallod
+    created `tools/`, in a small table of its own, replaced on every
+    start. `stallod.service` is `Type=exec`, so a plain `ExecStartPost`
+    runs before `tools/` exists: switch to `Type=notify` with `READY=1`
+    after the cgroup setup, or use a root helper that waits for the path.
+    Until the rule is loaded, downloads fail (fail closed).
+  - The isolation probe should then also expect `EPERM` for UDP to
+    `127.0.0.53:53` sent from the `daemon/` leaf.
+  - Then drop `-4` and re-run the frames above: the IPv6 UDP row must be
+    dropped by the table.
 
 ## Not covered here
 
@@ -541,8 +595,7 @@ for the owner's first Windows VM on a production install.
 - An Intel 82574L card (QEMU `e1000e`), which Windows has a driver for.
 - IPv4 by DHCP: **the laptop's own LAN address** and its default gateway
   (passt copies them), DNS server `169.254.1.53`, no search domain.
-- IPv6 by router advertisement, only if the laptop has a global IPv6
-  address. No IPv6 DNS server: names resolve over IPv4.
+- No IPv6: passt runs IPv4 only (see "Known gaps").
 - Windows ignores DHCP's MTU option and keeps 1500. passt sizes TCP
   segments to the guest's MSS, so this should not matter.
 
@@ -581,7 +634,7 @@ for the owner's first Windows VM on a production install.
 | 3 | `Test-NetConnection example.com -Port 443` | `TcpTestSucceeded : True` |
 | 4 | `curl.exe -sI https://www.google.com` | `HTTP/1.1 200` (or a redirect) |
 | 5 | In Edge, download and install Chrome; browse a few sites | works |
-| 6 | IPv6, only if the laptop has global IPv6: `curl.exe -6 -sI https://ipv6.google.com` | an HTTP status |
+| 6 | `curl.exe -6 -sI https://ipv6.google.com` | fails: no IPv6 (passt `-4`) |
 | 7 | `Test-NetConnection <gw> -Port 80` | `TcpTestSucceeded : False` (after a timeout) |
 | 8 | `Test-NetConnection <lan-dev> -Port <its port>` | `False` |
 | 9 | `nslookup example.com <gw>` (UDP to the router's DNS) | `timed out` |
