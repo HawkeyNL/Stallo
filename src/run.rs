@@ -617,8 +617,8 @@ mod tests {
         }
     }
 
-    /// A Windows VM fails closed: no start without a TPM, no internet, no
-    /// `stallo run` clone and nothing below its minimum size.
+    /// A Windows VM fails closed: no internet, no `stallo run` clone and
+    /// nothing below its minimum size.
     #[tokio::test]
     async fn windows_vms_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -634,11 +634,6 @@ mod tests {
         let dir = m.paths.vm_dir("win");
         fs::create_dir(&dir).unwrap();
         win.save(&dir).unwrap();
-        let err = m.start("win").await.err().unwrap();
-        assert_eq!(
-            err.to_string(),
-            "Windows VMs need TPM support (not yet available)"
-        );
         let argv = ["true".to_owned()];
         let err = m
             .run("win", &argv, false, Duration::from_secs(5), async {})

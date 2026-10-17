@@ -8,11 +8,13 @@ remove)
 	if [ -d /run/systemd/system ]; then
 		systemctl daemon-reload >/dev/null || true
 	fi
-	# Nothing runs as `stallo` any more; drop its table and QEMU's profile.
+	# Nothing runs as `stallo` any more; drop its table and the profiles.
 	nft delete table inet stallo >/dev/null 2>&1 || true
-	if aa-enabled --quiet 2>/dev/null && [ -f /etc/apparmor.d/stallo-qemu ]; then
-		apparmor_parser -R /etc/apparmor.d/stallo-qemu >/dev/null 2>&1 || true
-	fi
+	for profile in stallo-qemu stallo-swtpm; do
+		if aa-enabled --quiet 2>/dev/null && [ -f "/etc/apparmor.d/$profile" ]; then
+			apparmor_parser -R "/etc/apparmor.d/$profile" >/dev/null 2>&1 || true
+		fi
+	done
 	deb-systemd-helper mask stallo-nft.service stallod.service >/dev/null || true
 	;;
 purge)
