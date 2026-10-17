@@ -359,6 +359,14 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         List | Host | Images => Gate::Open,
         // VNC input bypasses agent control and the audit log (as SetVnc).
         New { vnc: true, .. } => Gate::Closed,
+        // A VM from an installer ISO is installed by hand over VNC. Fail
+        // closed: only images known to be cloud images pass.
+        New { image, .. }
+            if !crate::images::find(image)
+                .is_ok_and(|e| e.kind == crate::images::Kind::CloudImage) =>
+        {
+            Gate::Closed
+        }
         New { .. } => Gate::Create,
         Rm { .. }
         | Pull { .. }
@@ -636,6 +644,17 @@ mod tests {
         }
         assert!(err(Via::Mcp, &new_vnc, true, on).contains("only available to humans"));
         assert!(check_agent(Via::Cli, &new_vnc, false, off).is_ok());
+        // Nor may agents create VMs from installer ISOs, or from images this
+        // build does not know.
+        for image in ["fedora-44-workstation", "ubuntu-26.04-desktop", "nope"] {
+            let mut iso = new.clone();
+            if let Request::New { image: i, .. } = &mut iso {
+                *i = image.into();
+            }
+            assert_eq!(agent_gate(&iso), Gate::Closed, "{image}");
+            assert!(err(Via::Mcp, &iso, true, on).contains("only available to humans"));
+            assert!(check_agent(Via::Cli, &iso, false, off).is_ok());
+        }
         let resize = Request::SetResources {
             name: "dev".into(),
             vcpus: Some(4),

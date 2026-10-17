@@ -75,6 +75,12 @@ Guest images (`stallo images` lists them):
 | `fedora-44-workstation` | Fedora 44 Workstation live installer ISO (44-1.7) | Installed by hand over VNC; no guest agent until you install one. Offline only for now. |
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
+
+A VM from an installer ISO (`stallo new desk --image fedora-44-workstation`)
+gets a blank disk, the ISO in a read-only CD-ROM drive and VNC; there is no
+seed, cloud-init or guest password, and `new` and `start` do not wait for a
+guest agent. Defaults are 2 vCPUs, 4 GiB and a 32 GiB disk. Install over
+VNC; the installed system boots from the disk first.
 Ubuntu images are checked with the host's Ubuntu keyrings; other
 distributions' signing keys ship with Stallo in `catalog/keys/`. Ubuntu's
 `current/` and Arch's `latest/` move to each new build, so their signatures

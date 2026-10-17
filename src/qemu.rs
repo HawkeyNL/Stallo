@@ -61,6 +61,17 @@ const QGA_AFTER_CLOUD_INIT: &str = "[Unit]\nAfter=cloud-final.service\n";
 /// state. Ubuntu 26.04 ships QEMU 10.2.
 pub const MACHINE: &str = "pc-q35-10.2";
 
+/// The second drive of a VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Media<'a> {
+    /// The seed ISO (cloud images), as a virtio disk.
+    Seed,
+    /// A CD-ROM drive (installer ISOs) with this ISO, or empty. The drive is
+    /// there either way, so the virtual hardware stays the same when the
+    /// ISO is ejected.
+    Cdrom(Option<&'a Path>),
+}
+
 /// Builds the QEMU argv (without the program) for `vm`. `net_fd` is QEMU's
 /// end of the passt socketpair: required for the `internet` profile, and
 /// refused for `offline`. `vnc` is the VNC socket: required when `vm.vnc`
@@ -73,6 +84,7 @@ pub fn argv(
     net_fd: Option<RawFd>,
     vnc: Option<&Path>,
     agent: Agent,
+    media: Media,
 ) -> Result<Vec<String>> {
     // Names and uuids end up inside option strings; never trust the caller.
     vm.validate()?;
@@ -118,11 +130,27 @@ pub fn argv(
     let time_sync =
         format!("-smbios type=11,value=io.systemd.credential:systemd.extra-unit.{TIME_WAIT_SYNC}=");
     let file = |dir: &Path, name: &str| opt_path(&dir.join(name));
-    let (disk, vars, seed) = (
-        file(vm_dir, DISK)?,
-        file(vm_dir, VARS)?,
-        file(vm_dir, SEED)?,
-    );
+    let (disk, vars) = (file(vm_dir, DISK)?, file(vm_dir, VARS)?);
+    // The disk boots first; a blank one falls through to the CD-ROM. The
+    // ISO's format is pinned (raw), so QEMU never probes it.
+    let media = match media {
+        Media::Seed => vec![
+            format!(
+                "-blockdev driver=file,node-name=seed,filename={},read-only=on",
+                file(vm_dir, SEED)?
+            ),
+            "-device virtio-blk-pci,drive=seed".to_owned(),
+        ],
+        Media::Cdrom(Some(iso)) => vec![
+            format!(
+                "-blockdev driver=file,node-name=cd0-file,filename={},read-only=on",
+                opt_path(iso)?
+            ),
+            "-blockdev driver=raw,node-name=cd0,file=cd0-file,read-only=on".to_owned(),
+            "-device ide-cd,id=cd0,drive=cd0,bus=ide.0,bootindex=2".to_owned(),
+        ],
+        Media::Cdrom(None) => vec!["-device ide-cd,id=cd0,bus=ide.0,bootindex=2".to_owned()],
+    };
     let (qmp, qga) = (file(rt_dir, QMP_SOCK)?, file(rt_dir, QGA_SOCK)?);
     let (name, uuid) = (&vm.name, &vm.uuid);
     let (w, h) = SCREEN;
@@ -150,8 +178,8 @@ pub fn argv(
         ),
         "-blockdev driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap".into(),
         "-device virtio-blk-pci,drive=disk0,bootindex=1,werror=stop,rerror=stop".into(),
-        format!("-blockdev driver=file,node-name=seed,filename={seed},read-only=on"),
-        "-device virtio-blk-pci,drive=seed".into(),
+    ];
+    let devices = [
         // No legacy VGA and no USB controller: less emulated hardware.
         format!("-device bochs-display,edid=on,xres={w},yres={h}"),
         "-device virtio-tablet-pci".into(),
@@ -165,6 +193,8 @@ pub fn argv(
     // are checked in `opt_path`.
     Ok(args
         .iter()
+        .chain(&media)
+        .chain(&devices)
         .chain(&network)
         .chain([&time_sync])
         .chain(&qga_order)
@@ -185,17 +215,19 @@ fn opt_path(path: &Path) -> Result<String> {
     Ok(s.replace(',', ",,"))
 }
 
-/// Creates the VM disk as a qcow2 overlay on the cached base image. The
-/// backing format is always given (`-F`), so it is never probed.
-pub async fn create_disk(base: &Path, disk: &Path, size_gib: u64) -> Result<()> {
+/// Creates the VM disk as a qcow2 overlay on the cached base image, or
+/// blank without one (installer ISOs). The backing format is always given
+/// (`-F`), so it is never probed.
+pub async fn create_disk(base: Option<&Path>, disk: &Path, size_gib: u64) -> Result<()> {
     // qemu-img would silently overwrite an existing disk.
     ensure!(!disk.exists(), "{} already exists", disk.display());
+    let mut cmd = Command::new("qemu-img");
+    cmd.args(["create", "-q", "-f", "qcow2"]);
+    if let Some(base) = base {
+        cmd.args(["-F", "qcow2", "-b"]).arg(base);
+    }
     run_tool(
-        Command::new("qemu-img")
-            .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b"])
-            .arg(base)
-            .arg(disk)
-            .arg(format!("{size_gib}G")),
+        cmd.arg(disk).arg(format!("{size_gib}G")),
         Duration::from_secs(30),
     )
     .await
@@ -246,6 +278,7 @@ mod tests {
             throwaway_of: None,
             forwards: vec![],
             vnc: false,
+            cdrom: None,
         }
     }
 
@@ -259,6 +292,7 @@ mod tests {
             None,
             None,
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         let want = "\
@@ -290,6 +324,36 @@ mod tests {
         assert_eq!(got.join(" "), want);
     }
 
+    /// A VM from an ISO: the seed's two arguments make way for a CD-ROM
+    /// drive, with the ISO (raw, read-only) or empty; nothing else changes.
+    #[test]
+    fn golden_cdrom() {
+        let (d, r) = (Path::new("/d/vms/dev"), Path::new("/r/vms/dev"));
+        let with = |agent, media| argv(&vm(), d, r, None, None, agent, media).map(|a| a.join(" "));
+        let seed = with(Agent::Deb, Media::Seed).unwrap();
+        let seed_args = "-blockdev driver=file,node-name=seed,filename=/d/vms/dev/seed.iso,read-only=on \
+                         -device virtio-blk-pci,drive=seed";
+        assert!(seed.contains(seed_args));
+        let iso = Path::new("/d/images/fedora-44-workstation.iso");
+        assert_eq!(
+            with(Agent::Manual, Media::Cdrom(Some(iso))).unwrap(),
+            seed.replace(
+                seed_args,
+                "-blockdev driver=file,node-name=cd0-file,filename=/d/images/fedora-44-workstation.iso,read-only=on \
+                 -blockdev driver=raw,node-name=cd0,file=cd0-file,read-only=on \
+                 -device ide-cd,id=cd0,drive=cd0,bus=ide.0,bootindex=2"
+            )
+        );
+        assert_eq!(
+            with(Agent::Manual, Media::Cdrom(None)).unwrap(),
+            seed.replace(seed_args, "-device ide-cd,id=cd0,bus=ide.0,bootindex=2")
+        );
+        // The ISO's path is escaped or refused like the others.
+        assert!(with(Agent::Manual, Media::Cdrom(Some(Path::new("/a b.iso")))).is_err());
+        let comma = with(Agent::Manual, Media::Cdrom(Some(Path::new("/a,b.iso")))).unwrap();
+        assert!(comma.contains("filename=/a,,b.iso,read-only=on"));
+    }
+
     /// S4: the security-relevant flags, checked one by one.
     #[test]
     fn security_flags() {
@@ -300,6 +364,7 @@ mod tests {
             None,
             None,
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         let after = |flag: &str| {
@@ -333,6 +398,7 @@ mod tests {
             None,
             None,
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         assert!(a.iter().any(|x| x.contains("filename=/x,,y/disk.qcow2,")));
@@ -348,7 +414,8 @@ mod tests {
                     Path::new("/r"),
                     None,
                     None,
-                    Agent::Deb
+                    Agent::Deb,
+                    Media::Seed
                 )
                 .is_err()
             );
@@ -370,6 +437,7 @@ mod tests {
             Some(9),
             None,
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         let offline = argv(
@@ -379,6 +447,7 @@ mod tests {
             None,
             None,
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         let tail = &a[a.len() - 6..];
@@ -399,7 +468,8 @@ mod tests {
                 Path::new("/r"),
                 None,
                 None,
-                Agent::Deb
+                Agent::Deb,
+                Media::Seed
             )
             .is_err()
         );
@@ -410,7 +480,8 @@ mod tests {
                 Path::new("/r"),
                 Some(9),
                 None,
-                Agent::Deb
+                Agent::Deb,
+                Media::Seed
             )
             .is_err()
         );
@@ -420,8 +491,8 @@ mod tests {
     #[test]
     fn preinstalled_agent_waits_for_cloud_init() {
         let (d, r) = (Path::new("/d"), Path::new("/r"));
-        let deb = argv(&vm(), d, r, None, None, Agent::Deb).unwrap();
-        let pre = argv(&vm(), d, r, None, None, Agent::Preinstalled).unwrap();
+        let deb = argv(&vm(), d, r, None, None, Agent::Deb, Media::Seed).unwrap();
+        let pre = argv(&vm(), d, r, None, None, Agent::Preinstalled, Media::Seed).unwrap();
         assert_eq!(pre[..deb.len()], deb[..]);
         // base64 of "[Unit]\nAfter=cloud-final.service\n".
         assert_eq!(
@@ -435,7 +506,7 @@ mod tests {
             net: NetProfile::Internet,
             ..vm()
         };
-        let a = argv(&inet, d, r, Some(9), None, Agent::Preinstalled).unwrap();
+        let a = argv(&inet, d, r, Some(9), None, Agent::Preinstalled, Media::Seed).unwrap();
         assert!(a.contains(&pre[pre.len() - 1]));
     }
 
@@ -451,6 +522,7 @@ mod tests {
             None,
             Some(sock),
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         let offline = argv(
@@ -460,6 +532,7 @@ mod tests {
             None,
             None,
             Agent::Deb,
+            Media::Seed,
         )
         .unwrap();
         assert_eq!(a[a.len() - 2..], ["-vnc", "unix:/r/vnc/dev/vnc.sock"]);
@@ -472,7 +545,8 @@ mod tests {
                 Path::new("/r"),
                 None,
                 None,
-                Agent::Deb
+                Agent::Deb,
+                Media::Seed
             )
             .is_err()
         );
@@ -483,7 +557,8 @@ mod tests {
                 Path::new("/r"),
                 None,
                 Some(sock),
-                Agent::Deb
+                Agent::Deb,
+                Media::Seed
             )
             .is_err()
         );
@@ -494,7 +569,8 @@ mod tests {
                 Path::new("/r"),
                 None,
                 Some(Path::new("/a b")),
-                Agent::Deb
+                Agent::Deb,
+                Media::Seed
             )
             .is_err()
         );

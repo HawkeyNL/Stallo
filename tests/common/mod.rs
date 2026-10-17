@@ -28,7 +28,7 @@
 //!
 //! Images are hard-linked from the dev-mode cache, so pull the image once
 //! with dev mode first. Tests use `ubuntu-26.04` unless `STALLO_IT_IMAGE_ID`
-//! names another catalog image.
+//! names another catalog image (installer ISOs are named by their test).
 
 #![allow(dead_code)]
 
@@ -166,7 +166,14 @@ impl Daemon {
     /// [`Daemon::start`] for guests of up to `max_memory_mib` (at most
     /// [`MAX_SIZED_MIB`]). The unit's `MemoryMax` is that plus 1 GiB.
     pub fn start_sized(name: &str, config: &str, max_memory_mib: u64) -> Self {
+        Self::start_with(name, config, max_memory_mib, &image_id())
+    }
+
+    /// [`Daemon::start_sized`] with catalog image `id` (a cloud image or
+    /// an installer ISO) instead of [`image_id`].
+    pub fn start_with(name: &str, config: &str, max_memory_mib: u64, id: &str) -> Self {
         assert!(max_memory_mib <= MAX_SIZED_MIB);
+        let id = id.to_owned();
         let home = env_path("HOME");
         let (lock, cache_root) = exclusive();
 
@@ -182,15 +189,18 @@ impl Daemon {
 
         // Hard-link the cached image (free) and copy the debs (small), if
         // the image needs any.
-        let id = image_id();
+        let file = match stallo::images::find(&id).map(|e| e.kind) {
+            Ok(stallo::images::Kind::Iso) => format!("{id}.iso"),
+            _ => format!("{id}.qcow2"),
+        };
         let source = home.join(".local/share/stallo-dev/images");
-        let image = source.join(format!("{id}.qcow2"));
+        let image = source.join(&file);
         assert!(
             image.exists(),
             "{} missing; run `stallo images pull {id}` in dev mode first",
             image.display()
         );
-        fs::hard_link(&image, images.join(format!("{id}.qcow2"))).unwrap();
+        fs::hard_link(&image, images.join(&file)).unwrap();
         let debs = images.join(format!("{id}.debs"));
         if let Ok(cached) = fs::read_dir(source.join(format!("{id}.debs"))) {
             fs::create_dir(&debs).unwrap();

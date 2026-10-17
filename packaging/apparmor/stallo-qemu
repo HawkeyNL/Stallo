@@ -30,12 +30,14 @@ profile stallo-qemu flags=(enforce) {
   /dev/kvm rw,
 
   # VM disks, firmware variables, RAM snapshot images and the seed; the
-  # cached base images read-only. Landlock narrows this to one VM.
+  # cached base images and installer ISOs read-only. Landlock narrows this
+  # to one VM.
   /var/lib/stallo/vms/*/disk.qcow2 rwk,
   /var/lib/stallo/vms/*/vars.qcow2 rwk,
   /var/lib/stallo/vms/*/states/*.qcow2 rwk,
   /var/lib/stallo/vms/*/seed.iso rk,
   /var/lib/stallo/images/*.qcow2 rk,
+  /var/lib/stallo/images/*.iso rk,
 
   # QMP, QGA and VNC sockets; screendumps.
   /run/stallo/vms/*/{qmp,qga}.sock rw,

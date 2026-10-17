@@ -78,7 +78,10 @@ Arch's `latest/` image.
 
 Installer ISOs are verified like images (a signed checksum list, then the
 SHA-256), but are otherwise untrusted guest input: the host never mounts or
-parses them (no `qemu-img`); only QEMU reads them.
+parses them (no `qemu-img`); only QEMU reads them, as a raw (never
+probed), read-only CD-ROM. Landlock grants that QEMU read access to the one
+ISO in its drive, and the AppArmor profile allows `images/*.iso`
+read-only. `images rm` is refused while a VM has the ISO in its drive.
 
 ## Agent policy
 
@@ -89,7 +92,9 @@ VM creation unless `agents_can_create = true` in `stallod.toml`, and
 never lets agents delete VMs, pull or delete images, resume VMs, change
 agent control, turn VNC on (also not through `new`) or change a VM's CPUs
 and memory: agent control of a small VM must not let an agent claim the
-host's CPU and memory budget. Agents create VMs only from images a human has already pulled
+host's CPU and memory budget. Nor may agents create VMs from installer
+ISOs (or from images the daemon does not know as cloud images): those are
+installed by hand over VNC. Agents create VMs only from images a human has already pulled
 (`stallo images pull <id>`). Turning agent control off stops new agent
 calls; calls already running (an `exec` can run up to an hour) finish
 first.
