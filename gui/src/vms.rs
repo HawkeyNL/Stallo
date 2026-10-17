@@ -18,6 +18,7 @@ use adw::prelude::*;
 use adw::{gio, glib, gtk};
 use libadwaita as adw;
 use stallo::api::{VmDetails, VmInfo};
+use stallo::config::NetProfile;
 use stallo::host::HostInfo;
 use stallo::snapshot::Snapshot;
 
@@ -122,6 +123,10 @@ struct Detail {
     /// Shown while an action on this VM runs.
     busy: adw::Spinner,
     values: Vec<adw::ActionRow>,
+    /// The network profile, while the VM is stopped.
+    internet: adw::SwitchRow,
+    /// The window talks to the production daemon.
+    production: bool,
     /// VNC on or off from the next start.
     live_screen: adw::SwitchRow,
     /// Shown while an installer ISO is in the VM's drive.
@@ -172,6 +177,7 @@ struct SnapWidgets {
 /// Names of tabs in [`Detail::tabs`].
 const SCREEN: &str = "screen";
 const SNAPSHOTS: &str = "snapshots";
+const OVERVIEW: &str = "overview";
 
 impl Vms {
     pub fn new(ui: &Rc<Ui>, socket: PathBuf) -> Rc<Self> {
@@ -403,9 +409,12 @@ impl Vms {
             .screen
             .set_wanted(visible && tab.as_deref() == Some(SCREEN));
         // Not while an action on the VM runs: the daemon would make the
-        // list wait for it. The action asks again when it is done.
+        // list wait for it. The action asks again when it is done. On the
+        // Overview too while only snapshots could block Internet Access.
+        let switchable = tab.as_deref() == Some(OVERVIEW)
+            && model::internet_switch_block(&vm, None, detail.production).is_none();
         if visible
-            && tab.as_deref() == Some(SNAPSHOTS)
+            && (tab.as_deref() == Some(SNAPSHOTS) || switchable)
             && !self.pending.borrow().blocks(&detail.name)
             && !model::snaps_wait(detail.snaps_stuck.borrow().as_ref(), &vm.state, now)
             && detail.snaps_poll.borrow_mut().due(now)
@@ -741,7 +750,9 @@ impl Vms {
             Some(Some(off)) => return self.run(off, name),
             Some(None) => {}
         }
-        let c = setting.confirm(&vm);
+        let Some(c) = setting.confirm(&vm) else {
+            return;
+        };
         let dialog = adw::AlertDialog::builder()
             .heading(&c.heading)
             .heading_use_markup(false)
@@ -1102,11 +1113,19 @@ impl Detail {
         resize_buttons.append(&resize);
         let mut values = Vec::new();
         let mut resources = None;
+        let internet = adw::SwitchRow::builder()
+            .title(model::INTERNET_ACCESS)
+            .use_markup(false)
+            .active(vm.net == NetProfile::Internet)
+            .build();
         for (title, rows) in model::facts(vm, None) {
             let group = adw::PreferencesGroup::builder().title(title).build();
             if title == "Resources" {
                 group.set_header_suffix(Some(&resize_buttons));
                 resources = Some(group.clone());
+            }
+            if title == "Network" {
+                group.add(&internet);
             }
             for (title, _) in rows {
                 let row = adw::ActionRow::builder()
@@ -1164,6 +1183,7 @@ impl Detail {
         for (row, setting) in [
             (&live_screen, Setting::LiveScreen),
             (&agent, Setting::Agent),
+            (&internet, Setting::Internet),
         ] {
             let (v, name) = (Rc::downgrade(vms), vm.name.clone());
             row.connect_active_notify(move |row| {
@@ -1263,7 +1283,7 @@ impl Detail {
         let screen = Screen::new(vm, vms);
         let files = files::Files::new(vm, vms);
         let tabs = adw::ViewStack::new();
-        tabs.add_titled_with_icon(&overview, Some("overview"), "Overview", "computer-symbolic");
+        tabs.add_titled_with_icon(&overview, Some(OVERVIEW), "Overview", "computer-symbolic");
         tabs.add_titled_with_icon(
             &screen.root,
             Some(SCREEN),
@@ -1330,6 +1350,8 @@ impl Detail {
             resume,
             busy,
             values,
+            internet,
+            production: model::production(&vms.socket),
             live_screen,
             installer_group,
             installer,
@@ -1383,15 +1405,20 @@ impl Detail {
         self.screen
             .update(vm, self.details.borrow().as_ref(), blocked);
         self.files.update(vm, blocked, copy);
-        for (row, setting) in [
-            (&self.live_screen, Setting::LiveScreen),
-            (&self.agent, Setting::Agent),
+        let internet =
+            model::internet_switch_block(vm, self.snaps.borrow().as_deref(), self.production);
+        for (row, setting, free) in [
+            (&self.live_screen, Setting::LiveScreen, true),
+            (&self.agent, Setting::Agent, true),
+            (&self.internet, Setting::Internet, internet.is_none()),
         ] {
-            row.set_sensitive(!blocked);
+            row.set_sensitive(!blocked && free);
             if let Some(on) = setting.shown(vm, blocked) {
                 row.set_active(on);
             }
         }
+        self.internet
+            .set_subtitle(model::internet_note(vm, internet));
         self.connect_agent.set_visible(vm.agent_control);
         let note = model::installer_note(vm);
         self.installer_group.set_visible(note.is_some());

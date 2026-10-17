@@ -18,6 +18,7 @@ pub fn vms() -> Value {
         vm("win11", "running", "local-win11", false, true),
         vm("build", "paused", "debian-13", false, false),
         vm("fedora", "stopped", "fedora-44", false, true),
+        vm("desk", "stopped", "fedora-44-workstation", false, false),
     ])
 }
 
@@ -60,15 +61,20 @@ fn host() -> Value {
     })
 }
 
-fn snapshots() -> Value {
+/// `desk` has no RAM snapshots, so its Internet Access switch can move.
+fn snapshots(vm: &str) -> Value {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    json!([
+    let mut all = json!([
         {"name": "clean-install", "ram_bytes": 0, "created": now - 9 * 86_400, "vm_clock_ms": 0},
         {"name": "before-upgrade", "ram_bytes": 8_589_934_592_u64, "created": now - 26 * 3600, "vm_clock_ms": 5_400_000},
         {"name": "snapshot-3", "ram_bytes": 0, "created": now - 600, "vm_clock_ms": 0},
-    ])
+    ]);
+    if vm == "desk" {
+        all.as_array_mut().unwrap().retain(|s| s["ram_bytes"] == 0);
+    }
+    all
 }
 
 /// Catalog images, downloaded or not, and an imported Windows ISO.
@@ -106,7 +112,7 @@ fn answer(stream: UnixStream, vms: &Value) -> std::io::Result<()> {
         "list" => Some(vms.clone()),
         "host" => Some(host()),
         "info" => info(vms, request["name"].as_str().unwrap_or_default()),
-        "snapshots" => Some(snapshots()),
+        "snapshots" => Some(snapshots(request["name"].as_str().unwrap_or_default())),
         "images" => Some(images()),
         _ => None,
     };
