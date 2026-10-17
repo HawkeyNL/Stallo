@@ -93,8 +93,9 @@ images it was not verified with (`internet` in the catalog entry): so far
 the Ubuntu ones.
 
 A pull starts only if the image's filesystem keeps the disk floor
-(`disk_floor_gib`) free plus twice the image's largest size (less what an
-interrupted download already holds). A pulled image is kept as it is, and
+(`disk_floor_gib`) free plus twice the image's largest size, or once for
+an installer ISO, which is kept as downloaded (less what an interrupted
+download already holds). A pulled image is kept as it is, and
 `stallo images` shows the date of the signature it was verified with. To
 get a newer build, or to free the space, delete it and pull again:
 

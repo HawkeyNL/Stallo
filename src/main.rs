@@ -30,7 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a VM, start it and wait until it is ready.
+    /// Create a VM, start it and wait until it is ready (a VM from an
+    /// installer ISO: until QEMU runs; install it over VNC).
     New {
         #[arg(default_value = "dev")]
         name: String,
@@ -63,7 +64,8 @@ enum Cmd {
     },
     /// List VMs.
     Ls,
-    /// Start a stopped VM and wait until it is ready.
+    /// Start a stopped VM and wait until it is ready. A VM made from an
+    /// installer ISO is not waited for, even with a guest agent installed.
     Start {
         vm: String,
         #[arg(long)]
@@ -148,6 +150,10 @@ enum Cmd {
         /// Memory, e.g. 4G or 1536M (the VM must be stopped).
         #[arg(long, value_parser = parse_mib, group = "change")]
         mem: Option<u64>,
+        /// Empty the CD-ROM drive of a VM made from an installer ISO
+        /// (`eject`), or put a pulled ISO in it (its image id).
+        #[arg(long, value_name = "eject|ISO", group = "change")]
+        cdrom: Option<String>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
@@ -458,7 +464,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{vm}  {}", restored_line(&r));
             }
         }
-        Cmd::Set { vm, vnc, cpus, mem } => {
+        Cmd::Set {
+            vm,
+            vnc,
+            cpus,
+            mem,
+            cdrom,
+        } => {
             // First, so a running VM is refused before VNC changes.
             let resources = if cpus.is_some() || mem.is_some() {
                 let v = call(Request::SetResources {
@@ -502,8 +514,39 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 vnc_result = Some(v);
             }
+            let mut cdrom_result = None;
+            if let Some(cdrom) = cdrom {
+                let iso = (cdrom != "eject").then_some(cdrom);
+                let v = call(Request::SetCdrom {
+                    name: vm.clone(),
+                    iso: iso.clone(),
+                })
+                .await
+                .map_err(|e| match (&resources, &vnc_result) {
+                    (None, None) => e,
+                    _ => e.context(format!(
+                        "the other changes of {vm} were applied, the CD-ROM change was not"
+                    )),
+                })?;
+                if !json {
+                    let when = if v["running"] == true {
+                        " from the next start"
+                    } else {
+                        ""
+                    };
+                    match &iso {
+                        Some(iso) => println!("{vm}  cdrom {iso}{when}"),
+                        None => println!("{vm}  cdrom ejected{when}"),
+                    }
+                }
+                cdrom_result = Some(v);
+            }
             if json {
-                print_json(&serde_json::json!({"resources": resources, "vnc": vnc_result}));
+                print_json(&serde_json::json!({
+                    "resources": resources,
+                    "vnc": vnc_result,
+                    "cdrom": cdrom_result,
+                }));
             }
         }
         Cmd::Agent { vm, state } => {
@@ -1317,6 +1360,17 @@ mod tests {
             }
         ));
         assert!(set(&["--mem", "1G", "--vnc", "off"]).is_ok());
+        let c = set(&["--cdrom", "eject", "--vnc", "on"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                cdrom: Some(ref c),
+                vnc: Some(OnOff::On),
+                ..
+            } if c == "eject"
+        ));
+        assert!(set(&["--cdrom", "fedora-44-workstation"]).is_ok());
+        assert!(set(&["--cdrom"]).is_err());
         assert!(set(&[]).is_err(), "at least one setting");
         assert!(set(&["--mem", "2T"]).is_err());
         let c = Cli::try_parse_from(["stallo", "new", "dev", "--vnc"]).unwrap();

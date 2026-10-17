@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use common::Daemon;
+use serde_json::Value;
 use stallo::api::{Request, Via, VmDetails};
 use stallo::config::VmConfig;
 
@@ -164,4 +165,92 @@ fn boots_installer_iso() {
     d.ok(&["rm", "desk", "--yes"]);
     // The cached ISO is the human's to delete.
     assert!(d.data.join(format!("images/{ISO}.iso")).is_file());
+}
+
+/// ISO-3: with the installer ejected, the VM starts with an empty CD-ROM
+/// drive and its blank disk: the firmware finds nothing to boot and the VM
+/// keeps running (no crash). Agents may not change the drive.
+#[test]
+#[ignore = "boots a VM from an installer ISO; run with STALLO_IT=1"]
+fn ejected_installer_boots_empty() {
+    if !common::enabled() {
+        return;
+    }
+    let need = MEMORY_MIB + 512 + common::HEADROOM_MIB;
+    let available = Daemon::host_available_mib();
+    assert!(
+        available >= need,
+        "{available} MiB available, {need} MiB needed"
+    );
+    let d = Daemon::start_with("iso-eject", "", MEMORY_MIB, ISO);
+    d.ok(&["new", "desk", "--image", ISO]);
+    let eject = Request::SetCdrom {
+        name: "desk".into(),
+        iso: None,
+    };
+    let err = d.api(Via::Mcp, eject.clone()).unwrap_err();
+    assert!(
+        err.to_string().contains("only available to humans"),
+        "{err}"
+    );
+
+    // Ejected while running: from the next start, in one JSON reply.
+    let out = d.ok(&["set", "desk", "--cdrom", "eject", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["cdrom"],
+        serde_json::json!({"running": true, "cdrom": null})
+    );
+    assert_eq!((&v["resources"], &v["vnc"]), (&Value::Null, &Value::Null));
+    d.ok(&["stop", "desk", "--force"]);
+    d.ok(&["start", "desk"]);
+    let qemu = d.vm_pids("desk")[0];
+    let argv = fs::read_to_string(format!("/proc/{qemu}/cmdline"))
+        .unwrap()
+        .replace('\0', " ");
+    assert!(
+        argv.contains("-device ide-cd,id=cd0,bus=ide.0,bootindex=2")
+            && !argv.contains("cd0-file")
+            && !argv.contains(ISO)
+            && !argv.contains("-smbios"),
+        "{argv}"
+    );
+    std::thread::sleep(Duration::from_secs(30));
+    let info: VmDetails = serde_json::from_value(
+        d.api(
+            Via::Cli,
+            Request::Info {
+                name: "desk".into(),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (info.vm.state.as_str(), info.vm.cdrom.as_deref()),
+        ("running", None)
+    );
+    let shot = d
+        .api(
+            Via::Cli,
+            Request::Screenshot {
+                name: "desk".into(),
+            },
+        )
+        .unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(shot["png_base64"].as_str().unwrap())
+        .unwrap();
+    let saved = d.base.parent().unwrap().join("iso-ejected.png");
+    fs::write(&saved, &png).unwrap();
+    eprintln!("MEASURE ejected screen saved {}", saved.display());
+    d.assert_safe("desk");
+
+    // Back in, from the next start.
+    d.ok(&["stop", "desk", "--force"]);
+    let out = d.ok(&["set", "desk", "--cdrom", ISO]);
+    assert!(out.contains(&format!("desk  cdrom {ISO}")), "{out}");
+    let cfg = VmConfig::load(&d.vm_dir("desk")).unwrap();
+    assert_eq!(cfg.cdrom.as_deref(), Some(ISO));
+    d.ok(&["rm", "desk", "--yes"]);
 }
