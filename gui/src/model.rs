@@ -464,6 +464,16 @@ fn next_step(e: &CallError) -> Option<&'static str> {
     };
     if msg.contains("guest agent") {
         Some("Check that qemu-guest-agent is installed and running in the VM.")
+    } else if msg.contains("RAM snapshots") {
+        Some(
+            "Delete the snapshots that hold memory in the Snapshots tab, or keep the current size.",
+        )
+    } else if msg.contains("over the VM memory budget")
+        || msg.contains("not enough free host memory")
+    {
+        Some("Stop another VM or choose less memory.")
+    } else if msg.contains("is too many for a") {
+        Some("Choose fewer processors.")
     } else if msg.contains("GiB floor") {
         Some("Free up disk space on the host, then try again.")
     } else if msg == "stallod is busy; try again" {
@@ -501,6 +511,15 @@ pub enum Action {
     Restart {
         live_screen: bool,
     },
+    /// Turns agent control on or off.
+    Agent(bool),
+    /// Deletes the VM with its disk and snapshots (`rm`).
+    Remove,
+    /// Changes a stopped VM's processors and memory; `None` keeps one.
+    Resize {
+        vcpus: Option<u32>,
+        memory_mib: Option<u64>,
+    },
 }
 
 impl Action {
@@ -526,6 +545,13 @@ impl Action {
                 tag: tag.clone(),
             }],
             Action::LiveScreen(on) => vec![live_screen(*on)],
+            Action::Agent(on) => vec![Request::SetAgent { name, on: *on }],
+            Action::Remove => vec![Request::Rm { name }],
+            Action::Resize { vcpus, memory_mib } => vec![Request::SetResources {
+                name,
+                vcpus: *vcpus,
+                memory_mib: *memory_mib,
+            }],
             Action::Restart { live_screen: on } => on
                 .then(|| live_screen(true))
                 .into_iter()
@@ -546,7 +572,12 @@ impl Action {
     pub fn lifecycle(&self) -> bool {
         matches!(
             self,
-            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. }
+            Action::Life(_)
+                | Action::LiveScreen(_)
+                | Action::Restart { .. }
+                | Action::Agent(_)
+                | Action::Remove
+                | Action::Resize { .. }
         )
     }
 
@@ -588,6 +619,15 @@ impl Action {
                 (format!("turn on the live screen and restart {vm}"), None)
             }
             Action::Restart { live_screen: false } => (format!("restart {vm}"), None),
+            Action::Agent(on) => (
+                format!(
+                    "turn {} agent control of {vm}",
+                    if *on { "on" } else { "off" }
+                ),
+                None,
+            ),
+            Action::Remove => (format!("delete {vm}"), None),
+            Action::Resize { .. } => (format!("change the resources of {vm}"), None),
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
                 Some(format!("Snapshot of {vm} still running")),
@@ -633,6 +673,10 @@ impl Action {
             Action::LiveScreen(true) => "Turning on live screen…",
             Action::LiveScreen(false) => "Turning off live screen…",
             Action::Restart { .. } => "Restarting…",
+            Action::Agent(true) => "Turning on agent control…",
+            Action::Agent(false) => "Turning off agent control…",
+            Action::Remove => "Deleting VM…",
+            Action::Resize { .. } => "Changing resources…",
         }
     }
 
@@ -641,8 +685,12 @@ impl Action {
     pub fn done(&self, vm: &str, data: &serde_json::Value) -> Option<String> {
         let vm = printable(vm, 64);
         match self {
-            // The Screen tab shows the outcome.
-            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. } => None,
+            // The Screen tab or the switch shows the outcome.
+            Action::Life(_) | Action::LiveScreen(_) | Action::Restart { .. } | Action::Agent(_) => {
+                None
+            }
+            Action::Remove => Some(format!("{vm} deleted")),
+            Action::Resize { .. } => Some(format!("Resources of {vm} changed")),
             Action::Take(_) => Some(match data.get("name").and_then(|n| n.as_str()) {
                 Some(n) => format!("Snapshot {} taken", printable(n, 64)),
                 None => "Snapshot taken".to_owned(),
@@ -955,6 +1003,15 @@ pub fn confirm_delete(vm: &VmInfo, tag: &str) -> Confirm {
     }
 }
 
+/// Memory in words: whole GiB where it is one, else MiB.
+fn memory(mib: u64) -> String {
+    if mib.is_multiple_of(1024) {
+        format!("{} GiB", mib / 1024)
+    } else {
+        format!("{mib} MiB")
+    }
+}
+
 const MIB_PER_GIB: f64 = 1024.0;
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 /// Addresses shown at most; a guest reports what it likes.
@@ -965,11 +1022,7 @@ pub type Facts = Vec<(&'static str, Vec<(&'static str, String)>)>;
 
 pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
     let k = kind(&vm.state);
-    let memory = if vm.memory_mib.is_multiple_of(1024) {
-        format!("{} GiB", vm.memory_mib / 1024)
-    } else {
-        format!("{} MiB", vm.memory_mib)
-    };
+    let memory = memory(vm.memory_mib);
     let used = details.map_or("Unknown".to_owned(), |d| {
         format!("{:.1} GiB", d.disk_used_bytes as f64 / BYTES_PER_GIB)
     });
@@ -1316,6 +1369,8 @@ pub struct NewVm {
     pub memory_gib: u64,
     pub disk_gib: u64,
     pub internet: bool,
+    /// The live screen from the first start.
+    pub live_screen: bool,
 }
 
 impl NewVm {
@@ -1335,7 +1390,7 @@ impl NewVm {
             },
             forwards: vec![],
             wait: true,
-            vnc: false,
+            vnc: self.live_screen,
         }
     }
 
@@ -1556,6 +1611,169 @@ pub fn confirm_restart(vm: &VmInfo) -> Confirm {
     }
 }
 
+/// A VM setting with a switch in the Overview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    LiveScreen,
+    Agent,
+}
+
+impl Setting {
+    /// Whether `vm` has it on.
+    pub fn of(self, vm: &VmInfo) -> bool {
+        match self {
+            Setting::LiveScreen => vm.vnc,
+            Setting::Agent => vm.agent_control,
+        }
+    }
+
+    pub fn action(self, on: bool) -> Action {
+        match self {
+            Setting::LiveScreen => Action::LiveScreen(on),
+            Setting::Agent => Action::Agent(on),
+        }
+    }
+
+    /// The question before turning it on.
+    pub fn confirm(self, vm: &VmInfo) -> Confirm {
+        match self {
+            Setting::LiveScreen => confirm_live_screen_switch(vm),
+            Setting::Agent => confirm_agent(vm),
+        }
+    }
+
+    /// Whether turning it on is a risk the dialog marks as destructive.
+    pub fn destructive(self) -> bool {
+        self == Setting::Agent
+    }
+
+    /// What its switch moving to `active` asks for: nothing when the
+    /// switch only follows the VM (an update), the action when it turns
+    /// off, the question (`None` inside) when it turns on.
+    pub fn moved(self, vm: &VmInfo, active: bool) -> Option<Option<Action>> {
+        match (self.of(vm) == active, active) {
+            (true, _) => None,
+            (false, false) => Some(Some(self.action(false))),
+            (false, true) => Some(None),
+        }
+    }
+
+    /// What its switch shows: the VM's value, but not while an action
+    /// runs (`blocked`), which may be this switch's own.
+    pub fn shown(self, vm: &VmInfo, blocked: bool) -> Option<bool> {
+        (!blocked).then(|| self.of(vm))
+    }
+}
+
+/// The question before agent control goes on (SECURITY.md, agent policy).
+pub fn confirm_agent(vm: &VmInfo) -> Confirm {
+    Confirm {
+        heading: "Turn On Agent Control?".to_owned(),
+        body: format!(
+            "AI agents connected to Stallo can then use {} fully: run commands as root, read and write its files, see its screen and press keys. Stallo logs each of their calls. Only turn this on for a VM you can afford to lose.",
+            printable(&vm.name, 64)
+        ),
+        button: "Turn On",
+    }
+}
+
+/// Copied, never run: connects Claude Code (or prints the setup for
+/// other MCP clients).
+pub const MCP_INSTALL: &str = "stallo mcp install";
+
+/// The stop to offer, with its button label, where a change needs the
+/// VM stopped; `None` when it is.
+pub fn stop_offer(vm: &VmInfo) -> Option<(Op, &'static str)> {
+    match kind(&vm.state) {
+        Kind::Stopped => None,
+        Kind::Running => Some((Op::Stop, "Stop")),
+        // A VM that does not run gets no clean stop.
+        _ => Some((Op::ForceOff, "Force Off…")),
+    }
+}
+
+/// What the Overview's Delete VM row says, and whether it can delete
+/// now: the daemon deletes only stopped VMs.
+pub fn remove_note(vm: &VmInfo) -> (&'static str, bool) {
+    match kind(&vm.state) {
+        Kind::Stopped => ("Deletes its disk and all its snapshots for good.", true),
+        _ => ("Stop the VM to delete it.", false),
+    }
+}
+
+/// Why the processors and memory cannot be changed now, if so. Fixed
+/// text (a group description is markup).
+pub fn resize_block(vm: &VmInfo) -> Option<&'static str> {
+    stop_offer(vm).map(|_| "Stop the VM to change its processors or memory.")
+}
+
+/// The resources editor: where its values start and how far they go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeForm {
+    pub vcpus: u32,
+    /// What the VM has now, exactly.
+    pub memory_mib: u64,
+    pub memory_gib: u64,
+    pub max_vcpus: u32,
+    pub max_memory_gib: u64,
+}
+
+/// Capped as the daemon admits growth, as for a new VM (the VM is
+/// stopped, so it uses nothing yet). Keeping or shrinking is always
+/// allowed, so the caps never go below what the VM has.
+pub fn resize_form(vm: &VmInfo, host: &HostInfo) -> ResizeForm {
+    let limits = limits(host, 0);
+    // Whole GiB in the editor; a VM made with odd MiB keeps them unless
+    // memory is changed.
+    let memory_gib = (vm.memory_mib / 1024).max(1);
+    ResizeForm {
+        vcpus: vm.vcpus,
+        memory_mib: vm.memory_mib,
+        memory_gib,
+        max_vcpus: limits.vcpus.max(vm.vcpus).min(255),
+        max_memory_gib: limits.memory_gib.max(memory_gib),
+    }
+}
+
+impl ResizeForm {
+    /// The change for the values chosen: only what moved from the start,
+    /// or nothing to send.
+    pub fn action(&self, vcpus: u32, memory_gib: u64) -> Option<Action> {
+        let vcpus = (vcpus != self.vcpus).then_some(vcpus);
+        let memory_mib = (memory_gib != self.memory_gib).then_some(memory_gib << 10);
+        (vcpus.is_some() || memory_mib.is_some()).then_some(Action::Resize { vcpus, memory_mib })
+    }
+
+    /// The subtitles of the processor and memory rows.
+    pub fn notes(&self) -> [String; 2] {
+        [
+            format!("Up to {}", self.max_vcpus),
+            format!(
+                "Now {} · up to {} GiB",
+                memory(self.memory_mib),
+                self.max_memory_gib
+            ),
+        ]
+    }
+}
+
+/// The question before deleting a VM; its button needs the name typed.
+pub fn confirm_remove(vm: &VmInfo) -> Confirm {
+    let name = printable(&vm.name, 64);
+    Confirm {
+        heading: format!("Delete {name}?"),
+        body: format!(
+            "{name}, its disk and all its snapshots are deleted for good. This cannot be undone. Type {name} to confirm."
+        ),
+        button: "Delete VM",
+    }
+}
+
+/// Whether the name typed in the delete dialog is the VM's.
+pub fn remove_typed(typed: &str, vm: &str) -> bool {
+    typed == vm
+}
+
 /// Whether the screen is view-only: it turns on when agent control does
 /// (or is on when the tab opens), so a human and an agent do not fight
 /// over the mouse. Otherwise the user's choice stays. `agent_before` is
@@ -1772,6 +1990,299 @@ pub fn ctrl_alt_del() -> Vec<Input> {
         .map(|&k| key(k, true))
         .chain(keys.iter().rev().map(|&k| key(k, false)))
         .collect()
+}
+
+/// Bytes asked for per `file_read`, as `stallo cp` asks.
+pub const READ_CHUNK: u64 = 8 << 20;
+/// The largest file downloaded, as `stallo cp` has it, so a hostile
+/// guest cannot fill the host disk with an endless file.
+pub const MAX_DOWNLOAD: u64 = 16 << 30;
+/// The time limit of one file request: the daemon waits up to 30 s for
+/// the guest agent, then up to 120 s for the copy in the guest.
+pub const FILE_LIMIT: Duration = Duration::from_secs(180);
+
+/// What the Files tab shows instead of its buttons while the VM does not
+/// run. Fixed text only. A copy that runs (`copying`) keeps the buttons
+/// and its progress in view, even when the VM stops under it.
+pub fn files_status(vm: &VmInfo, copying: bool) -> Option<ScreenStatus> {
+    let (title, description, button) = match kind(&vm.state) {
+        _ if copying => return None,
+        Kind::Running => return None,
+        Kind::Stopped => (
+            "The VM Is Stopped",
+            "Start the VM to copy files in or out.",
+            Some("Start"),
+        ),
+        _ => (
+            "The VM Is Not Running",
+            "Files can be copied while the VM runs.",
+            None,
+        ),
+    };
+    Some(ScreenStatus {
+        icon: Some("folder-symbolic"),
+        title,
+        description,
+        button,
+    })
+}
+
+/// Where a path typed for the VM starts: the home of the guest user, or
+/// root's.
+pub fn guest_home(admin: bool) -> String {
+    if admin {
+        "/root/".to_owned()
+    } else {
+        format!("/home/{}/", stallo::seed::GUEST_USER)
+    }
+}
+
+/// The last part of a path, if it names a file.
+pub fn file_name(path: &str) -> Option<&str> {
+    path.rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+}
+
+/// A path typed for the VM, checked as the daemon checks it. For an
+/// upload (`upload` is the host file's name) a folder gets that name, as
+/// with `stallo cp`; a download needs a file.
+pub fn guest_path(typed: &str, upload: Option<&str>) -> Result<String, &'static str> {
+    if !typed.starts_with('/') {
+        return Err("Use a full path, starting with /.");
+    }
+    if typed.contains('\0') {
+        return Err("The path cannot contain a NUL character.");
+    }
+    let path = match upload {
+        Some(name) if typed.ends_with('/') => format!("{typed}{name}"),
+        _ => typed.to_owned(),
+    };
+    if file_name(&path).is_none() {
+        return Err("Add a file name to the path.");
+    }
+    if path.len() > 4096 {
+        return Err("The path is too long.");
+    }
+    Ok(path)
+}
+
+/// The `file_write` for host bytes `chunk` read at `offset`, or none: an
+/// empty chunk past the start adds nothing. The first write replaces the
+/// guest file, and creates it empty for an empty file.
+pub fn write_request(
+    vm: &str,
+    path: &str,
+    offset: u64,
+    chunk: &[u8],
+    admin: bool,
+) -> Option<Request> {
+    use base64::Engine;
+    (offset == 0 || !chunk.is_empty()).then(|| Request::FileWrite {
+        name: vm.to_owned(),
+        path: path.to_owned(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+        append: offset > 0,
+        admin,
+    })
+}
+
+/// Whether a chunk of `len` bytes was the host file's last.
+pub fn last_chunk(len: usize) -> bool {
+    len < stallo::api::FILE_WRITE_CHUNK
+}
+
+pub fn read_request(vm: &str, path: &str, offset: u64, admin: bool) -> Request {
+    Request::FileRead {
+        name: vm.to_owned(),
+        path: path.to_owned(),
+        offset,
+        max_bytes: Some(READ_CHUNK),
+        admin,
+    }
+}
+
+/// A `file_read` answer for the part at `offset`: its bytes, and whether
+/// the file goes on. The guest is not trusted.
+pub fn read_answer(data: serde_json::Value, offset: u64) -> Result<(Vec<u8>, bool), String> {
+    use base64::Engine;
+    let part: stallo::api::FileData =
+        serde_json::from_value(data).map_err(|e| format!("unexpected answer from stallod: {e}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&part.data_base64)
+        .map_err(|e| format!("unexpected answer from stallod: {e}"))?;
+    // A guest that claims more but sends nothing would loop forever.
+    if part.more && bytes.is_empty() {
+        return Err("the guest sent no data".to_owned());
+    }
+    if offset.saturating_add(bytes.len() as u64) > MAX_DOWNLOAD {
+        return Err(format!(
+            "the file is larger than {} GiB; not copied",
+            MAX_DOWNLOAD >> 30
+        ));
+    }
+    Ok((bytes, part.more))
+}
+
+/// A file copy as the Files tab shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transfer {
+    pub upload: bool,
+    /// The file's name, safe for plain labels.
+    pub name: String,
+    pub done: u64,
+    /// The size, when known: downloads go until the guest says the end.
+    pub total: Option<u64>,
+}
+
+impl Transfer {
+    pub fn new(upload: bool, path: &str) -> Self {
+        Self {
+            upload,
+            name: printable(file_name(path).unwrap_or(path), 64),
+            done: 0,
+            total: None,
+        }
+    }
+
+    pub fn title(&self) -> String {
+        let verb = if self.upload {
+            "Uploading"
+        } else {
+            "Downloading"
+        };
+        format!("{verb} {}…", self.name)
+    }
+
+    /// Bytes done, of how many if known.
+    pub fn progress(&self) -> String {
+        match self.total {
+            Some(total) => format!("{} of {}", bytes(self.done), bytes(total)),
+            None => format!("{} so far", bytes(self.done)),
+        }
+    }
+
+    /// Done as a share, 0 to 1, if the size is known.
+    pub fn fraction(&self) -> Option<f64> {
+        self.total.map(|t| match t {
+            0 => 1.0,
+            t => (self.done as f64 / t as f64).min(1.0),
+        })
+    }
+
+    pub fn done_text(&self, vm: &str) -> String {
+        let vm = printable(vm, 64);
+        if self.upload {
+            format!("{} copied to {vm}", self.name)
+        } else {
+            format!("{} copied from {vm}", self.name)
+        }
+    }
+
+    /// Cancelled: an upload leaves the part copied so far in the VM.
+    pub fn cancelled(&self) -> String {
+        if self.upload {
+            format!("Upload cancelled. {} in the VM is incomplete.", self.name)
+        } else {
+            "Download cancelled".to_owned()
+        }
+    }
+
+    pub fn failed(&self, e: &CallError) -> Failure {
+        if let CallError::Failed(m) = e
+            && m.contains("guest agent")
+        {
+            return failure(
+                "Files need qemu-guest-agent running in the VM".to_owned(),
+                e,
+            );
+        }
+        let verb = if self.upload { "upload" } else { "download" };
+        failure(format!("Could not {verb} {}", self.name), e)
+    }
+}
+
+/// A copy that runs, as the Files tab of its VM shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyJob {
+    pub transfer: Transfer,
+    /// Cancel was pressed: it stops after the chunk in flight.
+    pub cancelled: bool,
+}
+
+impl CopyJob {
+    /// What the progress row's subtitle says.
+    pub fn subtitle(&self) -> String {
+        if self.cancelled {
+            "Cancelling…".to_owned()
+        } else {
+            self.transfer.progress()
+        }
+    }
+}
+
+/// The copies that run, one per VM at most, kept by the window rather
+/// than a VM's page, so a page opened again shows its VM's copy.
+#[derive(Debug, Default)]
+pub struct Copies(HashMap<String, CopyJob>);
+
+impl Copies {
+    /// Claims `vm` for a copy; false if one runs there already.
+    pub fn start(&mut self, vm: &str, transfer: Transfer) -> bool {
+        if self.0.contains_key(vm) {
+            return false;
+        }
+        let job = CopyJob {
+            transfer,
+            cancelled: false,
+        };
+        self.0.insert(vm.to_owned(), job);
+        true
+    }
+
+    pub fn get(&self, vm: &str) -> Option<&CopyJob> {
+        self.0.get(vm)
+    }
+
+    /// The size is known now.
+    pub fn sized(&mut self, vm: &str, total: u64) {
+        if let Some(j) = self.0.get_mut(vm) {
+            j.transfer.total = Some(total);
+        }
+    }
+
+    /// `bytes` more are copied.
+    pub fn copied(&mut self, vm: &str, bytes: u64) {
+        if let Some(j) = self.0.get_mut(vm) {
+            j.transfer.done += bytes;
+        }
+    }
+
+    pub fn cancel(&mut self, vm: &str) {
+        if let Some(j) = self.0.get_mut(vm) {
+            j.cancelled = true;
+        }
+    }
+
+    /// Whether the copy on `vm` should stop: cancelled, or gone.
+    pub fn stops(&self, vm: &str) -> bool {
+        self.0.get(vm).is_none_or(|j| j.cancelled)
+    }
+
+    /// The copy ended; frees `vm` for the next one.
+    pub fn finish(&mut self, vm: &str) -> Option<CopyJob> {
+        self.0.remove(vm)
+    }
+}
+
+/// A byte count in words.
+fn bytes(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} bytes"),
+        1024..1_048_576 => format!("{} KiB", n >> 10),
+        1_048_576..1_073_741_824 => format!("{:.1} MiB", n as f64 / 1_048_576.0),
+        _ => format!("{:.1} GiB", n as f64 / BYTES_PER_GIB),
+    }
 }
 
 #[cfg(test)]
@@ -3206,6 +3717,7 @@ mod tests {
             memory_gib: 3,
             disk_gib: 30,
             internet: true,
+            live_screen: false,
         };
         let json = |r: Request| serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -3215,9 +3727,12 @@ mod tests {
         let cached = NewVm {
             internet: false,
             cached: true,
+            live_screen: true,
             ..plan.clone()
         };
-        assert!(json(cached.request()).contains(r#""net":"offline""#));
+        let sent = json(cached.request());
+        assert!(sent.contains(r#""net":"offline""#), "{sent}");
+        assert!(sent.ends_with(r#""wait":true,"vnc":true}"#), "{sent}");
 
         assert_eq!(
             plan.progress(),
@@ -3655,5 +4170,389 @@ mod tests {
         // An action on the VM holds its row and its buttons.
         let r = row(&vm("running"), Some(&Action::Restart { live_screen: true }));
         assert_eq!(r.working, Some("Restarting…"));
+    }
+
+    #[test]
+    fn guest_paths() {
+        assert_eq!(guest_home(false), "/home/agent/");
+        assert_eq!(guest_home(true), "/root/");
+        assert_eq!(file_name("/home/agent/notes.txt"), Some("notes.txt"));
+        for none in ["/", "/home/agent/", "/tmp/..", "/tmp/.", ""] {
+            assert_eq!(file_name(none), None, "{none}");
+        }
+        // Uploads: a folder gets the host file's name, as with `stallo cp`.
+        assert_eq!(
+            guest_path("/home/agent/", Some("a b.txt")),
+            Ok("/home/agent/a b.txt".to_owned())
+        );
+        assert_eq!(guest_path("/tmp/x", Some("a.txt")), Ok("/tmp/x".to_owned()));
+        // Downloads need a file.
+        assert_eq!(
+            guest_path("/etc/os-release", None),
+            Ok("/etc/os-release".into())
+        );
+        assert!(guest_path("/home/agent/", None).is_err());
+        assert!(guest_path("/home/agent/", Some("")).is_err());
+        for bad in ["", "notes.txt", "~/notes.txt", "/tmp/a\0b"] {
+            assert!(guest_path(bad, Some("a")).is_err(), "{bad:?}");
+        }
+        let long = format!("/{}", "a".repeat(4096));
+        assert_eq!(guest_path(&long, None), Err("The path is too long."));
+        assert!(guest_path(&long[..4096], None).is_ok());
+    }
+
+    #[test]
+    fn file_chunks() {
+        use base64::Engine;
+        let wire = |r: Option<Request>| r.map(|r| serde_json::to_string(&r).unwrap());
+        // An empty file still creates the guest file.
+        assert_eq!(
+            wire(write_request("dev", "/tmp/a", 0, b"", false)).unwrap(),
+            r#"{"op":"file_write","name":"dev","path":"/tmp/a","data_base64":"","append":false,"admin":false}"#
+        );
+        // The first chunk replaces, later ones append.
+        assert!(
+            wire(write_request("dev", "/tmp/a", 0, b"hi", true))
+                .unwrap()
+                .contains(r#""data_base64":"aGk=","append":false,"admin":true"#)
+        );
+        assert!(
+            wire(write_request("dev", "/tmp/a", 7, b"hi", false))
+                .unwrap()
+                .contains(r#""append":true"#)
+        );
+        // A file of whole chunks ends with an empty read: nothing to send.
+        assert_eq!(write_request("dev", "/tmp/a", 7, b"", false), None);
+        let chunk = stallo::api::FILE_WRITE_CHUNK;
+        assert!(!last_chunk(chunk));
+        assert!(last_chunk(chunk - 1) && last_chunk(0));
+        assert_eq!(
+            serde_json::to_string(&read_request("dev", "/tmp/a", 9, false)).unwrap(),
+            r#"{"op":"file_read","name":"dev","path":"/tmp/a","offset":9,"max_bytes":8388608,"admin":false}"#
+        );
+        assert!(READ_CHUNK <= stallo::vm::FILE_MAX as u64);
+
+        let part = |data: &[u8], more: bool| {
+            serde_json::json!({
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(data),
+                "size": data.len(),
+                "more": more,
+            })
+        };
+        assert_eq!(
+            read_answer(part(b"abc", true), 0),
+            Ok((b"abc".to_vec(), true))
+        );
+        assert_eq!(read_answer(part(b"", false), 5), Ok((vec![], false)));
+        // A guest that says "more" but sends nothing would never end.
+        assert!(
+            read_answer(part(b"", true), 5)
+                .unwrap_err()
+                .contains("no data")
+        );
+        assert!(
+            read_answer(part(b"x", true), MAX_DOWNLOAD)
+                .unwrap_err()
+                .contains("16 GiB")
+        );
+        assert!(read_answer(part(b"x", false), MAX_DOWNLOAD - 1).is_ok());
+        let bad = serde_json::json!({"data_base64": "!!", "size": 1, "more": false});
+        assert!(
+            read_answer(bad, 0)
+                .unwrap_err()
+                .contains("unexpected answer")
+        );
+        assert!(read_answer(serde_json::json!({}), 0).is_err());
+    }
+
+    #[test]
+    fn transfer_progress() {
+        let mut t = Transfer::new(true, "/home/me/report\nfinal.pdf");
+        assert_eq!(t.name, "reportfinal.pdf", "printable");
+        assert_eq!(t.title(), "Uploading reportfinal.pdf…");
+        assert_eq!(t.progress(), "0 bytes so far");
+        assert_eq!(t.fraction(), None);
+        t.total = Some(4 << 20);
+        t.done = 3 << 19;
+        assert_eq!(t.progress(), "1.5 MiB of 4.0 MiB");
+        assert_eq!(t.fraction(), Some(0.375));
+        t.done = 5 << 20;
+        assert_eq!(t.fraction(), Some(1.0), "a file that grew");
+        t.total = Some(0);
+        assert_eq!(t.fraction(), Some(1.0), "an empty file");
+        assert_eq!(t.done_text("dev"), "reportfinal.pdf copied to dev");
+        assert!(t.cancelled().contains("incomplete"));
+
+        let mut d = Transfer::new(false, "/var/log/syslog");
+        assert_eq!(d.title(), "Downloading syslog…");
+        d.done = 2048;
+        assert_eq!(d.progress(), "2 KiB so far");
+        d.done = 3 << 30;
+        assert_eq!(d.progress(), "3.0 GiB so far");
+        assert_eq!(d.done_text("dev"), "syslog copied from dev");
+        assert_eq!(d.cancelled(), "Download cancelled");
+    }
+
+    #[test]
+    fn file_errors() {
+        let up = Transfer::new(true, "/tmp/a.txt");
+        // No guest agent: say what is missing, not the raw error.
+        for raw in [
+            "guest agent did not answer within 5s",
+            "guest agent: connection refused",
+        ] {
+            let f = up.failed(&CallError::Failed(raw.into()));
+            assert_eq!(f.title, "Files need qemu-guest-agent running in the VM");
+            let details = f.details.unwrap();
+            assert!(details.contains(raw) && details.contains("installed and running"));
+        }
+        let f = up.failed(&CallError::Failed(
+            "cannot write \"/root/a\": Permission denied".into(),
+        ));
+        assert_eq!(f.title, "Could not upload a.txt");
+        let down = Transfer::new(false, "/tmp/b");
+        assert_eq!(
+            down.failed(&CallError::Timeout).title,
+            "Could not download b"
+        );
+        assert_eq!(files_status(&vm("running"), false), None);
+        assert_eq!(
+            files_status(&vm("stopped"), false).unwrap().button,
+            Some("Start")
+        );
+        // A copy that runs stays in view when the VM stops under it.
+        assert_eq!(files_status(&vm("stopped"), true), None);
+        let paused = files_status(&vm("paused"), false).unwrap();
+        assert_eq!(paused.button, None);
+        assert!(paused.description.contains("while the VM runs"));
+    }
+
+    #[test]
+    fn copies_outlive_the_page() {
+        let mut c = Copies::default();
+        assert!(c.get("dev").is_none() && c.stops("dev"), "none runs");
+        assert!(c.start("dev", Transfer::new(true, "/tmp/a.txt")));
+        // One copy per VM; another VM is free.
+        assert!(!c.start("dev", Transfer::new(false, "/tmp/b")));
+        assert!(c.start("web", Transfer::new(false, "/tmp/b")));
+        assert!(!c.stops("dev"));
+        c.sized("dev", 4 << 20);
+        c.copied("dev", 1 << 20);
+        c.copied("dev", 1 << 20);
+        let job = c.get("dev").unwrap();
+        assert_eq!(job.transfer.title(), "Uploading a.txt…");
+        assert_eq!(job.subtitle(), "2.0 MiB of 4.0 MiB");
+        assert_eq!(job.transfer.fraction(), Some(0.5));
+        // Cancel: says so, and stops after the chunk in flight.
+        c.cancel("dev");
+        assert!(c.stops("dev") && !c.stops("web"));
+        assert_eq!(c.get("dev").unwrap().subtitle(), "Cancelling…");
+        let done = c.finish("dev").unwrap();
+        assert_eq!(done.transfer.done, 2 << 20);
+        assert!(c.get("dev").is_none());
+        assert!(c.start("dev", Transfer::new(true, "/tmp/c")), "free again");
+        // Updates to a VM without a copy change nothing.
+        c.copied("nope", 5);
+        c.cancel("nope");
+        assert!(c.get("nope").is_none());
+    }
+
+    #[test]
+    fn deleting_a_vm() {
+        let stopped = vm("stopped");
+        assert_eq!(stop_offer(&stopped), None);
+        let (note, can) = remove_note(&stopped);
+        assert!(note.contains("for good") && can);
+        assert_eq!(stop_offer(&vm("running")), Some((Op::Stop, "Stop")));
+        assert_eq!(
+            stop_offer(&vm("paused (disk full)")),
+            Some((Op::ForceOff, "Force Off…"))
+        );
+        assert_eq!(
+            remove_note(&vm("running")),
+            ("Stop the VM to delete it.", false)
+        );
+        assert!(!remove_note(&vm("paused")).1);
+        let c = confirm_remove(&stopped);
+        assert_eq!(c.heading, "Delete dev?");
+        assert!(c.body.contains("disk") && c.body.contains("snapshots"));
+        assert!(c.body.contains("for good") && c.body.contains("Type dev"));
+        assert_eq!(c.button, "Delete VM");
+        // The exact name, nothing near it.
+        assert!(remove_typed("dev", "dev"));
+        for typed in ["", "de", "dev ", "Dev", " dev"] {
+            assert!(!remove_typed(typed, "dev"), "{typed:?}");
+        }
+        assert_eq!(
+            serde_json::to_string(&Action::Remove.requests("dev")[0]).unwrap(),
+            r#"{"op":"rm","name":"dev"}"#
+        );
+        assert!(Action::Remove.lifecycle());
+        assert_eq!(Action::Remove.progress(), "Deleting VM…");
+        assert_eq!(
+            Action::Remove.done("dev", &serde_json::Value::Null),
+            Some("dev deleted".into())
+        );
+        let f = Action::Remove.failed(
+            "dev",
+            &CallError::Failed("dev is running; stop it first: stallo stop dev".into()),
+        );
+        assert_eq!(f.title, "Could not delete dev");
+    }
+
+    #[test]
+    fn agent_control() {
+        let c = confirm_agent(&vm("running"));
+        assert_eq!(c.heading, "Turn On Agent Control?");
+        for word in [
+            "root",
+            "files",
+            "screen",
+            "keys",
+            "logs",
+            "afford to lose",
+            "dev",
+        ] {
+            assert!(c.body.contains(word), "{word}");
+        }
+        assert_eq!(Setting::Agent.confirm(&vm("running")), c);
+        assert!(Setting::Agent.destructive() && !Setting::LiveScreen.destructive());
+        assert_eq!(MCP_INSTALL, "stallo mcp install");
+        assert_eq!(
+            serde_json::to_string(&Action::Agent(true).requests("dev")[0]).unwrap(),
+            r#"{"op":"set_agent","name":"dev","on":true}"#
+        );
+        assert!(Action::Agent(false).lifecycle());
+        assert_eq!(
+            Action::Agent(false).progress(),
+            "Turning off agent control…"
+        );
+        assert_eq!(
+            Action::Agent(true).done("dev", &serde_json::Value::Null),
+            None
+        );
+        assert_eq!(
+            Action::Agent(true).failed("dev", &CallError::Timeout).title,
+            "Could not turn on agent control of dev"
+        );
+    }
+
+    #[test]
+    fn switches_follow_the_vm() {
+        let mut on = vm("running");
+        on.agent_control = true;
+        let off = vm("running");
+        for s in [Setting::Agent, Setting::LiveScreen] {
+            let mut both = on.clone();
+            both.vnc = true;
+            // The window setting the VM's own value: no request, no loop.
+            assert_eq!(s.moved(&both, true), None, "{s:?}");
+            assert_eq!(s.moved(&off, false), None, "{s:?}");
+            // Off at once, on after the question.
+            assert_eq!(s.moved(&both, false), Some(Some(s.action(false))));
+            assert_eq!(s.moved(&off, true), Some(None));
+            // Not while an action (maybe its own) runs.
+            assert_eq!(s.shown(&both, true), None);
+            assert_eq!(s.shown(&both, false), Some(true));
+            assert_eq!(s.shown(&off, false), Some(false));
+        }
+        assert!(Setting::Agent.of(&on) && !Setting::LiveScreen.of(&on));
+        assert_eq!(Setting::LiveScreen.action(true), Action::LiveScreen(true));
+        assert_eq!(Setting::Agent.action(false), Action::Agent(false));
+    }
+
+    #[test]
+    fn changing_resources() {
+        let host = roomy_host();
+        let room = limits(&host, 0);
+        let stopped = vm("stopped");
+        assert_eq!(resize_block(&stopped), None);
+        assert!(
+            resize_block(&vm("running"))
+                .unwrap()
+                .contains("Stop the VM")
+        );
+        let form = resize_form(&stopped, &host);
+        assert_eq!(
+            form,
+            ResizeForm {
+                vcpus: 2,
+                memory_mib: 2048,
+                memory_gib: 2,
+                max_vcpus: room.vcpus,
+                max_memory_gib: room.memory_gib,
+            }
+        );
+        assert_eq!(
+            form.notes(),
+            [
+                format!("Up to {}", room.vcpus),
+                format!("Now 2 GiB · up to {} GiB", room.memory_gib)
+            ]
+        );
+        // Only what changed is sent; nothing changed, nothing to save.
+        assert_eq!(form.action(2, 2), None);
+        assert_eq!(
+            form.action(4, 2),
+            Some(Action::Resize {
+                vcpus: Some(4),
+                memory_mib: None
+            })
+        );
+        let both = form.action(1, 3).unwrap();
+        assert_eq!(
+            serde_json::to_string(&both.requests("dev")[0]).unwrap(),
+            r#"{"op":"set_resources","name":"dev","vcpus":1,"memory_mib":3072}"#
+        );
+        assert!(both.lifecycle());
+        assert_eq!(both.progress(), "Changing resources…");
+        assert_eq!(
+            both.done("dev", &serde_json::Value::Null),
+            Some("Resources of dev changed".into())
+        );
+        // A busy host never caps below what the VM has: shrinking is free.
+        let busy = HostInfo {
+            cores: 2,
+            memory_used_mib: host.memory_budget_mib,
+            ..host
+        };
+        let big = VmInfo {
+            vcpus: 8,
+            memory_mib: 6 * 1024 + 512,
+            ..vm("stopped")
+        };
+        let f = resize_form(&big, &busy);
+        assert_eq!((f.max_vcpus, f.max_memory_gib), (8, 6));
+        // Odd MiB stay unless memory is changed.
+        assert_eq!(f.memory_gib, 6);
+        assert_eq!(f.notes()[1], "Now 6656 MiB · up to 6 GiB");
+        assert_eq!(
+            f.action(4, 6),
+            Some(Action::Resize {
+                vcpus: Some(4),
+                memory_mib: None
+            })
+        );
+        // The daemon's refusals come with a next step.
+        let refusal = |m: &str| {
+            Action::Resize {
+                vcpus: Some(4),
+                memory_mib: None,
+            }
+            .failed("dev", &CallError::Failed(m.into()))
+        };
+        let f = refusal(
+            "dev has RAM snapshots (s1) that only restore at its current size; delete them first: stallo snap dev --delete <name>",
+        );
+        assert_eq!(f.title, "Could not change the resources of dev");
+        assert!(f.details.unwrap().contains("Snapshots tab"));
+        assert!(refusal("9000 MiB (guest RAM + QEMU overhead) is over the VM memory budget: 100 MiB of 16384 MiB left; stop a VM or lower --mem")
+            .details.unwrap().contains("Stop another VM"));
+        assert!(
+            refusal("20 vCPUs is too many for a 16-core host (at most 14; 2 stay with the host)")
+                .details
+                .unwrap()
+                .contains("fewer processors")
+        );
     }
 }

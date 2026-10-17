@@ -189,6 +189,7 @@ struct Form {
     memory: adw::SpinRow,
     disk: adw::SpinRow,
     internet: adw::SwitchRow,
+    live_screen: adw::SwitchRow,
     create: gtk::Button,
     host: HostInfo,
     /// Names of the VMs there are.
@@ -255,10 +256,18 @@ impl Form {
             .build();
         name.upcast_ref::<gtk::Widget>()
             .update_relation(&[gtk::accessible::Relation::DescribedBy(&[hint.upcast_ref()])]);
-        // The Live Screen switch joins this group once `new` takes `vnc`.
         let name_group = adw::PreferencesGroup::new();
         name_group.add(&name);
         name_group.add(&hint);
+        // Its own group: the name's hint stays right under the name.
+        let live_screen = adw::SwitchRow::builder()
+            .title("Live Screen")
+            .subtitle("See and use the VM's screen here. Anyone in the stallo group can too.")
+            .use_markup(false)
+            .active(true)
+            .build();
+        let screen_group = adw::PreferencesGroup::new();
+        screen_group.add(&live_screen);
 
         let spin = |title: &str, value: u64, lower: u64| {
             let adjustment = gtk::Adjustment::new(
@@ -297,6 +306,7 @@ impl Form {
         let page = adw::PreferencesPage::new();
         page.add(&image_group);
         page.add(&name_group);
+        page.add(&screen_group);
         page.add(&advanced_group);
         stack.add_named(&page, Some("form"));
         stack.set_visible_child_name("form");
@@ -315,6 +325,7 @@ impl Form {
             memory,
             disk,
             internet,
+            live_screen,
             create: create.clone(),
             host,
             taken,
@@ -477,6 +488,7 @@ impl Form {
             memory_gib,
             disk_gib,
             internet: self.internet.is_active(),
+            live_screen: self.live_screen.is_active(),
         };
         if let Some(d) = self.dialog.upgrade() {
             d.close();

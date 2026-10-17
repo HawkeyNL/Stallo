@@ -20,20 +20,23 @@ use crate::model::{self, Action, CallError, Probe, Production};
 /// How long a read request may take, waiting for a free slot included.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Requests in flight at once, app-wide: 13, in four pools. Lifecycle
-/// actions may take up to 150 s each, snapshot actions 15 min and creates
-/// (with an image download) 30 min, so each kind has its own slots: reads
-/// (polls, the probe) never wait behind an action, a start or stop never
-/// waits behind a snapshot job, and nothing waits behind a create. The
-/// window runs one create at a time.
+/// Requests in flight at once, app-wide: 15, in five pools. Lifecycle
+/// actions may take up to 150 s each, snapshot actions 15 min, creates
+/// (with an image download) 30 min and file copies one request per chunk,
+/// so each kind has its own slots: reads (polls, the probe) never wait
+/// behind an action, a start or stop never waits behind a snapshot job or
+/// a copy, and nothing waits behind a create. The window runs one create
+/// at a time.
 const READ_SLOTS: usize = 4;
 const ACTION_SLOTS: usize = 4;
 const SNAP_SLOTS: usize = 4;
 const CREATE_SLOTS: usize = 1;
+const FILE_SLOTS: usize = 2;
 static READS: Semaphore = Semaphore::const_new(READ_SLOTS);
 static ACTIONS: Semaphore = Semaphore::const_new(ACTION_SLOTS);
 static SNAPS: Semaphore = Semaphore::const_new(SNAP_SLOTS);
 static CREATES: Semaphore = Semaphore::const_new(CREATE_SLOTS);
+static FILES: Semaphore = Semaphore::const_new(FILE_SLOTS);
 
 fn runtime() -> &'static Handle {
     static RT: OnceLock<Handle> = OnceLock::new();
@@ -67,16 +70,27 @@ async fn call_in(
     request: Request,
     limit: Duration,
 ) -> Result<serde_json::Value, CallError> {
+    let work = async {
+        let _slot = slots.acquire().await;
+        send(socket, request, limit).await
+    };
+    tokio::time::timeout(limit, work)
+        .await
+        .unwrap_or(Err(CallError::Timeout))
+}
+
+/// Sends one request, without a slot; `limit` covers the answer.
+async fn send(
+    socket: &Path,
+    request: Request,
+    limit: Duration,
+) -> Result<serde_json::Value, CallError> {
     // The app is a human interface, like the CLI.
     let envelope = Envelope {
         via: Via::Cli,
         request,
     };
-    let work = async {
-        let _slot = slots.acquire().await;
-        stallo::api::call(socket, &envelope).await
-    };
-    match tokio::time::timeout(limit, work).await {
+    match tokio::time::timeout(limit, stallo::api::call(socket, &envelope)).await {
         Err(_) => Err(CallError::Timeout),
         Ok(Ok(data)) => Ok(data),
         Ok(Err(e)) => Err(
@@ -154,6 +168,23 @@ pub async fn images(socket: &Path) -> Result<Vec<ImageInfo>, CallError> {
 /// Creates a VM (`new`), downloading its image first if needed.
 pub async fn create(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
     call_in(&CREATES, socket, request, model::CREATE_LIMIT).await
+}
+
+/// One part of a file copy (`file_read`, `file_write`). The time limit
+/// starts once it has a slot: a copy waits for another copy's chunk, not
+/// for the whole other copy to fit in its own limit.
+pub async fn file(socket: &Path, request: Request) -> Result<serde_json::Value, CallError> {
+    let _slot = FILES.acquire().await;
+    send(socket, request, model::FILE_LIMIT).await
+}
+
+/// Runs host file work off the I/O thread.
+pub async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, CallError> + Send + 'static,
+) -> Result<T, CallError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|e| Err(CallError::Failed(e.to_string())))
 }
 
 /// Looks at the host and, when that leaves a socket to try, asks it.
@@ -421,6 +452,27 @@ mod tests {
             Ok(serde_json::json!({"ready_ms": 9}))
         );
         fake.join().unwrap();
+    }
+
+    #[test]
+    fn file_requests() {
+        let (_d, s, fake) = serve(
+            r#"{"op":"file_read","name":"dev","path":"/tmp/a","offset":0,"max_bytes":8388608,"admin":false}"#,
+            answer("{\"ok\":true,\"data\":{\"data_base64\":\"aGk=\",\"size\":2,\"more\":false}}\n"),
+        );
+        let data =
+            run(async move { file(&s, model::read_request("dev", "/tmp/a", 0, false)).await });
+        fake.join().unwrap();
+        assert_eq!(
+            model::read_answer(data.unwrap(), 0),
+            Ok((b"hi".to_vec(), false))
+        );
+        // Host file work runs off the I/O thread; a panic is an error.
+        assert_eq!(run(async { blocking(|| Ok(7)).await }), Ok(7));
+        assert!(matches!(
+            run(async { blocking(|| -> Result<(), CallError> { panic!("boom") }).await }),
+            Err(CallError::Failed(_))
+        ));
     }
 
     #[test]

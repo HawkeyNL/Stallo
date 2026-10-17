@@ -1,7 +1,8 @@
 //! stallo-gui: the desktop app for Stallo. It finds the daemon, walks the
 //! user through anything that stops it from connecting, and then lists the
-//! VMs, creates, starts and stops them, shows their screens, and takes and
-//! restores snapshots.
+//! VMs, creates, starts, stops and deletes them, shows their screens,
+//! copies files in and out, takes and restores snapshots, and turns agent
+//! control on and off.
 
 mod client;
 mod model;
@@ -372,21 +373,26 @@ impl Ui {
                 .title_selectable(true)
                 .css_classes(["monospace"])
                 .build();
-            let copy = gtk::Button::builder()
-                .icon_name("edit-copy-symbolic")
-                .tooltip_text("Copy")
-                .valign(gtk::Align::Center)
-                .css_classes(["flat"])
-                .build();
-            let (ui, command) = (self.clone(), command.to_string());
-            copy.connect_clicked(move |b| {
-                b.clipboard().set_text(&command);
-                ui.toast("Copied to clipboard");
-            });
-            row.add_suffix(&copy);
+            row.add_suffix(&self.copy_button(command));
             list.append(&row);
         }
         list
+    }
+
+    /// A button that copies `text` to the clipboard.
+    fn copy_button(self: &Rc<Self>, text: &str) -> gtk::Button {
+        let copy = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let (ui, text) = (self.clone(), text.to_owned());
+        copy.connect_clicked(move |b| {
+            b.clipboard().set_text(&text);
+            ui.toast("Copied to clipboard");
+        });
+        copy
     }
 
     /// Asks systemd to start the daemon; polkit decides and may ask for a

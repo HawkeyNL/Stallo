@@ -1318,6 +1318,7 @@ name = "stallo-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "gtk4",
  "libadwaita",
  "rustix",
