@@ -1,29 +1,24 @@
-//! W3 gate, part A: a Windows-profile VM starts with its own swtpm, keeps
-//! its TPM through a RAM snapshot, and leaves nothing behind. No ISO or
-//! guest needed: the firmware alone runs on an empty disk.
-//!
-//! No catalog image makes a Windows VM yet (local ISO imports come with
-//! W1), so the test plants the VM's files itself, as `create` would make
-//! them: a blank 64 GiB disk, Secure Boot variables and a `vm.toml` with
-//! `machine = "windows"` and an empty CD-ROM drive.
+//! W3 gate, part A: a Windows VM starts with its own swtpm, keeps its TPM
+//! through RAM and disk-only snapshots, stops when swtpm dies, and leaves
+//! nothing behind. No Windows ISO needed: a dummy ISO (not bootable) is
+//! imported as a Windows image, and the firmware alone runs.
 
 mod common;
 
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
 use common::Daemon;
-use stallo::config::{NetProfile, VmConfig, new_uuid};
-use stallo::images::{Firmware, Os};
-use stallo::{qemu, tpm};
+use stallo::config::VmConfig;
+use stallo::tpm;
 
 /// The Windows minimums (and defaults).
 const MEMORY_MIB: u64 = 4096;
 
 #[test]
-#[ignore = "boots a Windows-profile VM (firmware only); run with STALLO_IT=1"]
+#[ignore = "boots a Windows VM (firmware only); run with STALLO_IT=1"]
 fn windows_vm_runs_with_swtpm() {
     if !common::enabled() {
         return;
@@ -40,11 +35,36 @@ fn windows_vm_runs_with_swtpm() {
         "{available} MiB available, {need} MiB needed"
     );
     let d = Daemon::start_without_image("windows", "", MEMORY_MIB);
-    plant(&d.vm_dir("win"));
+    // 64 KiB with the ISO 9660 magic, the one thing an import checks.
+    let iso = d.base.join("dummy.iso");
+    let mut bytes = vec![0; 64 << 10];
+    bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+    fs::write(&iso, bytes).unwrap();
+    d.ok(&[
+        "images",
+        "import",
+        iso.to_str().unwrap(),
+        "--os",
+        "windows",
+        "--id",
+        "win11",
+    ]);
+    d.ok(&[
+        "new",
+        "win",
+        "--image",
+        "local-win11",
+        "--cpus",
+        "2",
+        "--mem",
+        "4G",
+        "--disk",
+        "64G",
+    ]);
     let vm_dir = d.vm_dir("win");
     let tpm_dir = vm_dir.join(tpm::DIR);
+    assert!(!VmConfig::load(&vm_dir).unwrap().machine.is_linux());
 
-    d.ok(&["start", "win", "--no-wait"]);
     d.assert_safe("win");
     let (qemu, swtpm) = pair(&d);
     let argv = cmdline(qemu).join(" ");
@@ -66,8 +86,9 @@ fn windows_vm_runs_with_swtpm() {
         tpm_dir.join("tpm2-00.permall").exists()
     })
     .expect("no TPM state after 30 s");
-    assert_only_own_fds(swtpm, &vm_dir);
-    assert_only_own_fds(qemu, &vm_dir);
+    assert_swtpm_fds(swtpm, &vm_dir);
+    let cd = d.data.join("images/local-win11.iso");
+    assert_only_own_fds(qemu, &vm_dir, &cd);
 
     // A RAM snapshot carries the TPM state (QEMU's tpm-emulator fetches it
     // from swtpm), and loads back into the same and into a new swtpm.
@@ -81,19 +102,43 @@ fn windows_vm_runs_with_swtpm() {
     // swtpm exits by itself (`,terminate`) instead of being killed.
     d.ok(&["stop", "win"]);
     assert_gone(&d, &[qemu, swtpm]);
-    let log = fs::read_to_string(d.base.join("stallod.log")).unwrap();
-    assert!(log.contains("win: swtpm exited"), "{log}");
-    assert!(!log.contains("win: swtpm exited:"), "{log}");
+    let log = || fs::read_to_string(d.base.join("stallod.log")).unwrap();
+    assert!(log().contains("win: swtpm exited"), "{}", log());
+    assert!(!log().contains("win: swtpm exited:"), "{}", log());
+
+    // A disk-only snapshot keeps a copy of the TPM state and puts it back.
+    let permall = || fs::read(tpm_dir.join("tpm2-00.permall")).unwrap();
+    let saved = permall();
+    let out = d.ok(&["snap", "win", "d1"]);
+    assert!(out.contains("disk only"), "{out}");
+    fs::write(tpm_dir.join("tpm2-00.volatilestate"), b"later").unwrap();
+    d.ok(&["restore", "win", "d1"]);
+    assert_eq!(permall(), saved);
+    assert!(!tpm_dir.join("tpm2-00.volatilestate").exists());
+    d.ok(&["snap", "win", "--delete", "d1", "--yes"]);
+    assert!(!vm_dir.join("tpm-snapshots/d1").exists());
 
     let out = d.ok(&["restore", "win", "s1"]);
     assert!(out.contains("running"), "{out}");
     d.assert_safe("win");
     let (qemu2, swtpm2) = pair(&d);
     assert_ne!((qemu2, swtpm2), (qemu, swtpm));
-    d.ok(&["stop", "win", "--force"]);
+    // An swtpm that dies takes the VM with it.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(swtpm2 as i32).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
     assert_gone(&d, &[qemu2, swtpm2]);
+    assert!(log().contains("swtpm exited"), "{}", log());
+    assert!(log().contains("stopping win"), "{}", log());
 
-    // swtpm logs errors only; QEMU's TPM backend none either.
+    d.ok(&["start", "win", "--no-wait"]);
+    let (qemu3, swtpm3) = pair(&d);
+    d.ok(&["stop", "win", "--force"]);
+    assert_gone(&d, &[qemu3, swtpm3]);
+
+    // swtpm logs errors only: none, and QEMU's TPM backend none either.
     let swtpm_log = fs::read_to_string(vm_dir.join(tpm::LOG)).unwrap();
     assert!(swtpm_log.trim().is_empty(), "swtpm.log: {swtpm_log}");
     let qemu_log = fs::read_to_string(vm_dir.join("qemu.log")).unwrap();
@@ -102,47 +147,9 @@ fn windows_vm_runs_with_swtpm() {
         "qemu.log: {qemu_log}"
     );
 
-    // `rm` takes the TPM state with the VM.
+    // `rm` takes the TPM state and its snapshot copies with the VM.
     d.ok(&["rm", "win", "--yes"]);
     assert!(!tpm_dir.exists() && !vm_dir.exists());
-}
-
-/// Writes a stopped Windows VM's files into `dir`.
-fn plant(dir: &Path) {
-    fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            qemu::create_disk(None, &dir.join(qemu::DISK), 64)
-                .await
-                .unwrap();
-            qemu::create_vars(&dir.join(qemu::VARS), Firmware::SecureBoot)
-                .await
-                .unwrap();
-        });
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir.join(qemu::STATES))
-        .unwrap();
-    VmConfig {
-        name: "win".into(),
-        uuid: new_uuid().unwrap(),
-        image: "local-win11".into(),
-        vcpus: 2,
-        memory_mib: MEMORY_MIB,
-        disk_gib: 64,
-        net: NetProfile::Offline,
-        agent_control: false,
-        throwaway_of: None,
-        forwards: vec![],
-        vnc: true,
-        cdrom: None,
-        machine: Os::Windows,
-    }
-    .save(dir)
-    .unwrap();
 }
 
 fn cmdline(pid: u32) -> Vec<String> {
@@ -166,13 +173,50 @@ fn pair(d: &Daemon) -> (u32, u32) {
     }
 }
 
-/// Every open file of `pid` is a socket, pipe, anonymous inode or
-/// `/dev` node, or lies in `vm_dir`: nothing of the daemon or of other VMs
-/// leaked in.
-fn assert_only_own_fds(pid: u32, vm_dir: &Path) {
-    for fd in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
-        let target = fs::read_link(fd.unwrap().path()).unwrap();
-        let t = target.to_string_lossy();
+fn open_fds(pid: u32) -> Vec<(u32, String)> {
+    fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .map(|fd| {
+            let fd = fd.unwrap();
+            let n = fd.file_name().to_str().unwrap().parse().unwrap();
+            (
+                n,
+                fs::read_link(fd.path()).unwrap().to_string_lossy().into(),
+            )
+        })
+        .collect()
+}
+
+/// swtpm holds stdin/stdout on /dev/null, stderr on its log, its lock
+/// file, both ends of its own self-pipe, and exactly two sockets: the
+/// control channel from the daemon and the data channel QEMU sent on it.
+/// Nothing else leaked in.
+fn assert_swtpm_fds(pid: u32, vm_dir: &Path) {
+    let fds = open_fds(pid);
+    let log = vm_dir.join(tpm::LOG).display().to_string();
+    let lock = vm_dir.join(tpm::DIR).join(".lock").display().to_string();
+    let (mut sockets, mut pipes) = (0, Vec::new());
+    for (n, target) in &fds {
+        match n {
+            0 | 1 => assert_eq!(target, "/dev/null"),
+            2 => assert_eq!(*target, log),
+            _ if target.starts_with("socket:") => sockets += 1,
+            _ if target.starts_with("pipe:") => pipes.push(target),
+            _ => assert_eq!(*target, lock, "swtpm holds fd {n}: {fds:?}"),
+        }
+    }
+    assert_eq!(sockets, 2, "{fds:?}");
+    assert!(
+        pipes.is_empty() || pipes.len() == 2 && pipes[0] == pipes[1],
+        "{fds:?}"
+    );
+}
+
+/// Every open file of `pid` is a socket, pipe, anonymous inode, `/dev`
+/// node, the firmware or the ISO `cd`, or lies in `vm_dir`: nothing of the
+/// daemon or of other VMs leaked in.
+fn assert_only_own_fds(pid: u32, vm_dir: &Path, cd: &Path) {
+    for (_, t) in open_fds(pid) {
         assert!(
             t.starts_with("socket:")
                 || t.starts_with("pipe:")
@@ -180,7 +224,8 @@ fn assert_only_own_fds(pid: u32, vm_dir: &Path) {
                 || t.starts_with("/dev/")
                 || t.starts_with("/memfd:")
                 || t.starts_with("/usr/share/OVMF/")
-                || target.starts_with(vm_dir),
+                || Path::new(&t).starts_with(vm_dir)
+                || Path::new(&t) == cd,
             "process {pid} holds {t}"
         );
     }
@@ -194,9 +239,10 @@ fn assert_gone(d: &Daemon, pids: &[u32]) {
             .all(|p| !Path::new(&format!("/proc/{p}")).exists())
     })
     .unwrap_or_else(|_| panic!("{pids:?} still exist"));
-    assert!(!d.vm_cgroup("win").exists());
-    assert!(!d.vm_runtime("win").exists());
-    let procs = fs::read_to_string(d.cgroup.join("daemon/cgroup.procs")).unwrap_or_default();
+    common::wait_for(Duration::from_secs(5), || {
+        !d.vm_cgroup("win").exists() && !d.vm_runtime("win").exists()
+    })
+    .expect("the VM's cgroup or runtime directory is left");
     for entry in fs::read_dir(&d.cgroup).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if entry.file_type().unwrap().is_dir() && name != "daemon" && name != "tools" {
@@ -204,5 +250,6 @@ fn assert_gone(d: &Daemon, pids: &[u32]) {
             assert!(left.trim().is_empty(), "{name} still holds {left}");
         }
     }
+    let procs = fs::read_to_string(d.cgroup.join("daemon/cgroup.procs")).unwrap_or_default();
     assert!(!procs.trim().is_empty(), "the daemon is gone");
 }

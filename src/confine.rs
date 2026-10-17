@@ -106,8 +106,12 @@ pub fn qemu_rules(
     .collect()
 }
 
-/// The rules for a Windows VM's swtpm (`crate::tpm`): the system files it
-/// loads and its own TPM state directory `tpm_dir`, where it writes a
+/// The ELF interpreter (x86_64): `exec` opens it like the program itself.
+const LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
+
+/// The rules for a Windows VM's swtpm (`crate::tpm`): it may execute only
+/// its binary and the ELF loader, read the rest of `/usr` (its libraries),
+/// and use its own TPM state directory `tpm_dir`, where it writes a
 /// temporary file, renames it over the state file and keeps a `.lock`
 /// file. No directory listing, links, sockets or devices besides
 /// `/dev/urandom`. swtpm parses guest-controlled TPM commands (libtpms), so
@@ -115,7 +119,9 @@ pub fn qemu_rules(
 pub fn swtpm_rules(tpm_dir: &Path) -> Vec<Rule> {
     use AccessFs::*;
     vec![
-        ("/usr".into(), ReadFile | ReadDir | Execute),
+        ("/usr".into(), ReadFile | ReadDir),
+        (crate::tpm::SWTPM.into(), ReadFile | Execute),
+        (LOADER.into(), ReadFile | Execute),
         ("/etc/ld.so.cache".into(), ReadFile.into()),
         ("/dev/urandom".into(), ReadFile.into()),
         (
@@ -667,7 +673,10 @@ mod tests {
         for (p, access) in &rules {
             let p = p.to_str().unwrap();
             assert!(!p.starts_with("/d/") || p == "/d/vms/win/tpm", "{p}");
-            assert!(!access.contains(AccessFs::Execute) || p == "/usr", "{p}");
+            assert!(
+                !access.contains(AccessFs::Execute) || p == crate::tpm::SWTPM || p == LOADER,
+                "{p}"
+            );
             assert!(!access.contains(AccessFs::MakeSym) && !access.contains(AccessFs::Refer));
         }
 
@@ -679,7 +688,9 @@ mod tests {
             vm_files(d, b"x");
             fs::write(d.join("tpm/tpm2-00.permall"), b"state\n").unwrap();
         }
-        let rules = swtpm_rules(&own.join("tpm"));
+        // The probe runs shell tools instead of swtpm.
+        let mut rules = swtpm_rules(&own.join("tpm"));
+        rules.push(("/usr/bin".into(), AccessFs::Execute.into()));
         let q = |p: &Path| format!("'{}'", p.display());
         let (tpm, state) = (q(&own.join("tpm")), q(&own.join("tpm/tpm2-00.permall")));
         // What swtpm does: read, write a temporary file and rename it over

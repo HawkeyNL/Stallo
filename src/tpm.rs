@@ -18,15 +18,16 @@
 //! profile `stallo-swtpm`. No `mode=` on `--tpmstate`: swtpm would
 //! `fchmod` its files, which the filter denies; the directory is 0700.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use tokio::process::{Child, Command};
 
-use crate::config::Mode;
+use crate::config::{Mode, validate_tag};
+use crate::paths::{ensure_private_dir, safe_remove};
 use crate::{confine, net};
 
 pub const SWTPM: &str = "/usr/bin/swtpm";
@@ -36,6 +37,9 @@ pub const MEMORY_MIB: u64 = 32;
 pub const DIR: &str = "tpm";
 /// swtpm's messages, in the VM directory.
 pub const LOG: &str = "swtpm.log";
+/// Largest file swtpm may write (`RLIMIT_FSIZE`): its state is tens of
+/// KiB, so a guest cannot make it fill the disk.
+pub const MAX_FILE_BYTES: libc::rlim_t = 16 << 20;
 
 /// swtpm's arguments. `fd` is swtpm's end of the socketpair. swtpm splits
 /// option values at commas and has no escape, so a state path with one is
@@ -78,6 +82,21 @@ pub fn spawn(tpm_dir: &Path, fd: OwnedFd, cgroup: &Path, log: File, mode: Mode) 
     // denies.
     crate::cgroup::move_on_exec(&mut cmd, cgroup)?;
     net::inherit_on_exec(&mut cmd, fd);
+    // SAFETY: runs in the forked child before exec; one setrlimit syscall
+    // on a stack value, nothing else.
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: MAX_FILE_BYTES,
+                rlim_max: MAX_FILE_BYTES,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     if mode == Mode::Production {
         confine::apparmor_on_exec(&mut cmd, confine::SWTPM_PROFILE);
     }
@@ -96,6 +115,77 @@ pub fn spawn(tpm_dir: &Path, fd: OwnedFd, cgroup: &Path, log: File, mode: Mode) 
         confine::check_profile(pid, confine::SWTPM_PROFILE)?;
     }
     Ok(child)
+}
+
+/// Copies of the TPM state that disk-only snapshots carry, one directory
+/// per snapshot: `<vm>/tpm-snapshots/<tag>/`. (A RAM snapshot has the TPM
+/// state in its RAM image.) Out of reach of QEMU and swtpm.
+const SNAPSHOTS: &str = "tpm-snapshots";
+
+fn copy_dir(vm_dir: &Path, tag: &str) -> PathBuf {
+    vm_dir.join(SNAPSHOTS).join(tag)
+}
+
+/// Copies the TPM state (the regular files of `tpm/` but swtpm's `.lock`)
+/// for disk-only snapshot `tag` of a stopped VM. The state is a few KiB.
+pub fn save_copy(vm_dir: &Path, tag: &str) -> Result<()> {
+    validate_tag(tag)?;
+    let to = copy_dir(vm_dir, tag);
+    safe_remove(vm_dir, &to)?;
+    ensure_private_dir(&vm_dir.join(DIR))?;
+    ensure_private_dir(&vm_dir.join(SNAPSHOTS))?;
+    ensure_private_dir(&to)?;
+    copy_files(&vm_dir.join(DIR), &to).context("cannot copy the TPM state")
+}
+
+/// Whether disk-only snapshot `tag` has a copy of the TPM state.
+pub fn has_copy(vm_dir: &Path, tag: &str) -> bool {
+    copy_dir(vm_dir, tag).is_dir()
+}
+
+/// Makes the copy of snapshot `tag` the TPM state of a stopped VM: built
+/// beside `tpm/` and swapped in with two renames.
+pub fn restore_copy(vm_dir: &Path, tag: &str) -> Result<()> {
+    validate_tag(tag)?;
+    ensure!(
+        has_copy(vm_dir, tag),
+        "snapshot {tag} has no copy of the TPM state"
+    );
+    let (tpm, new, old) = (
+        vm_dir.join(DIR),
+        vm_dir.join("tpm.new"),
+        vm_dir.join("tpm.old"),
+    );
+    for d in [&new, &old] {
+        safe_remove(vm_dir, d)?;
+    }
+    ensure_private_dir(&new)?;
+    copy_files(&copy_dir(vm_dir, tag), &new).context("cannot copy the TPM state back")?;
+    ensure_private_dir(&tpm)?;
+    fs::rename(&tpm, &old)?;
+    fs::rename(&new, &tpm)?;
+    safe_remove(vm_dir, &old)?;
+    Ok(())
+}
+
+/// Removes the TPM copy of snapshot `tag`, if any.
+pub fn remove_copy(vm_dir: &Path, tag: &str) -> Result<()> {
+    validate_tag(tag)?;
+    safe_remove(vm_dir, &copy_dir(vm_dir, tag))?;
+    Ok(())
+}
+
+/// Copies the regular files of `from` (never links, never `.lock`) into
+/// the new, empty directory `to`.
+fn copy_files(from: &Path, to: &Path) -> Result<()> {
+    for e in fs::read_dir(from)? {
+        let e = e?;
+        let name = e.file_name();
+        if name != ".lock" && e.file_type()?.is_file() {
+            fs::copy(e.path(), to.join(&name))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -121,6 +211,45 @@ mod tests {
         }
         assert!(args(Path::new("/d/a,b/tpm"), 7).is_err());
         assert!(args(Path::new("/d/a\nb/tpm"), 7).is_err());
+    }
+
+    /// A disk-only snapshot's TPM copy goes back exactly: files added
+    /// since are gone, links and the lock are never copied.
+    #[test]
+    fn snapshot_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = std::fs::canonicalize(tmp.path()).unwrap();
+        let tpm = vm.join(DIR);
+        crate::paths::ensure_private_dir(&tpm).unwrap();
+        fs::write(tpm.join("tpm2-00.permall"), b"old").unwrap();
+        fs::write(tpm.join(".lock"), b"").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", tpm.join("link")).unwrap();
+        assert!(!has_copy(&vm, "s1"));
+        save_copy(&vm, "s1").unwrap();
+        assert!(has_copy(&vm, "s1"));
+        let names = |d: &Path| {
+            let mut n: Vec<_> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(&vm.join("tpm-snapshots/s1")), ["tpm2-00.permall"]);
+
+        fs::write(tpm.join("tpm2-00.permall"), b"new").unwrap();
+        fs::write(tpm.join("tpm2-00.volatilestate"), b"v").unwrap();
+        restore_copy(&vm, "s1").unwrap();
+        assert_eq!(names(&tpm), ["tpm2-00.permall"]);
+        assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"old");
+        assert!(!vm.join("tpm.new").exists() && !vm.join("tpm.old").exists());
+        // The copy stays for the next restore, until the snapshot goes.
+        assert!(has_copy(&vm, "s1"));
+        remove_copy(&vm, "s1").unwrap();
+        assert!(!has_copy(&vm, "s1"));
+        assert!(restore_copy(&vm, "s1").is_err());
+        assert_eq!(fs::read(tpm.join("tpm2-00.permall")).unwrap(), b"old");
+        assert!(save_copy(&vm, "../x").is_err());
     }
 
     /// The real swtpm under its Landlock rules and the seccomp filter: it

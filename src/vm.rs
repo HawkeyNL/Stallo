@@ -36,6 +36,9 @@ use crate::{confine, images, input, net, qemu, seed, tpm};
 
 /// passt's messages, in the VM directory.
 const PASST_LOG: &str = "passt.log";
+/// How long after swtpm's exit QEMU's exit may follow and still count as
+/// the cause (QEMU closes swtpm's channel as it exits).
+const SWTPM_GRACE: Duration = Duration::from_secs(2);
 /// Graceful power-off budget before QEMU is told to quit.
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `wait_ready` waits for the guest agent.
@@ -120,8 +123,8 @@ pub struct NewVm {
 pub struct Running {
     pub config: VmConfig,
     pub pid: u32,
-    /// swtpm's pid (Windows VMs).
-    tpm_pid: Option<u32>,
+    /// swtpm's pid and whether it has exited (Windows VMs).
+    tpm: Option<(u32, Arc<AtomicBool>)>,
     pub qmp: Qmp,
     qga_sock: PathBuf,
     rt_dir: PathBuf,
@@ -848,18 +851,35 @@ impl Manager {
                 return Err(e);
             }
         }
-        let tpm_pid = swtpm.as_ref().and_then(|t| t.id());
-        if let Some(mut t) = swtpm {
-            let name = name.clone();
+        let (tx, rx) = watch::channel(false);
+        let tpm = swtpm.map(|mut t| {
+            let pid = t.id().expect("a child that was not waited for has a pid");
+            let gone = Arc::new(AtomicBool::new(false));
+            let (this, name, done, mut exited) =
+                (self.clone(), name.clone(), gone.clone(), rx.clone());
             // Reaps swtpm. It exits when QEMU closes its socket, or with
-            // the cgroup.
+            // the cgroup. Otherwise the guest has lost its TPM: the VM is
+            // killed rather than left running without it.
             tokio::spawn(async move {
-                match t.wait().await {
+                let r = t.wait().await;
+                done.store(true, Ordering::Relaxed);
+                // `is_ok` drops the borrow of the channel at once.
+                let qemu_gone = tokio::time::timeout(SWTPM_GRACE, exited.wait_for(|e| *e))
+                    .await
+                    .is_ok();
+                match r {
+                    _ if !qemu_gone => {
+                        tracing::error!("{name}: swtpm exited ({r:?}); stopping {name}");
+                        if let Err(e) = this.cgroups.kill_vm(&name) {
+                            tracing::error!("{name}: {e:#}");
+                        }
+                    }
                     Ok(s) if s.success() => tracing::debug!("{name}: swtpm exited"),
                     r => tracing::warn!("{name}: swtpm exited: {r:?}"),
                 }
             });
-        }
+            (pid, gone)
+        });
         let net_down = Arc::new(AtomicBool::new(false));
         let cut_net = passt.map(|mut p| {
             let cut = Arc::new(tokio::sync::Notify::new());
@@ -885,11 +905,10 @@ impl Manager {
             cut
         });
 
-        let (tx, rx) = watch::channel(false);
         let running = Arc::new(Running {
             config: cfg.clone(),
             pid,
-            tpm_pid,
+            tpm,
             qmp,
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
             rt_dir: rt_dir.clone(),
@@ -1214,9 +1233,17 @@ impl Manager {
             return;
         }
         for vm in self.all_running() {
-            let swtpm = vm.tpm_pid.map_or(Ok(()), |pid| {
-                confine::check_profile(pid, confine::SWTPM_PROFILE)
-            });
+            // An swtpm that has exited (its reaper stops the VM) has no
+            // label to check.
+            let swtpm = match &vm.tpm {
+                Some((pid, gone))
+                    if !gone.load(Ordering::Relaxed)
+                        && Path::new(&format!("/proc/{pid}")).exists() =>
+                {
+                    confine::check_profile(*pid, confine::SWTPM_PROFILE)
+                }
+                _ => Ok(()),
+            };
             if let Err(e) = confine::check_profile(vm.pid, confine::QEMU_PROFILE).and(swtpm) {
                 tracing::error!("{}: {e:#}; killing it", vm.config.name);
                 if let Err(e) = self.cgroups.kill_vm(&vm.config.name) {
@@ -2123,7 +2150,7 @@ mod tests {
                 machine: images::Os::Linux,
             },
             pid: 0,
-            tpm_pid: None,
+            tpm: None,
             qmp,
             qga_sock: dir.path().join("qga.sock"),
             rt_dir: "/nonexistent".into(),

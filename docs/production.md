@@ -219,19 +219,24 @@ own `swtpm` process (`src/tpm.rs`):
   certificates, no state encryption: Windows Setup only needs a TPM 2.0.
   Its log is `swtpm.log` in the VM directory.
 - **Confinement.** swtpm runs TPM commands from the guest (libtpms), so it
-  is confined like QEMU: a Landlock ruleset with read-only `/usr` and its
-  own `tpm/` only (no other VM's state, not even its own VM's disk), the
-  daemon's seccomp filter (swtpm runs under it unchanged; `--tpmstate` has
+  is confined like QEMU: a Landlock ruleset with read-only `/usr`
+  (executing only swtpm and the ELF loader) and its own `tpm/` only (no
+  other VM's state, not even its own VM's disk), the daemon's seccomp
+  filter (swtpm runs under it unchanged; `--tpmstate` has
   no `mode=`, which would need `fchmod`), its own seccomp filter, and the
   AppArmor profile above in production. Its memory (32 MiB) counts in the
   VM's cgroup limit and in admission.
 - **Snapshots.** A RAM snapshot (taken while the VM runs) includes the TPM
   state: QEMU's TPM emulator backend saves swtpm's state with the RAM and
-  loads it back, also into a fresh swtpm when a stopped VM is restored.
-  **A disk-only snapshot (taken while the VM is stopped) does not include
-  the TPM state**: restoring one leaves `tpm/` as it is, so anything sealed
-  to the TPM after the snapshot (BitLocker, a Windows Hello PIN) may not
-  match the restored disk. Snapshot Windows VMs while they run.
+  loads it back, also into a fresh swtpm when a stopped VM is restored. A
+  disk-only snapshot (taken while the VM is stopped) gets a copy of
+  `tpm/` (a few KiB) in `tpm-snapshots/<name>/`, out of reach of QEMU and
+  swtpm; restoring it puts the copy back with the disk and firmware
+  variables, and deleting the snapshot deletes the copy. A disk-only
+  snapshot of a Windows VM without a copy is refused at restore.
+- **Limits.** swtpm may write files of at most 16 MiB (`RLIMIT_FSIZE`; its
+  state is tens of KiB). If swtpm exits while QEMU still runs, the daemon
+  kills the VM: a guest never runs on without its TPM.
 
 ## M5 gate (lab VM)
 

@@ -33,6 +33,9 @@ profile stallo-swtpm flags=(enforce) {
   # on it: connected stream sockets without addresses.
   unix (send, receive, getattr, getopt, setopt, shutdown) type=stream addr=none,
 
+  # Its own threads and itself, under either label form (see stallo-qemu).
+  signal (send, receive) peer=stallo-swtpm//&unconfined,
+  signal (send, receive) peer=stallo-swtpm,
   # The daemon (unconfined) stops it.
   signal (receive) peer=unconfined,
 

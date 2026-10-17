@@ -175,8 +175,8 @@ impl Daemon {
         Self::launch(name, config, max_memory_mib, Some(id))
     }
 
-    /// [`Daemon::start_sized`] without any image, for a test that plants
-    /// its VM's files itself (a VM no catalog image can make yet).
+    /// [`Daemon::start_sized`] without any image, for a test that imports
+    /// its own (`stallo images import`).
     pub fn start_without_image(name: &str, config: &str, max_memory_mib: u64) -> Self {
         Self::launch(name, config, max_memory_mib, None)
     }
@@ -357,7 +357,11 @@ impl Daemon {
                     .map(|a| String::from_utf8_lossy(a).into_owned())
                     .collect();
                 if argv[0] == stallo::tpm::SWTPM {
-                    check_swtpm_argv(&argv);
+                    // Only a Windows VM has an swtpm, on its own state.
+                    let vm = name.strip_prefix("vm-").expect("a VM cgroup");
+                    let cfg = stallo::config::VmConfig::load(&self.vm_dir(vm)).unwrap();
+                    assert!(!cfg.machine.is_linux(), "swtpm in Linux VM {vm}");
+                    check_swtpm_argv(&argv, &self.vm_dir(vm).join(stallo::tpm::DIR));
                 } else {
                     check_argv_max(&argv, self.max_memory_mib);
                 }
@@ -449,10 +453,21 @@ fn check_argv_max(argv: &[String], max_memory_mib: u64) {
     }
 }
 
-/// The harness rules for a swtpm command line: a control channel on an
-/// inherited socket, no data socket, no TCP and no socket file.
-pub fn check_swtpm_argv(argv: &[String]) {
+/// The harness rules for a swtpm command line: the VM's own state in
+/// `tpm_dir`, a control channel on an inherited socket, no data socket, no
+/// TCP, no socket or log file.
+pub fn check_swtpm_argv(argv: &[String], tpm_dir: &Path) {
     assert_eq!(argv[1], "socket", "{argv:?}");
+    let state: Vec<&String> = argv
+        .windows(2)
+        .filter(|w| w[0] == "--tpmstate")
+        .map(|w| &w[1])
+        .collect();
+    assert_eq!(
+        state,
+        [&format!("dir={}", tpm_dir.display())],
+        "swtpm must keep its VM's own state: {argv:?}"
+    );
     let ctrl: Vec<&String> = argv
         .windows(2)
         .filter(|w| w[0] == "--ctrl")
@@ -470,7 +485,7 @@ pub fn check_swtpm_argv(argv: &[String]) {
             "swtpm must have no {bad}: {argv:?}"
         );
     }
-    for bad in ["tcp", "path=", "bindaddr"] {
+    for bad in ["tcp", "path=", "bindaddr", "file="] {
         assert!(
             !argv.iter().any(|a| a.contains(bad)),
             "swtpm must have no listener ({bad}): {argv:?}"
