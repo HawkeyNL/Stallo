@@ -1,8 +1,8 @@
 //! Dev only (feature `shots`): `stallo-gui --screenshot <dir>` renders the
 //! real pages against a fake daemon (see [`fake`]) and saves each as
 //! `<page>-<light|dark>.png`. Run it through `packaging/dev/shots.sh`,
-//! which gives it a private broadway display. It binds its fake sockets
-//! in the working directory.
+//! which gives it a private broadway display and a fresh working
+//! directory (`STALLO_SHOTS_DIR`) for its fake sockets.
 
 mod fake;
 
@@ -18,6 +18,7 @@ use libadwaita as adw;
 
 use super::{SCREEN, SNAPSHOTS, Vms};
 use crate::Ui;
+use crate::model::Onboarding;
 
 const WIDTH: i32 = 1100;
 const HEIGHT: i32 = 720;
@@ -42,6 +43,14 @@ pub fn run() -> Option<glib::ExitCode> {
 }
 
 fn shoot_all(out: &Path) -> anyhow::Result<()> {
+    // The fake sockets go in the working directory: only in one made for
+    // them, never in wherever this happens to run.
+    let here = std::env::current_dir()?.canonicalize()?;
+    let dir = std::env::var_os("STALLO_SHOTS_DIR").map(|d| Path::new(&d).canonicalize());
+    anyhow::ensure!(
+        matches!(dir, Some(Ok(d)) if d == here),
+        "run me through packaging/dev/shots.sh (STALLO_SHOTS_DIR must be the working directory)"
+    );
     adw::init()?;
     // Shots of finished states, not of transitions half way.
     if let Some(settings) = gtk::Settings::default() {
@@ -49,14 +58,19 @@ fn shoot_all(out: &Path) -> anyhow::Result<()> {
     }
     std::fs::create_dir_all(out)?;
     let (full, empty) = (PathBuf::from("stallod.sock"), PathBuf::from("empty.sock"));
-    for socket in [&full, &empty, &PathBuf::from(fake::VNC_SOCKET)] {
-        let _ = std::fs::remove_file(socket);
-    }
     fake::daemon(&full, fake::vms())?;
     fake::daemon(&empty, serde_json::json!([]))?;
     fake::screen(fake::VNC_SOCKET.as_ref())?;
 
-    let ui = ui();
+    // `busy` stays set, so the window never probes: nothing here may reach
+    // a real daemon.
+    let ui = Ui::build(None);
+    ui.busy.set(true);
+    ui.window.set_default_size(WIDTH, HEIGHT);
+    // Broadway's screen is 1024x768 with no browser attached; a minimum
+    // size is not clamped to it.
+    ui.toasts.set_size_request(WIDTH, HEIGHT);
+    ui.window.present();
     let main = glib::MainLoop::new(None, false);
     let result = Rc::new(RefCell::new(Ok(())));
     let (m, r, out) = (main.clone(), result.clone(), out.to_owned());
@@ -68,62 +82,40 @@ fn shoot_all(out: &Path) -> anyhow::Result<()> {
     result.replace(Ok(()))
 }
 
-/// The window as `Ui::new` builds it, minus the probe: nothing here may
-/// reach a real daemon. `busy` stays set, so no probe ever starts.
-fn ui() -> Rc<Ui> {
-    let banner = adw::Banner::new("Reconnecting…");
-    let view = adw::ToolbarView::new();
-    let header = adw::HeaderBar::new();
-    header.set_visible(false);
-    view.add_top_bar(&header);
-    view.add_top_bar(&banner);
-    let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&view));
-    // Broadway's screen is 1024x768 with no browser attached; a minimum
-    // size is not clamped to it.
-    toasts.set_size_request(WIDTH, HEIGHT);
-    let window = adw::ApplicationWindow::builder()
-        .title("Stallo")
-        .default_width(WIDTH)
-        .default_height(HEIGHT)
-        .content(&toasts)
-        .build();
-    let css = gtk::CssProvider::new();
-    css.load_from_string(super::CSS);
-    gtk::style_context_add_provider_for_display(
-        &WidgetExt::display(&window),
-        &css,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-    window.present();
-    Rc::new(Ui {
-        window,
-        view,
-        header,
-        banner,
-        toasts,
-        state: RefCell::new(None),
-        busy: Cell::new(true),
-        timer: RefCell::new(None),
-        vms: RefCell::new(None),
-    })
-}
-
-async fn settle(ms: u64) {
-    glib::timeout_future(Duration::from_millis(ms)).await;
-}
-
-/// Shows the VMs of the fake daemon on `socket`, polling it.
-async fn connect(ui: &Rc<Ui>, socket: PathBuf) -> Rc<Vms> {
-    if let Some(old) = ui.vms.take() {
-        old.set_active(false);
+/// Waits until `done`, for at most 10 s.
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) -> anyhow::Result<()> {
+    for _ in 0..200 {
+        if done() {
+            return Ok(());
+        }
+        glib::timeout_future(Duration::from_millis(50)).await;
     }
-    let vms = Vms::new(ui, socket);
-    ui.view.set_content(Some(&vms.root));
-    *ui.vms.borrow_mut() = Some(vms.clone());
-    vms.set_active(true);
-    settle(1500).await;
-    vms
+    anyhow::bail!("timed out waiting for {what}")
+}
+
+/// Waits for two frames of `window`: what changed is laid out and drawn.
+async fn frames(window: &adw::ApplicationWindow) -> anyhow::Result<()> {
+    let ticks = Rc::new(Cell::new(0));
+    let t = ticks.clone();
+    let id = window.add_tick_callback(move |_, _| {
+        t.set(t.get() + 1);
+        glib::ControlFlow::Continue
+    });
+    let done = wait_until("a frame", || ticks.get() >= 2).await;
+    id.remove();
+    done
+}
+
+/// Shows the VMs of the fake daemon on `socket`, as connecting to it does.
+async fn connect(ui: &Rc<Ui>, socket: PathBuf, vms: bool) -> anyhow::Result<Rc<Vms>> {
+    ui.apply(Onboarding::Connected { socket });
+    let page = ui.vms.borrow().clone();
+    let page = page.ok_or_else(|| anyhow::anyhow!("no VM page"))?;
+    wait_until("the VM list and host", || {
+        page.meter.is_visible() && page.rows.borrow().is_empty() != vms
+    })
+    .await?;
+    Ok(page)
 }
 
 async fn select(vms: &Rc<Vms>, name: &str) -> anyhow::Result<Rc<super::Detail>> {
@@ -132,61 +124,72 @@ async fn select(vms: &Rc<Vms>, name: &str) -> anyhow::Result<Rc<super::Detail>> 
         .and_then(|i| vms.list.row_at_index(i32::try_from(i).ok()?))
         .ok_or_else(|| anyhow::anyhow!("no VM {name}"))?;
     vms.list.select_row(Some(&row));
-    settle(1500).await;
-    vms.detail
-        .borrow()
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("{name} did not open"))
-}
-
-async fn tab(detail: &super::Detail, name: &str) {
-    detail.tabs.set_visible_child_name(name);
-    settle(2000).await;
+    let open = || {
+        vms.detail
+            .borrow()
+            .clone()
+            .filter(|d| d.name == name && d.details.borrow().is_some())
+    };
+    wait_until(&format!("{name} to open"), || open().is_some()).await?;
+    open().ok_or_else(|| anyhow::anyhow!("{name} closed"))
 }
 
 async fn script(ui: &Rc<Ui>, out: &Path, full: PathBuf, empty: PathBuf) -> anyhow::Result<()> {
     let shot = |page: &'static str| shoot(&ui.window, out, page);
 
-    connect(ui, empty).await;
+    connect(ui, empty, false).await?;
     shot("empty").await?;
 
-    let vms = connect(ui, full).await;
+    let vms = connect(ui, full, true).await?;
     shot("vm-list").await?;
 
     let detail = select(&vms, "dev").await?;
     shot("overview").await?;
-    tab(&detail, SCREEN).await;
+    detail.tabs.set_visible_child_name(SCREEN);
+    let screen = &detail.screen.root;
+    wait_until("the live screen", || {
+        screen.visible_child_name().as_deref() == Some("live")
+    })
+    .await?;
+    // The frame is decoded and uploaded after the page turns live.
+    glib::timeout_future(Duration::from_millis(500)).await;
     shot("screen").await?;
-    tab(&detail, "files").await;
+    detail.tabs.set_visible_child_name("files");
     shot("files").await?;
-    tab(&detail, SNAPSHOTS).await;
+    detail.tabs.set_visible_child_name(SNAPSHOTS);
+    let snaps = &detail.snaps_view;
+    wait_until("the snapshots", || {
+        snaps.visible_child_name().as_deref() == Some("list")
+    })
+    .await?;
     shot("snapshots").await?;
 
     // Agent control is off for win11: turning it on asks first.
     let detail = select(&vms, "win11").await?;
     shot("overview-installer").await?;
     detail.agent.set_active(true);
-    settle(800).await;
+    wait_until("the confirmation", || ui.window.visible_dialog().is_some()).await?;
     shot("agent-confirm").await?;
-    close_dialog(ui).await;
+    close_dialog(ui).await?;
 
     WidgetExt::activate_action(&vms.root, "vms.new", None)?;
-    settle(1500).await;
+    let windows = || find_row(ui.window.upcast_ref(), "Windows");
+    wait_until("the images", || windows().is_some()).await?;
     shot("create").await?;
-    let windows = find_row(ui.window.upcast_ref(), "Windows")
-        .ok_or_else(|| anyhow::anyhow!("no Windows image in the New VM dialog"))?;
+    let windows = windows().ok_or_else(|| anyhow::anyhow!("no Windows image"))?;
     ActionRowExt::activate(&windows);
-    settle(500).await;
     shot("create-windows").await?;
-    close_dialog(ui).await;
-    Ok(())
+    close_dialog(ui).await
 }
 
-async fn close_dialog(ui: &Ui) {
+async fn close_dialog(ui: &Ui) -> anyhow::Result<()> {
     if let Some(d) = ui.window.visible_dialog() {
         d.force_close();
     }
-    settle(500).await;
+    wait_until("the dialog to close", || {
+        ui.window.visible_dialog().is_none()
+    })
+    .await
 }
 
 /// The first action row under `w` whose title contains `text`.
@@ -214,17 +217,15 @@ async fn shoot(window: &adw::ApplicationWindow, out: &Path, page: &str) -> anyho
         (adw::ColorScheme::ForceDark, "dark"),
     ] {
         style.set_color_scheme(scheme);
-        settle(500).await;
-        // ponytail: polls for up to 2 s; the window sometimes draws
-        // nothing for a moment after a dialog opens.
+        frames(window).await?;
+        // The window sometimes draws nothing for a moment after a dialog
+        // opens.
         let mut texture = None;
-        for _ in 0..20 {
-            texture = render(window)?;
-            if texture.is_some() {
-                break;
-            }
-            settle(100).await;
-        }
+        wait_until(&format!("{page} to draw"), || {
+            texture = render(window).ok().flatten();
+            texture.is_some()
+        })
+        .await?;
         let texture = texture.ok_or_else(|| anyhow::anyhow!("{page}: the window drew nothing"))?;
         let path = out.join(format!("{page}-{name}.png"));
         texture.save_to_png(&path)?;

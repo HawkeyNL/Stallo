@@ -33,6 +33,8 @@ jobs:
       # rust-toolchain.toml selects the pinned toolchain.
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The dev-only screenshot harness (docs/gui-screenshots.md).
+      - run: cargo clippy --locked -p stallo-gui --all-targets --features shots -- -D warnings
       - run: cargo test --locked --workspace
 
   deny:

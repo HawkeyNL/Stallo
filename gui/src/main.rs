@@ -105,42 +105,7 @@ struct Ui {
 
 impl Ui {
     fn new(app: &adw::Application) -> Rc<Self> {
-        let banner = adw::Banner::new("Reconnecting…");
-        let connecting = adw::StatusPage::builder()
-            .title("Connecting to Stallo")
-            .child(&adw::Spinner::new())
-            .build();
-        let view = adw::ToolbarView::builder().content(&connecting).build();
-        let header = adw::HeaderBar::new();
-        view.add_top_bar(&header);
-        view.add_top_bar(&banner);
-        let toasts = adw::ToastOverlay::new();
-        toasts.set_child(Some(&view));
-        let window = adw::ApplicationWindow::builder()
-            .application(app)
-            .title("Stallo")
-            .default_width(900)
-            .default_height(600)
-            .content(&toasts)
-            .build();
-        let css = gtk::CssProvider::new();
-        css.load_from_string(vms::CSS);
-        gtk::style_context_add_provider_for_display(
-            &WidgetExt::display(&window),
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-        let ui = Rc::new(Self {
-            window,
-            view,
-            header,
-            banner,
-            toasts,
-            state: RefCell::new(None),
-            busy: Cell::new(false),
-            timer: RefCell::new(None),
-            vms: RefCell::new(None),
-        });
+        let ui = Self::build(Some(app));
         // ponytail: these closures keep `ui` alive for the process lifetime;
         // fine with one window. Use weak refs if there are ever several.
         let u = ui.clone();
@@ -159,6 +124,46 @@ impl Ui {
         ui.window.present();
         ui.probe();
         ui
+    }
+
+    /// The window and its widgets, not shown, with nothing that probes.
+    fn build(app: Option<&adw::Application>) -> Rc<Self> {
+        let banner = adw::Banner::new("Reconnecting…");
+        let connecting = adw::StatusPage::builder()
+            .title("Connecting to Stallo")
+            .child(&adw::Spinner::new())
+            .build();
+        let view = adw::ToolbarView::builder().content(&connecting).build();
+        let header = adw::HeaderBar::new();
+        view.add_top_bar(&header);
+        view.add_top_bar(&banner);
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&view));
+        let window = adw::ApplicationWindow::builder()
+            .title("Stallo")
+            .default_width(900)
+            .default_height(600)
+            .content(&toasts)
+            .build();
+        window.set_application(app);
+        let css = gtk::CssProvider::new();
+        css.load_from_string(vms::CSS);
+        gtk::style_context_add_provider_for_display(
+            &WidgetExt::display(&window),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        Rc::new(Self {
+            window,
+            view,
+            header,
+            banner,
+            toasts,
+            state: RefCell::new(None),
+            busy: Cell::new(false),
+            timer: RefCell::new(None),
+            vms: RefCell::new(None),
+        })
     }
 
     fn probe(self: &Rc<Self>) {
