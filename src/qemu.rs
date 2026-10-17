@@ -137,7 +137,9 @@ pub fn argv(
             }))
             .collect(),
         // An already connected socket (see net.rs). `romfile=`: no iPXE
-        // option ROM, so no network boot code in the firmware.
+        // option ROM, so no network boot code in the firmware. e1000e is
+        // more emulated code for the guest to reach than virtio-net; the
+        // QEMU confinement (confine.rs, AppArmor) is what contains it.
         (NetProfile::Internet, Some(fd)) => vec![
             format!("-netdev stream,id=net0,server=off,addr.type=fd,addr.str={fd}"),
             format!(
@@ -518,6 +520,8 @@ mod tests {
         )
         .unwrap();
         assert!(a.contains(&"e1000e,netdev=net0,mac=52:54:00:4f:1c:2b,romfile=".to_owned()));
+        // passt's end of the socketpair, as for Linux guests.
+        assert!(a.contains(&"stream,id=net0,server=off,addr.type=fd,addr.str=9".to_owned()));
         assert!(!a.iter().any(|x| x.contains("virtio-net") || x == "-nic"));
         // A Windows VM always comes from an ISO.
         assert!(

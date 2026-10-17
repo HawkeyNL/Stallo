@@ -617,8 +617,8 @@ mod tests {
         }
     }
 
-    /// A Windows VM fails closed: no internet, no `stallo run` clone and
-    /// nothing below its minimum size.
+    /// A Windows VM fails closed: no `stallo run` clone and nothing below
+    /// its minimum size.
     #[tokio::test]
     async fn windows_vms_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -644,20 +644,41 @@ mod tests {
         let err = m.set_resources("win", Some(1), None).await.unwrap_err();
         assert!(err.to_string().contains("at least 2 vCPUs"), "{err}");
         assert_eq!(m.load("win").unwrap(), win);
+    }
 
-        for mode in [Mode::Dev, Mode::Production] {
-            let tmp = tempfile::tempdir().unwrap();
-            let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
-            let dir = m.paths.vm_dir("win");
-            fs::create_dir_all(&dir).unwrap();
-            VmConfig {
-                net: NetProfile::Internet,
-                ..win.clone()
+    /// The internet profile for VMs from an ISO (imported Windows or
+    /// Linux, or a catalog ISO): no per-image gate (they have no seed),
+    /// only the host's isolation, which refuses here in both modes (no
+    /// table).
+    #[tokio::test]
+    async fn isos_take_internet_only_with_isolation() {
+        for (image, machine) in [
+            ("local-win11", Os::Windows),
+            ("local-distro", Os::Linux),
+            ("ubuntu-26.04-desktop", Os::Linux),
+        ] {
+            for (mode, why) in [
+                (Mode::Dev, "dev mode"),
+                (Mode::Production, "isolation unavailable"),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+                let dir = m.paths.vm_dir("win");
+                fs::create_dir_all(&dir).unwrap();
+                VmConfig {
+                    image: image.into(),
+                    net: NetProfile::Internet,
+                    machine,
+                    vcpus: 2,
+                    memory_mib: 4096,
+                    disk_gib: 64,
+                    ..vm("win", None)
+                }
+                .save(&dir)
+                .unwrap();
+                let err = m.start("win").await.err().unwrap();
+                assert!(err.to_string().contains(why), "{image} {err}");
             }
-            .save(&dir)
-            .unwrap();
-            let err = m.start("win").await.err().unwrap();
-            assert!(err.to_string().contains("offline only"), "{err}");
         }
     }
 
