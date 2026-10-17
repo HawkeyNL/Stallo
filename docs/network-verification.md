@@ -370,10 +370,12 @@ table inet stallo {
 
   - nft resolves the path to a cgroup id when the rule is loaded. The
     path must exist then, and the id changes whenever stallod restarts
-    (systemd recreates its cgroup). So stallod must load this rule after
-    it created `tools/`, for example from a root `ExecStartPost=+`, in a
-    small table of its own, and replace it on every start. Until then
-    downloads fail (fail closed).
+    (systemd recreates its cgroup). So the rule must load after stallod
+    created `tools/`, in a small table of its own, replaced on every
+    start. `stallod.service` is `Type=exec`, so a plain `ExecStartPost`
+    runs before `tools/` exists: switch to `Type=notify` with `READY=1`
+    after the cgroup setup, or use a root helper that waits for the path.
+    Until the rule is loaded, downloads fail (fail closed).
   - The isolation probe should then also expect `EPERM` for UDP to
     `127.0.0.53:53` sent from the `daemon/` leaf.
   - Then drop `-4` and re-run the frames above: the IPv6 UDP row must be

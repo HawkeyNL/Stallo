@@ -711,7 +711,7 @@ impl Manager {
         // listeners; say why here, before passt starts.
         if let Some(f) = cfg.forwards.iter().find(|f| f.bind.is_ipv6()) {
             bail!(
-                "port forward {} binds IPv6, but guests get IPv4 only for now; bind 127.0.0.1 or another IPv4 address",
+                "port forward {} binds IPv6, but guests get IPv4 only for now: recreate the VM with an IPv4 forward (forwards cannot be edited yet)",
                 std::net::SocketAddr::new(f.bind, f.host)
             );
         }
