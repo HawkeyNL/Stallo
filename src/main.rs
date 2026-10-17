@@ -303,7 +303,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .iter()
                 .map(|f| stallo::net::parse_forward(f, bind))
                 .collect::<Result<_>>()?;
-            let (def_cpus, def_mem, def_disk) = catalog_defaults(&image);
+            let (def_cpus, def_mem, def_disk) = match stallo::images::find(&image) {
+                Ok(e) => new_defaults(Some(e.kind), Some(e.os)),
+                // An image only the daemon knows: ask it what it is.
+                Err(_) => {
+                    let images: Vec<ImageInfo> =
+                        serde_json::from_value(call(Request::Images).await?)?;
+                    let info = images.into_iter().find(|i| i.id == image);
+                    new_defaults(info.as_ref().and_then(|i| i.kind), info.and_then(|i| i.os))
+                }
+            };
             let v = call(Request::New {
                 vcpus: cpus.unwrap_or(def_cpus),
                 memory_mib: mem.unwrap_or(def_mem),
@@ -911,12 +920,6 @@ fn new_defaults(kind: Option<Kind>, os: Option<Os>) -> (u32, u64, u64) {
     }
 }
 
-/// [`new_defaults`] for a catalog image id.
-fn catalog_defaults(image: &str) -> (u32, u64, u64) {
-    let entry = stallo::images::find(image).ok();
-    new_defaults(entry.as_ref().map(|e| e.kind), entry.map(|e| e.os))
-}
-
 fn images_table(images: &[ImageInfo]) -> String {
     let w = images.iter().map(|i| i.id.len()).fold(16, usize::max);
     let mut s = format!(
@@ -1134,11 +1137,15 @@ mod tests {
 
     #[test]
     fn defaults_per_image_kind() {
-        assert_eq!(catalog_defaults("ubuntu-26.04"), (2, 2048, 20));
-        assert_eq!(catalog_defaults("fedora-44-workstation"), (2, 4096, 32));
-        assert_eq!(catalog_defaults("ubuntu-26.04-desktop"), (2, 4096, 32));
-        // An image only a newer daemon knows: the cloud defaults.
-        assert_eq!(catalog_defaults("other"), (2, 2048, 20));
+        let catalog = |id| {
+            let e = stallo::images::find(id).unwrap();
+            new_defaults(Some(e.kind), Some(e.os))
+        };
+        assert_eq!(catalog("ubuntu-26.04"), (2, 2048, 20));
+        assert_eq!(catalog("fedora-44-workstation"), (2, 4096, 32));
+        assert_eq!(catalog("ubuntu-26.04-desktop"), (2, 4096, 32));
+        // An image the daemon does not describe: the cloud defaults.
+        assert_eq!(new_defaults(None, None), (2, 2048, 20));
         // Windows: its minimums, from an ISO or not.
         for kind in [Some(Kind::Iso), None] {
             assert_eq!(new_defaults(kind, Some(Os::Windows)), (2, 4096, 64));

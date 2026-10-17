@@ -190,13 +190,6 @@ impl VmConfig {
             (1..=16384).contains(&self.disk_gib),
             "disk must be between 1 and 16384 GiB"
         );
-        if self.machine == Os::Windows {
-            let (cpus, mem, disk) = WINDOWS_MIN;
-            ensure!(
-                self.vcpus >= cpus && self.memory_mib >= mem && self.disk_gib >= disk,
-                "a Windows VM needs at least {cpus} vCPUs, {mem} MiB of memory and a {disk} GiB disk"
-            );
-        }
         ensure!(
             self.forwards.is_empty() || self.net == NetProfile::Internet,
             "port forwards need the internet network profile"
@@ -212,6 +205,20 @@ impl VmConfig {
                 !self.forwards[..i].iter().any(|o| o.host == f.host),
                 "host port {} is forwarded twice",
                 f.host
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuses a Windows VM below [`WINDOWS_MIN`]. Checked when a VM is
+    /// created or resized, not on load: a raised minimum must not hide
+    /// existing VMs.
+    pub fn check_min_size(&self) -> Result<()> {
+        if self.machine == Os::Windows {
+            let (cpus, mem, disk) = WINDOWS_MIN;
+            ensure!(
+                self.vcpus >= cpus && self.memory_mib >= mem && self.disk_gib >= disk,
+                "a Windows VM needs at least {cpus} vCPUs, {mem} MiB of memory and a {disk} GiB disk"
             );
         }
         Ok(())
@@ -547,7 +554,8 @@ mod tests {
     }
 
     /// `machine`: absent means Linux (vm.toml from before it existed), only
-    /// Windows is written, and a Windows VM has a minimum size.
+    /// Windows is written, and a new or resized Windows VM has a minimum
+    /// size.
     #[test]
     fn machine_profile() {
         let text = toml::to_string(&vm()).unwrap();
@@ -560,7 +568,7 @@ mod tests {
             disk_gib: 64,
             ..vm()
         };
-        win.validate().unwrap();
+        win.check_min_size().unwrap();
         let text = toml::to_string(&win).unwrap();
         assert!(text.contains("machine = \"windows\""), "{text}");
         let tmp = tempfile::tempdir().unwrap();
@@ -582,7 +590,10 @@ mod tests {
                 ..win.clone()
             },
         ] {
-            let err = small.validate().unwrap_err();
+            // Loads (a later, higher minimum must not hide it), but is
+            // refused at create and resize.
+            small.validate().unwrap();
+            let err = small.check_min_size().unwrap_err();
             assert!(
                 err.to_string().contains("Windows VM needs at least"),
                 "{err}"

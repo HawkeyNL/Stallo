@@ -418,6 +418,7 @@ impl Manager {
             machine: entry.os,
         };
         cfg.validate()?;
+        cfg.check_min_size()?;
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
@@ -455,9 +456,10 @@ impl Manager {
     async fn populate(&self, cfg: &VmConfig) -> Result<()> {
         let dir = self.paths.vm_dir(&cfg.name);
         let entry = images::find(&cfg.image)?;
+        let firmware = vars_firmware(cfg, entry.firmware);
         if entry.kind == images::Kind::Iso {
             qemu::create_disk(None, &dir.join(qemu::DISK), cfg.disk_gib).await?;
-            qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
+            qemu::create_vars(&dir.join(qemu::VARS), firmware).await?;
             ensure_private_dir(&dir.join(qemu::STATES))?;
             return cfg.save(&dir);
         }
@@ -470,7 +472,7 @@ impl Manager {
             cfg.image
         );
         qemu::create_disk(Some(&base), &dir.join(qemu::DISK), cfg.disk_gib).await?;
-        qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
+        qemu::create_vars(&dir.join(qemu::VARS), firmware).await?;
         ensure_private_dir(&dir.join(qemu::STATES))?;
 
         let password = seed::generate_password()?;
@@ -612,9 +614,12 @@ impl Manager {
     /// For a VM made from an installer ISO, its CD-ROM drive: the attached
     /// ISO's path, or `None` if empty. `None` for a VM from a cloud image
     /// (or from an image that left the catalog), which has a seed instead.
-    /// Fails closed unless the drive holds a catalog ISO.
+    /// A Windows VM is always made from an ISO. Fails closed unless the
+    /// drive holds a catalog ISO.
     fn cdrom(&self, cfg: &VmConfig) -> Result<Option<Option<PathBuf>>> {
-        if !images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso) {
+        if cfg.machine.is_linux()
+            && !images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso)
+        {
             return Ok(None);
         }
         let Some(id) = &cfg.cdrom else {
@@ -969,6 +974,7 @@ impl Manager {
         cfg.vcpus = vcpus.unwrap_or(cfg.vcpus);
         cfg.memory_mib = memory_mib.unwrap_or(cfg.memory_mib);
         cfg.validate()?;
+        cfg.check_min_size()?;
         let ram: Vec<String> = self
             .list_snapshots(name)
             .await?
@@ -1835,6 +1841,15 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
     ("systemd-run".to_owned(), args)
 }
 
+/// The firmware variable template for `cfg`'s disk: Windows always gets
+/// Secure Boot with Microsoft's keys, whatever its image says.
+fn vars_firmware(cfg: &VmConfig, image: images::Firmware) -> images::Firmware {
+    match cfg.machine {
+        images::Os::Windows => images::Firmware::SecureBoot,
+        images::Os::Linux => image,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2320,6 +2335,55 @@ mod tests {
         m.running.lock().unwrap().clear();
         m.remove_image(id).await.unwrap();
         assert!(!images::iso_path(&m.paths, id).exists());
+    }
+
+    /// A Windows VM gets Secure Boot variables and a CD-ROM drive (never a
+    /// seed), whatever its image lookup says.
+    #[tokio::test]
+    async fn windows_firmware_and_drive() {
+        use crate::config::{DaemonConfig, Mode};
+        use images::{Firmware, Os};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        let (_d, running, _) = fake_vm("running", None).await;
+        let linux = VmConfig {
+            image: "local-win11".into(),
+            ..running.config.clone()
+        };
+        let win = VmConfig {
+            machine: Os::Windows,
+            ..linux.clone()
+        };
+        for fw in [Firmware::Uefi, Firmware::SecureBoot] {
+            assert_eq!(vars_firmware(&win, fw), Firmware::SecureBoot);
+            assert_eq!(vars_firmware(&linux, fw), fw);
+        }
+        // An image the catalog does not know: a seed for Linux, an empty
+        // drive for Windows.
+        assert_eq!(m.cdrom(&linux).unwrap(), None);
+        assert_eq!(m.cdrom(&win).unwrap(), Some(None));
+        let id = "fedora-44-workstation";
+        let with_iso = VmConfig {
+            cdrom: Some(id.into()),
+            ..win
+        };
+        assert_eq!(
+            m.cdrom(&with_iso).unwrap(),
+            Some(Some(images::iso_path(&m.paths, id)))
+        );
     }
 
     /// `set_resources`: limits and host checks of `new`, stopped VMs only,
