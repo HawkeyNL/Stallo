@@ -365,11 +365,13 @@ website and use your own licence.
 1. Import it with `stallo images import … --os windows` (above), or
    **Use My Own ISO…** in the desktop app's new-VM dialog.
 2. Create the VM. Windows VMs get Secure Boot, a TPM 2.0 (swtpm) and at
-   least 2 vCPUs, 4 GiB and a 64 GiB disk. Windows VMs are offline for
-   now:
+   least 2 vCPUs, 4 GiB and a 64 GiB disk. On a production install, add
+   `--net internet` ([Network profiles](#network-profiles), and the
+   [checks inside Windows](docs/network-verification.md#windows-guests));
+   offline also works:
 
    ```sh
-   stallo new win --image local-win11-25h2-english-x64
+   stallo new win --image local-win11-25h2-english-x64 --net internet
    ```
 
 3. Open the screen. You need not catch "Press any key to boot from CD or
