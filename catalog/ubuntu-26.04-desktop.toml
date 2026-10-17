@@ -1,0 +1,24 @@
+# Ubuntu 26.04.1 LTS Desktop installer ISO, amd64. Installed by hand over
+# VNC: no cloud-init, no seed, no guest agent until the user installs one.
+# Pinned to the point release: when releases.ubuntu.com drops it (after
+# the next point release), the URL answers 404 and the entry needs a bump.
+id = "ubuntu-26.04-desktop"
+name = "Ubuntu 26.04.1 LTS Desktop (installer ISO)"
+kind = "iso"
+os = "linux"
+firmware = "secure-boot"
+url = "https://releases.ubuntu.com/26.04/ubuntu-26.04.1-desktop-amd64.iso"
+# 6,482,409,472 bytes on 2026-10-17.
+max_size = 8_589_934_592
+
+trust = "signed-sums"
+sums_url = "https://releases.ubuntu.com/26.04/SHA256SUMS"
+sig_url = "https://releases.ubuntu.com/26.04/SHA256SUMS.gpg"
+sums_format = "gnu"
+# "Ubuntu CD Image Automatic Signing Key (2012) <cdimage@ubuntu.com>", in
+# the host's ubuntu-keyring package. gpgv checked SHA256SUMS.gpg against it
+# on 2026-10-17 (signed 2026-08-27).
+keyring = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+signing_key = "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+
+agent = "manual"

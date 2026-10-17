@@ -317,7 +317,7 @@ impl Manager {
     pub async fn pull(&self, id: &str) -> Result<()> {
         let entry = images::find(id)?;
         let _guard = self.images.write().await;
-        if !images::image_path(&self.paths, id).is_file() {
+        if !images::cached_path(&self.paths, &entry).is_file() {
             let dir = self.paths.images_dir();
             ensure_private_dir(&dir)?;
             host::check_pull_space(
@@ -391,6 +391,11 @@ impl Manager {
             vnc: new.vnc,
         };
         cfg.validate()?;
+        ensure!(
+            images::find(&cfg.image)?.kind == images::Kind::CloudImage,
+            "{} is an installer ISO: VMs from ISOs are not supported yet",
+            cfg.image
+        );
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;

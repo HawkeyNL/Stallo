@@ -321,6 +321,8 @@ pub struct ImageInfo {
     pub cached: bool,
     // Optional: an older stallod does not send these.
     #[serde(default)]
+    pub kind: Option<crate::images::Kind>,
+    #[serde(default)]
     pub os: Option<crate::images::Os>,
     #[serde(default)]
     pub trust: Option<crate::images::Trust>,

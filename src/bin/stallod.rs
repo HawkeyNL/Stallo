@@ -583,7 +583,7 @@ async fn dispatch(
                 .into_iter()
                 .map(|e| {
                     let cached = images::is_cached(&m.paths, &e);
-                    let size_bytes = std::fs::metadata(images::image_path(&m.paths, &e.id))
+                    let size_bytes = std::fs::metadata(images::cached_path(&m.paths, &e))
                         .ok()
                         .filter(|f| f.is_file())
                         .map(|f| f.len());
@@ -594,6 +594,9 @@ async fn dispatch(
                     if e.trust == images::Trust::Pinned {
                         notes.push("pinned (upstream unsigned)".into());
                     }
+                    if e.kind == images::Kind::Iso {
+                        notes.push("installer ISO: install by hand over VNC".into());
+                    }
                     if e.firmware == images::Firmware::Uefi {
                         notes.push("no Secure Boot".into());
                     }
@@ -602,6 +605,7 @@ async fn dispatch(
                         .and_then(|p| p.sig_date);
                     ImageInfo {
                         cached,
+                        kind: Some(e.kind),
                         os: Some(e.os),
                         trust: Some(e.trust),
                         size_bytes,

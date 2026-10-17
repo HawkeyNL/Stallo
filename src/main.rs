@@ -853,8 +853,9 @@ fn snaps_table(list: &[Snapshot], now: u64) -> String {
 }
 
 fn images_table(images: &[ImageInfo]) -> String {
+    let w = images.iter().map(|i| i.id.len()).fold(16, usize::max);
     let mut s = format!(
-        "{:<16} {:<14} {:>9}  {:<12} NOTES\n",
+        "{:<w$} {:<14} {:>9}  {:<12} NOTES\n",
         "ID", "STATE", "SIZE", "TRUST"
     );
     for i in images {
@@ -868,7 +869,7 @@ fn images_table(images: &[ImageInfo]) -> String {
             .collect::<Vec<_>>()
             .join("; ");
         s.push_str(&format!(
-            "{:<16} {:<14} {:>9}  {:<12} {notes}\n",
+            "{:<w$} {:<14} {:>9}  {:<12} {notes}\n",
             i.id,
             state,
             size,
@@ -1084,6 +1085,14 @@ mod tests {
         assert_eq!(
             table.lines().nth(1),
             Some("ubuntu-26.04     cached                 -  -            Ubuntu")
+        );
+        // A longer id widens the column.
+        let long =
+            serde_json::json!([{"id": "fedora-44-workstation", "name": "F", "cached": false}]);
+        let images: Vec<ImageInfo> = serde_json::from_value(long).unwrap();
+        assert_eq!(
+            images_table(&images).lines().nth(1),
+            Some("fedora-44-workstation not downloaded         -  -            F")
         );
     }
 
