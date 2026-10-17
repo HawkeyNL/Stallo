@@ -98,7 +98,10 @@ agent control, turn VNC on (also not through `new`) or change a VM's CPUs
 and memory: agent control of a small VM must not let an agent claim the
 host's CPU and memory budget. Nor may agents create VMs from installer
 ISOs (or from images the daemon does not know as cloud images) or change
-what is in a VM's CD-ROM drive: those are installed by hand over VNC. Agents create VMs only from images a human has already pulled
+what is in a VM's CD-ROM drive: those are installed by hand over VNC. Such
+a guest has no guest agent until its user installs one: until then,
+agent control of it covers the screen, input, power and snapshots, but
+not files or commands. Agents create VMs only from images a human has already pulled
 (`stallo images pull <id>`). Turning agent control off stops new agent
 calls; calls already running (an `exec` can run up to an hour) finish
 first.

@@ -71,16 +71,14 @@ Guest images (`stallo images` lists them):
 | `fedora-44` | Fedora 44 Cloud Base Generic (44-1.7) | The guest agent's SELinux domain is made permissive (see `catalog/fedora-44.toml`). Offline only for now. |
 | `arch` | Arch Linux cloud image (arch-boxes) | No Secure Boot (its boot loader is not signed for it). Rolling: `latest/` moves every two weeks, and the first pull is kept. Offline only for now. |
 | `debian-13` | Debian 13 generic cloud image (20261015-2632) | Pinned (upstream unsigned): Debian signs no checksums for its cloud images, so Stallo checks a SHA-512 built into it, and a newer build needs a Stallo release. So does a new Debian archive key: the archive keyring that checks the guest-agent package is vendored, and fetches fail until a release ships the new one. Offline only for now. |
-| `ubuntu-26.04-desktop` | Ubuntu 26.04.1 LTS Desktop installer ISO | Installed by hand over VNC; no guest agent until you install one. Pinned to the point release: the next one needs a catalog bump. Offline only for now. |
-| `fedora-44-workstation` | Fedora 44 Workstation live installer ISO (44-1.7) | Installed by hand over VNC; no guest agent until you install one. Offline only for now. |
+| `ubuntu-26.04-desktop` | Ubuntu 26.04.1 LTS Desktop installer ISO (about 6 GB) | You install it on the VM's screen; no guest agent until you install one. Defaults: 2 vCPUs, 4 GiB, 32 GiB disk. Pinned to the point release: the next one needs a catalog bump. Offline only for now. |
+| `fedora-44-workstation` | Fedora 44 Workstation live installer ISO (44-1.7, about 2.7 GB) | You install it on the VM's screen; no guest agent until you install one (its SELinux domain then needs to be permissive). Defaults: 2 vCPUs, 4 GiB, 32 GiB disk. Offline only for now. |
 
 Use another one with `stallo new dev --image fedora-44` after pulling it.
 
-A VM from an installer ISO (`stallo new desk --image fedora-44-workstation`)
-gets a blank disk, the ISO in a read-only CD-ROM drive and VNC; there is no
-seed, cloud-init or guest password, and `new` and `start` do not wait for a
-guest agent. Defaults are 2 vCPUs, 4 GiB and a 32 GiB disk. Install over
-VNC; the installed system boots from the disk first.
+The installer ISOs (`ubuntu-26.04-desktop`, `fedora-44-workstation`) give a
+desktop that you install yourself on the VM's screen; see
+[Install a desktop from an ISO](#install-a-desktop-from-an-iso).
 Ubuntu images are checked with the host's Ubuntu keyrings; other
 distributions' signing keys ship with Stallo in `catalog/keys/`. Ubuntu's
 `current/` and Arch's `latest/` move to each new build, so their signatures
@@ -245,6 +243,73 @@ ssh -N -L 127.0.0.1:5901:/run/stallo/vnc/<vm>/vnc.sock <host>
 
 VNC input bypasses agent control and the audit log, so only humans can
 turn it on. `stallo set <vm> --vnc off` removes it at the next start.
+
+## Install a desktop from an ISO
+
+An installer ISO gives you a full desktop that you install yourself on
+the VM's screen, as on a real PC. Stallo only boots the installer: there
+is no seed, no cloud-init and no guest password, and the VM is offline.
+
+1. Pull the ISO (humans only). Fedora's is about 2.7 GB, Ubuntu's about
+   6 GB. A pull needs the disk floor plus the ISO's largest size free:
+
+   ```sh
+   stallo images pull fedora-44-workstation
+   ```
+
+2. Create the VM. It gets a blank 32 GiB disk, 2 vCPUs, 4 GiB, the ISO in
+   a read-only CD-ROM drive and VNC. Change the size with `--cpus`,
+   `--mem` and `--disk`. `new` returns once QEMU runs; nothing waits for
+   a guest agent:
+
+   ```sh
+   stallo new desk --image fedora-44-workstation
+   ```
+
+3. Open the screen: the **Screen** tab in the desktop app, or a VNC
+   viewer on `/run/stallo/vnc/desk/vnc.sock` in production (see
+   [Viewing a VM's screen](#viewing-a-vms-screen)).
+4. Install as usual. The installer sees only the VM's blank disk, never
+   the host's. The desktop has no 3D acceleration, so it is slower than
+   on hardware.
+5. Eject the installer, then restart. The disk boots first, so the
+   installed system starts even with the ISO still in; ejecting it means
+   QEMU no longer reads the ISO:
+
+   ```sh
+   stallo set desk --cdrom eject       # from the next start
+   stallo stop desk && stallo start desk
+   ```
+
+   `stallo set desk --cdrom fedora-44-workstation` puts it back, for
+   example to repair the installed system.
+
+The screen, keyboard and mouse work without anything in the guest. File
+copies (`stallo cp`) and commands (`stallo exec`) need the QEMU guest
+agent in the guest, which Stallo does not install. The VM is offline for
+now, so the package must come from the installed system or its ISO:
+
+- Check `systemctl status qemu-guest-agent`; if it is missing, install the
+  `qemu-guest-agent` package, then
+  `sudo systemctl enable --now qemu-guest-agent`.
+- Without `--admin`, Stallo runs commands and file copies as the guest
+  user `agent`. Create that user (`sudo useradd -m agent`), or use
+  `--admin` (root) for every call.
+- Fedora: SELinux confines the guest agent (`virt_qemu_ga_t`) and refuses
+  what `exec` needs. Make only that domain permissive, as Stallo does for
+  its Fedora cloud image:
+  `echo '(typepermissive virt_qemu_ga_t)' > /tmp/qga.cil && sudo semodule -i /tmp/qga.cil`.
+
+Stallo does not wait for a guest agent in a VM made from an ISO: not at
+`new`, `start` or snapshot restore, even after you install one. Agents
+may not create such VMs or change their CD-ROM drive. With agent control
+on (`stallo agent desk on`) they may use the screen, keyboard and mouse,
+and also files and commands once the guest agent runs.
+
+Disk space: the cached ISO stays until you remove it
+(`stallo images rm fedora-44-workstation`, refused while a VM has it in
+its drive). The VM's disk grows as you install, up to its full size, and
+each RAM snapshot of it takes up to its memory size.
 
 ## Agents (MCP)
 
