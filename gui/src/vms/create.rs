@@ -213,6 +213,8 @@ struct Form {
     importing: RefCell<Option<Importing>>,
     /// Imports started so far.
     generations: Cell<u64>,
+    /// A chosen file is looked at, or its system asked, before its import.
+    checking: Cell<bool>,
     name: adw::EntryRow,
     /// Shown only while the name is refused.
     hint: gtk::Label,
@@ -400,6 +402,7 @@ impl Form {
             import_stop,
             importing: RefCell::new(None),
             generations: Cell::new(0),
+            checking: Cell::new(false),
             name,
             hint,
             advanced_group,
@@ -599,7 +602,8 @@ impl Form {
         }
         // Creating would close the dialog, and so end the import.
         let importing = self.importing.borrow().is_some();
-        self.own_iso.set_sensitive(!importing);
+        self.own_iso
+            .set_sensitive(!importing && !self.checking.get());
         if let Some(d) = self.dialog.upgrade() {
             d.set_can_close(!importing);
         }
@@ -694,6 +698,13 @@ impl Form {
         if self.images.borrow().iter().any(|i| i.id == id) {
             return self.import_failed(&label, model::IMPORTED_ALREADY);
         }
+        self.checking.set(true);
+        self.import_row.set_title(&format!("Checking {label}…"));
+        self.import_row.set_subtitle("");
+        self.import_bar.set_visible(false);
+        self.import_stop.set_visible(false);
+        self.import_row.set_visible(true);
+        self.update();
         let f = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let p = path.clone();
@@ -736,15 +747,21 @@ impl Form {
         alert.set_default_response(Some("import"));
         alert.set_close_response("cancel");
         let f = Rc::downgrade(self);
-        alert.connect_response(Some("import"), move |_, _| {
+        alert.connect_response(None, move |_, response| {
+            let Some(f) = f.upgrade() else {
+                return;
+            };
+            if response != "import" {
+                f.checking.set(false);
+                f.import_row.set_visible(false);
+                return f.update();
+            }
             let os = if os.selected() == 1 {
                 Os::Windows
             } else {
                 Os::Linux
             };
-            if let Some(f) = f.upgrade() {
-                f.import(path.clone(), label.clone(), id.clone(), os);
-            }
+            f.import(path.clone(), label.clone(), id.clone(), os);
         });
         alert.present(Some(&self.own_iso));
     }
@@ -763,6 +780,7 @@ impl Form {
         if self.importing.borrow().is_some() {
             return;
         }
+        self.checking.set(false);
         let (sent, mut progress) = watch::channel((0, 0));
         let task = client::spawn(client::import(
             self.socket.clone(),
@@ -856,7 +874,7 @@ impl Form {
             .body_use_markup(false)
             .build();
         alert.add_response("keep", "Keep Importing");
-        alert.add_response("stop", "Stop");
+        alert.add_response("stop", "Stop Import");
         alert.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
         alert.set_default_response(Some("keep"));
         alert.set_close_response("keep");

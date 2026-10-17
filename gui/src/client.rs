@@ -241,10 +241,10 @@ pub async fn import(
 }
 
 /// The ISO 9660 volume label of the file at `path` (32 bytes at 0x8028),
-/// trimmed; empty if it has none or cannot be read. A hint for the OS
-/// guess only. Read on the blocking pool.
+/// trimmed; empty if it has none or cannot be read within 10 s. A hint
+/// for the OS guess only. Read on the blocking pool.
 pub async fn iso_label(path: PathBuf) -> String {
-    blocking(move || {
+    let read = blocking(move || {
         use std::os::unix::fs::{FileExt, OpenOptionsExt};
         let mut label = [0u8; 32];
         let file = std::fs::OpenOptions::new()
@@ -262,9 +262,12 @@ pub async fn iso_label(path: PathBuf) -> String {
             |_| String::new(),
             |()| String::from_utf8_lossy(&label).trim().to_owned(),
         ))
-    })
-    .await
-    .unwrap_or_default()
+    });
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
 }
 
 /// Counts the bytes read through it into `sent`: every 16 MiB and at the

@@ -1472,9 +1472,10 @@ pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64, internet: bo
     format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk · {net}")
 }
 
-/// Parts of the file names and volume labels of Windows ISOs: Microsoft
-/// names them by build (`…CLIENTCONSUMER_RET_x64FRE_en-us.iso`) and labels
-/// them `CCCOMA_X64FRE_EN-US_DV9`, `CENA_X64FREE_EN-US_DV9` and the like.
+/// Starts of words in the file names and volume labels of Windows ISOs:
+/// Microsoft names them by build (`…CLIENTCONSUMER_RET_x64FRE_en-us.iso`)
+/// and labels them `CCCOMA_X64FRE_EN-US_DV9`, `CENA_X64FREE_EN-US_DV9` and
+/// the like.
 const WINDOWS_MARKS: &[&str] = &[
     "win",
     "x64fre",
@@ -1482,30 +1483,31 @@ const WINDOWS_MARKS: &[&str] = &[
     "arm64fre",
     "a64fre",
     "cccoma",
-    "cena_",
-    "cpba_",
-    "ccsa_",
+    "cena",
+    "cpba",
+    "ccsa",
     "clientconsumer",
     "clientbusiness",
 ];
-/// Parts of the names and labels of Linux ISOs.
+/// Starts of words in the names and labels of Linux ISOs.
 const LINUX_MARKS: &[&str] = &[
     "linux",
     "ubuntu",
+    "kubuntu",
+    "xubuntu",
+    "lubuntu",
     "fedora",
     "debian",
     "mint",
-    "arch",
+    "archlinux",
     "opensuse",
     "suse",
     "manjaro",
-    "pop-os",
-    "pop_os",
     "elementary",
     "zorin",
     "centos",
     "rocky",
-    "alma",
+    "almalinux",
     "kali",
     "nixos",
     "gentoo",
@@ -1513,12 +1515,16 @@ const LINUX_MARKS: &[&str] = &[
     "rhel",
 ];
 
-/// The system an ISO installs, guessed from its file name and its ISO 9660
-/// volume label; `None` when unsure, and the user is asked. Only a label:
-/// nothing about the file is trusted.
+/// The system an ISO installs, guessed from the words of its file name and
+/// its ISO 9660 volume label; `None` when unsure, and the user is asked.
+/// Only a label: nothing about the file is trusted.
 pub fn guess_os(file_name: &str, label: &str) -> Option<Os> {
     let text = format!("{file_name} {label}").to_ascii_lowercase();
-    let has = |marks: &[&str]| marks.iter().any(|m| text.contains(m));
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |marks: &[&str]| words.iter().any(|w| marks.iter().any(|m| w.starts_with(m)));
     match (has(WINDOWS_MARKS), has(LINUX_MARKS)) {
         (true, false) => Some(Os::Windows),
         (false, true) => Some(Os::Linux),
@@ -4144,6 +4150,9 @@ mod tests {
             ("install.iso", "CDROM", None),
             ("", "", None),
             ("linux-and-windows.iso", "", None),
+            ("archive.iso", "", None),
+            ("darwin-x86.iso", "", None),
+            ("backup.iso", "DARWIN", None),
         ] {
             assert_eq!(guess_os(file, label), os, "{file} {label}");
         }
