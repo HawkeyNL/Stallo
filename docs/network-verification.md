@@ -520,8 +520,8 @@ reference.
 
 **Not verified yet.** The lab above used Linux guests. Windows guests and
 VMs from any imported ISO take the `internet` profile with the same passt
-flags and the same table. This checklist is for the owner's first
-Windows VM on a production install.
+flags and the same table. So do VMs from a catalog ISO. This checklist is
+for the owner's first Windows VM on a production install.
 
 **Why nothing changes for the isolation:**
 - Everything is enforced on the host. passt turns the guest's frames into
@@ -533,8 +533,9 @@ Windows VM on a production install.
   as `stallo` sockets and are dropped.
 - The catalog's per-image `internet` flag does not apply. It exists
   because a cloud image's seed (`network-config`) must match the NIC, or
-  DHCP never comes up and the VM is never ready. An imported ISO has no
-  seed: the installed OS asks passt's DHCP itself.
+  DHCP never comes up and the VM is never ready. A VM from an ISO
+  (imported or from the catalog) has no seed: the installed OS asks
+  passt's DHCP itself.
 
 **What the guest gets** (passt's behaviour, not checked with Windows):
 - An Intel 82574L card (QEMU `e1000e`), which Windows has a driver for.
@@ -546,15 +547,22 @@ Windows VM on a production install.
   segments to the guest's MSS, so this should not matter.
 
 **Before you start, on the laptop:**
-1. Do "Check the host first" under "Installing on a host" (global IPv6,
-   the router's WAN address).
+1. Do "Check the host first" under "Installing on a host". If the LAN
+   has global IPv6, or the router answers on its WAN address, **do not
+   continue** until the LAN's IPv6 prefix is in `deny6` and the WAN
+   address in `deny4` (`/etc/stallo/stallo.nft`, then
+   `sudo systemctl reload stallo-nft`).
 2. Check the table: `sudo nft list table inet stallo` must print it.
 3. Note the addresses to test, with `ip -br addr` and `ip route show default`:
    - `<gw>`: the default gateway (your router);
    - `<lan-dev>`: another device on the LAN with a known open port, for
      example a NAS or printer web page;
    - `<host-other>`: any other address of the laptop that is not its LAN
-     address (`docker0`, `virbr0`, `tailscale0`), if it has one.
+     address (`docker0`, `virbr0`, `tailscale0`), if it has one;
+   - `<lan-v6>`: a LAN device's global IPv6 address, if the LAN has global
+     IPv6 (`ip -6 neigh` on the laptop lists neighbours);
+   - `<wan>`: the router's public address (its status page, or
+     `curl -s https://ifconfig.me` from the laptop).
 4. Controls, as your own user on the laptop: `curl -m 3 http://<gw>/`
    and the `<lan-dev>` page answer.
 5. Optional, to prove that no guest address reaches the laptop's
@@ -578,13 +586,15 @@ Windows VM on a production install.
 | 8 | `Test-NetConnection <lan-dev> -Port <its port>` | `False` |
 | 9 | `nslookup example.com <gw>` (UDP to the router's DNS) | `timed out` |
 | 10 | `Test-NetConnection <host-other> -Port 22` (each one) | `False` |
-| 11 | With step 5's server: `Test-NetConnection <gw> -Port 8000` and `Test-NetConnection 169.254.1.53 -Port 8000` | `False` |
+| 11 | With step 5's server: `Test-NetConnection <gw> -Port 8000` and `Test-NetConnection 169.254.1.53 -Port 8000` | `False`: neither address is mapped to the laptop's loopback (this row tests only that mapping) |
 | 12 | `Test-NetConnection 169.254.169.254 -Port 80`, `Test-NetConnection 10.0.0.1 -Port 80` | `False` |
 | 13 | If the laptop runs Tailscale: `Test-NetConnection 100.100.100.100 -Port 53`, and `nslookup <laptop's tailnet name>` | `False`; no tailnet answer |
 | 14 | `ping <gw>` | no replies |
+| 15 | If the LAN has global IPv6: `Test-NetConnection <lan-v6> -Port <its port>` | `False` |
+| 16 | `Test-NetConnection <wan> -Port 80` and `-Port 443` | `False` |
 
 - **Blocked means a timeout**, not "refused" (finding 7). A `True` in rows
-  7 to 13 is an isolation failure: stop the VM (`stallo stop win`) and
+  7 to 13, 15 or 16 is an isolation failure: stop the VM (`stallo stop win`) and
   report it.
 - Testing the laptop's LAN address from Windows proves nothing: it is the
   guest's own address, so Windows answers itself.

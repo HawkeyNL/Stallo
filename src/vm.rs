@@ -662,10 +662,11 @@ impl Manager {
     ///
     /// The catalog's per-image `internet` flag is about the seed: its
     /// network config must bring the NIC up, or the VM never gets ready.
-    /// A VM from an imported ISO (every Windows VM) has no seed; its own OS
-    /// asks passt's DHCP. The isolation is on the host either way.
+    /// A VM from an ISO (catalog or imported; every Windows VM) has no
+    /// seed; its own OS asks passt's DHCP. The isolation is on the host
+    /// either way.
     fn check_net(&self, cfg: &VmConfig) -> Result<()> {
-        if cfg.net != NetProfile::Offline && !images::is_local(&cfg.image) {
+        if cfg.net != NetProfile::Offline && !images::is_iso(&cfg.image)? {
             images::find(&cfg.image)?.check_net(cfg.net)?;
         }
         match (cfg.net, self.mode) {

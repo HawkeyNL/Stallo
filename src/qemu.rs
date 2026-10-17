@@ -134,7 +134,9 @@ pub fn argv(
             }))
             .collect(),
         // An already connected socket (see net.rs). `romfile=`: no iPXE
-        // option ROM, so no network boot code in the firmware.
+        // option ROM, so no network boot code in the firmware. e1000e is
+        // more emulated code for the guest to reach than virtio-net; the
+        // QEMU confinement (confine.rs, AppArmor) is what contains it.
         (NetProfile::Internet, Some(fd)) => vec![
             format!("-netdev stream,id=net0,server=off,addr.type=fd,addr.str={fd}"),
             format!(

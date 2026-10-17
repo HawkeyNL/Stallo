@@ -651,12 +651,17 @@ mod tests {
         assert_eq!(m.load("win").unwrap(), win);
     }
 
-    /// The internet profile for VMs from an imported ISO, Windows or
-    /// Linux: no per-image gate (they have no seed), only the host's
-    /// isolation, which refuses here in both modes (no table).
+    /// The internet profile for VMs from an ISO (imported Windows or
+    /// Linux, or a catalog ISO): no per-image gate (they have no seed),
+    /// only the host's isolation, which refuses here in both modes (no
+    /// table).
     #[tokio::test]
-    async fn local_isos_take_internet_only_with_isolation() {
-        for machine in [Os::Windows, Os::Linux] {
+    async fn isos_take_internet_only_with_isolation() {
+        for (image, machine) in [
+            ("local-win11", Os::Windows),
+            ("local-distro", Os::Linux),
+            ("ubuntu-26.04-desktop", Os::Linux),
+        ] {
             for (mode, why) in [
                 (Mode::Dev, "dev mode"),
                 (Mode::Production, "isolation unavailable"),
@@ -666,7 +671,7 @@ mod tests {
                 let dir = m.paths.vm_dir("win");
                 fs::create_dir_all(&dir).unwrap();
                 VmConfig {
-                    image: "local-win11".into(),
+                    image: image.into(),
                     net: NetProfile::Internet,
                     machine,
                     vcpus: 2,
@@ -677,7 +682,7 @@ mod tests {
                 .save(&dir)
                 .unwrap();
                 let err = m.start("win").await.err().unwrap();
-                assert!(err.to_string().contains(why), "{machine:?} {err}");
+                assert!(err.to_string().contains(why), "{image} {err}");
             }
         }
     }
