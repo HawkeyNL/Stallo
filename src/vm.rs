@@ -1134,7 +1134,9 @@ impl Manager {
             "{name} is a `stallo run` clone; change the VM it was made from"
         );
         ensure!(
-            images::is_iso(&cfg.image).unwrap_or(false),
+            images::is_iso(&cfg.image).with_context(|| format!(
+                "{name} is made from an image this build does not know"
+            ))?,
             "{name} is made from cloud image {}, whose seed fixed the guest's network at `stallo new`; create a new VM with the profile instead",
             cfg.image
         );
@@ -1143,7 +1145,7 @@ impl Manager {
         }
         ensure!(
             net == NetProfile::Internet || cfg.forwards.is_empty(),
-            "{name} has port forwards, which need the internet profile; remove the port forwards first"
+            "{name} has port forwards, which need the internet profile; port forwards cannot be removed yet; recreate the VM to make it offline"
         );
         cfg.net = net;
         cfg.validate()?;
@@ -2908,10 +2910,24 @@ mod tests {
         assert!(err(m.set_net("nope", Offline).await).contains("nope"));
         let e = err(m.set_net("dev", Offline).await);
         assert!(e.contains("made from cloud image ubuntu-26.04"), "{e}");
+        // An image that left the catalog is refused, not taken for one.
+        let gone = VmConfig {
+            name: "gone".into(),
+            image: "no-such-image".into(),
+            ..cloud.clone()
+        };
+        let dir = m.paths.vm_dir("gone");
+        fs::create_dir(&dir).unwrap();
+        gone.save(&dir).unwrap();
+        let e = err(m.set_net("gone", Offline).await);
+        assert!(
+            e.contains("gone is made from an image this build does not know"),
+            "{e}"
+        );
         let e = err(m.set_net("run-0a1b2c3d", Offline).await);
         assert!(e.contains("clone"), "{e}");
         let e = err(m.set_net("fwd", Offline).await);
-        assert!(e.contains("remove the port forwards first"), "{e}");
+        assert!(e.contains("recreate the VM to make it offline"), "{e}");
         assert_eq!(m.load("fwd").unwrap(), fwd, "nothing saved");
         // Dev mode always refuses the internet profile; production mode
         // without the host's table (as here) too.

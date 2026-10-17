@@ -571,7 +571,8 @@ offline gets the profile later with `stallo set <vm> --net internet`
    loopback: `python3 -m http.server 8000 --bind 127.0.0.1` in a
    terminal (loopback only; stop it with Ctrl+C afterwards).
 6. Create the VM: `stallo new win --image local-<id> --net internet`.
-   The profile is fixed at `new`; an offline VM must be made again.
+   An offline VM gets it with `stallo set <vm> --net internet` (stopped
+   VM, no RAM snapshots).
 
 **Inside Windows**, in PowerShell (during Setup: Shift+F10, then
 `powershell`):
