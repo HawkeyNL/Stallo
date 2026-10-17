@@ -1977,19 +1977,15 @@ pub fn remove_note(vm: &VmInfo) -> (&'static str, bool) {
 pub const INTERNET_ACCESS: &str = "Internet Access";
 
 /// Why the Internet Access switch cannot move now, if so; as the daemon's
-/// `set_net`, which checks again. `snaps`: the VM's snapshots, if listed.
+/// `set_net`, which checks again. Only VMs from an installer ISO have
+/// the switch ([`internet_switchable`]). `snaps`: the VM's snapshots, if
+/// listed.
 pub fn internet_switch_block(
     vm: &VmInfo,
     snaps: Option<&[Snapshot]>,
     production: bool,
 ) -> Option<&'static str> {
-    let installer = vm
-        .image
-        .as_deref()
-        .is_some_and(|i| stallo::images::is_iso(i).unwrap_or(false));
-    if !installer {
-        Some("VMs from cloud images keep the setting they were created with.")
-    } else if kind(&vm.state) != Kind::Stopped {
+    if kind(&vm.state) != Kind::Stopped {
         Some("Stop the VM to change this.")
     } else if vm.net == NetProfile::Offline && !production {
         Some("Not available: the dev-mode daemon keeps VMs offline.")
@@ -2002,7 +1998,27 @@ pub fn internet_switch_block(
     }
 }
 
-/// The Internet Access switch's subtitle: a cut network, else why it
+/// Whether `vm` gets the Internet Access switch: made from an installer
+/// ISO (catalog or imported), as the daemon's `set_net`. Reads the
+/// catalog: once per VM page.
+pub fn internet_switchable(vm: &VmInfo) -> bool {
+    vm.image
+        .as_deref()
+        .is_some_and(|i| stallo::images::is_iso(i).unwrap_or(false))
+}
+
+/// Why a VM without the switch keeps its setting.
+pub const INTERNET_FIXED: &str = "VMs from cloud images keep the setting they were created with.";
+
+/// The Internet Access value of a VM without the switch.
+pub fn internet_word(vm: &VmInfo) -> &'static str {
+    match vm.net {
+        NetProfile::Internet => "On",
+        NetProfile::Offline => "Off",
+    }
+}
+
+/// The Internet Access row's subtitle: a cut network, else why it
 /// cannot move, else what it means.
 pub fn internet_note(vm: &VmInfo, block: Option<&'static str>) -> &'static str {
     // The daemon cut it: the network check failed.
@@ -5121,15 +5137,21 @@ mod tests {
             internet_note(&win, None),
             "Reaches the internet, not this computer or your local network."
         );
-        // Cloud images first: stopping would not help.
+        // Only VMs from an ISO get the switch; others show their value.
+        assert!(internet_switchable(&win));
+        assert!(internet_switchable(&VmInfo {
+            image: Some("fedora-44-workstation".into()),
+            ..vm("running")
+        }));
         for image in [Some("ubuntu-26.04"), Some("nope"), None] {
             let cloud = VmInfo {
                 image: image.map(Into::into),
                 ..vm("running")
             };
-            let why = internet_switch_block(&cloud, None, true).unwrap();
-            assert!(why.contains("cloud images"), "{image:?}");
+            assert!(!internet_switchable(&cloud), "{image:?}");
         }
+        assert_eq!((internet_word(&win), internet_word(&on)), ("Off", "On"));
+        assert_eq!(internet_note(&win, Some(INTERNET_FIXED)), INTERNET_FIXED);
         for state in ["running", "paused", "running (no network)"] {
             let busy = VmInfo {
                 state: state.into(),

@@ -123,8 +123,12 @@ struct Detail {
     /// Shown while an action on this VM runs.
     busy: adw::Spinner,
     values: Vec<adw::ActionRow>,
-    /// The network profile, while the VM is stopped.
-    internet: adw::SwitchRow,
+    /// Internet Access: the switch's row, or a plain one.
+    internet: adw::ActionRow,
+    /// For VMs from an installer ISO, which can change it while stopped.
+    internet_switch: Option<adw::SwitchRow>,
+    /// "On" or "Off" on the plain row.
+    internet_value: Option<gtk::Label>,
     /// The window talks to the production daemon.
     production: bool,
     /// VNC on or off from the next start.
@@ -412,6 +416,7 @@ impl Vms {
         // list wait for it. The action asks again when it is done. On the
         // Overview too while only snapshots could block Internet Access.
         let switchable = tab.as_deref() == Some(OVERVIEW)
+            && detail.internet_switch.is_some()
             && model::internet_switch_block(&vm, None, detail.production).is_none();
         if visible
             && (tab.as_deref() == Some(SNAPSHOTS) || switchable)
@@ -1113,11 +1118,25 @@ impl Detail {
         resize_buttons.append(&resize);
         let mut values = Vec::new();
         let mut resources = None;
-        let internet = adw::SwitchRow::builder()
-            .title(model::INTERNET_ACCESS)
-            .use_markup(false)
-            .active(vm.net == NetProfile::Internet)
-            .build();
+        let internet_switch = model::internet_switchable(vm).then(|| {
+            adw::SwitchRow::builder()
+                .title(model::INTERNET_ACCESS)
+                .use_markup(false)
+                .active(vm.net == NetProfile::Internet)
+                .build()
+        });
+        let internet: adw::ActionRow = match &internet_switch {
+            Some(s) => s.clone().upcast(),
+            None => adw::ActionRow::builder()
+                .title(model::INTERNET_ACCESS)
+                .use_markup(false)
+                .build(),
+        };
+        let internet_value = internet_switch.is_none().then(|| {
+            let value = gtk::Label::builder().css_classes(["dim-label"]).build();
+            internet.add_suffix(&value);
+            value
+        });
         for (title, rows) in model::facts(vm, None) {
             let group = adw::PreferencesGroup::builder().title(title).build();
             if title == "Resources" {
@@ -1181,10 +1200,13 @@ impl Detail {
             .active(vm.agent_control)
             .build();
         for (row, setting) in [
-            (&live_screen, Setting::LiveScreen),
-            (&agent, Setting::Agent),
-            (&internet, Setting::Internet),
+            (Some(&live_screen), Setting::LiveScreen),
+            (Some(&agent), Setting::Agent),
+            (internet_switch.as_ref(), Setting::Internet),
         ] {
+            let Some(row) = row else {
+                continue;
+            };
             let (v, name) = (Rc::downgrade(vms), vm.name.clone());
             row.connect_active_notify(move |row| {
                 if let Some(v) = v.upgrade() {
@@ -1351,6 +1373,8 @@ impl Detail {
             busy,
             values,
             internet,
+            internet_switch,
+            internet_value,
             production: model::production(&vms.socket),
             live_screen,
             installer_group,
@@ -1405,13 +1429,22 @@ impl Detail {
         self.screen
             .update(vm, self.details.borrow().as_ref(), blocked);
         self.files.update(vm, blocked, copy);
-        let internet =
-            model::internet_switch_block(vm, self.snaps.borrow().as_deref(), self.production);
+        let internet = match &self.internet_switch {
+            Some(_) => {
+                model::internet_switch_block(vm, self.snaps.borrow().as_deref(), self.production)
+            }
+            None => Some(model::INTERNET_FIXED),
+        };
+        // Until the snapshots are listed, it is not known whether it can move.
+        let free = internet.is_none() && self.snaps.borrow().is_some();
         for (row, setting, free) in [
-            (&self.live_screen, Setting::LiveScreen, true),
-            (&self.agent, Setting::Agent, true),
-            (&self.internet, Setting::Internet, internet.is_none()),
+            (Some(&self.live_screen), Setting::LiveScreen, true),
+            (Some(&self.agent), Setting::Agent, true),
+            (self.internet_switch.as_ref(), Setting::Internet, free),
         ] {
+            let Some(row) = row else {
+                continue;
+            };
             row.set_sensitive(!blocked && free);
             if let Some(on) = setting.shown(vm, blocked) {
                 row.set_active(on);
@@ -1419,6 +1452,9 @@ impl Detail {
         }
         self.internet
             .set_subtitle(model::internet_note(vm, internet));
+        if let Some(value) = &self.internet_value {
+            value.set_label(model::internet_word(vm));
+        }
         self.connect_agent.set_visible(vm.agent_control);
         let note = model::installer_note(vm);
         self.installer_group.set_visible(note.is_some());
