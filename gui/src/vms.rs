@@ -6,6 +6,8 @@
 
 mod create;
 mod files;
+#[cfg(feature = "shots")]
+pub mod shots;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;

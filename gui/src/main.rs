@@ -65,6 +65,10 @@ fn main() -> glib::ExitCode {
         .with_max_level(level)
         .with_writer(std::io::stderr)
         .init();
+    #[cfg(feature = "shots")]
+    if let Some(code) = vms::shots::run() {
+        return code;
+    }
     let mut flags = gio::ApplicationFlags::empty();
     if !model::single_instance(std::env::var_os("STALLO_SOCKET").is_some()) {
         flags |= gio::ApplicationFlags::NON_UNIQUE;

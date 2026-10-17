@@ -29,5 +29,9 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["test-util"] }
 
+[features]
+# Dev only: `stallo-gui --screenshot <dir>`, see docs/gui-screenshots.md.
+shots = []
+
 [lints.rust]
 unsafe_code = "forbid"
