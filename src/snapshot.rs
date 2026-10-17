@@ -35,7 +35,7 @@ use crate::config::validate_tag;
 use crate::paths::safe_remove;
 use crate::qmp::Qmp;
 use crate::vm::{Manager, QGA_BUSY_WAIT, Running};
-use crate::{cgroup, confine, host, qemu, run_tool};
+use crate::{cgroup, confine, host, qemu, run_tool, tpm};
 
 /// The block nodes every snapshot covers (named in `qemu::argv`).
 const DEVICES: [&str; 2] = ["disk0", "fw-vars"];
@@ -556,7 +556,18 @@ impl Manager {
                 saved?
             }
             None => {
-                create_offline(&vm_dir, &tag).await?;
+                // The TPM state is not in the images: a Windows VM's
+                // disk-only snapshot gets a copy of it.
+                let windows = !self.load(name)?.machine.is_linux();
+                if windows {
+                    tpm::save_copy(&vm_dir, &tag)?;
+                }
+                if let Err(e) = create_offline(&vm_dir, &tag).await {
+                    if windows && let Err(e) = tpm::remove_copy(&vm_dir, &tag) {
+                        tracing::warn!("{name}: cannot remove the TPM copy of {tag}: {e:#}");
+                    }
+                    return Err(e);
+                }
                 None
             }
         };
@@ -636,7 +647,17 @@ impl Manager {
                 }
             }
             None => {
+                let windows = !self.load(name)?.machine.is_linux();
+                ensure!(
+                    !windows || tpm::has_copy(&vm_dir, &snap.name),
+                    "{} has no copy of {name}'s TPM state; it cannot be restored, delete it",
+                    snap.name
+                );
                 apply_offline(&vm_dir, &snap.name, &names_offline(&vm_dir).await?).await?;
+                if windows {
+                    tpm::restore_copy(&vm_dir, &snap.name)
+                        .context("the restore stopped halfway; restore again")?;
+                }
                 None
             }
         };
@@ -723,6 +744,7 @@ impl Manager {
             }
         }
         safe_remove(&vm_dir, &file)?;
+        tpm::remove_copy(&vm_dir, tag)?;
         Ok(())
     }
 }

@@ -18,9 +18,10 @@ a release build with `dpkg-deb` (no root, no extra tools).
 | `/usr/lib/systemd/system/stallod.service` | the daemon (`packaging/stallod.service`) |
 | `/usr/lib/systemd/system/stallo-nft.service` | loads the network table at boot (`packaging/stallo-nft.service`) |
 | `/etc/apparmor.d/stallo-qemu` | QEMU's AppArmor profile (`packaging/apparmor/stallo-qemu`), a conffile |
+| `/etc/apparmor.d/stallo-swtpm` | swtpm's AppArmor profile (`packaging/apparmor/stallo-swtpm`, Windows VMs), a conffile |
 | `/etc/stallo/stallo.nft` | the table (`packaging/stallo.nft`), a conffile: local edits such as a LAN IPv6 prefix in `deny6` survive upgrades |
 
-**Depends:** `apparmor`, `nftables`, `passt`, `qemu-system-x86 (>= 1:10.2)`,
+**Depends:** `apparmor`, `nftables`, `passt`, `swtpm`, `qemu-system-x86 (>= 1:10.2)`,
 `qemu-utils`, `ovmf`, `xorriso`, `curl`, `gpgv`,
 `ubuntu-cloudimage-keyring`, `ubuntu-keyring`, `passwd` (`useradd`), and
 `systemd (>= 257)`
@@ -40,14 +41,16 @@ a release build with `dpkg-deb` (no root, no extra tools).
     (`SupplementaryGroups=kvm`).
   - Enables both units on first install, and keeps the owner's choice on
     upgrades.
-  - Loads QEMU's AppArmor profile (if AppArmor is enabled), the table
+  - Loads the AppArmor profiles of QEMU and swtpm (if AppArmor is
+    enabled), the table
     (`restart stallo-nft`), then starts `stallod`. It
     does the same when dpkg rolls a failed upgrade back
     (`abort-upgrade`), so the daemon that prerm stopped comes back.
 - **prerm:** stops `stallod`. **That stops every VM**, on upgrade and
   removal alike: VMs live in the daemon's cgroup.
 - **postrm remove:** deletes the table (nothing runs as `stallo` any more),
-  unloads QEMU's AppArmor profile, and masks the units, as debhelper does.
+  unloads the AppArmor profiles of QEMU and swtpm, and masks the units, as
+  debhelper does.
   - It never deletes VMs, images, `/var/lib/stallo` or the user, not even
     on purge. The steps below remove them by hand.
 
@@ -179,8 +182,61 @@ gate.
   - Removing the package unloads the profile; the conffile stays until
     purge, so `apparmor.service` loads it again at boot (harmless: it
     attaches to nothing by itself).
-- **swtpm:** not used before M4 (Windows).
+- **swtpm (Windows VMs, W3):** the package ships the profile
+  `stallo-swtpm` and postinst loads it, as for QEMU.
+  - The daemon makes each swtpm enter it at exec, checks its label right
+    after the spawn and again every 10 s with QEMU's, and refuses or kills
+    the VM unless it is the profile in enforce mode (both label forms, as
+    above). **Without the profile, Windows VMs do not start**; Linux VMs
+    do not need it.
+  - It replaces Ubuntu's `swtpm` profile for these processes (that one is
+    written for libvirt's paths and peers).
+  - It allows `/var/lib/stallo/vms/*/tpm/**`, the VM's `swtpm.log` and
+    connected Unix stream sockets without an address. It denies, and logs,
+    the network, capabilities, ptrace, mount and `connect`/`bind`/`listen`
+    on Unix sockets.
+  - **Not verified in the lab yet** (no production install with a Windows
+    VM so far): the profile parses (`apparmor_parser -Q`), but its
+    enforcement and any denials are unmeasured. Dev mode runs swtpm under
+    Ubuntu's `swtpm` profile, which allows `$HOME`.
 - **No override of Ubuntu's profiles is needed.**
+
+## swtpm (Windows VMs)
+
+Every Windows VM has a TPM 2.0 (Windows 11 requires one), emulated by its
+own `swtpm` process (`src/tpm.rs`):
+
+- **Lifecycle.** The daemon starts swtpm before QEMU, in the VM's cgroup,
+  and connects the two with a socket pair: swtpm's control channel is one
+  end (`--ctrl type=unixio,clientfd=N,terminate`), QEMU's
+  `-chardev socket,fd=M` the other. There is no socket file, no TCP and no
+  `connect()`. When QEMU exits swtpm exits by itself (`terminate`); a
+  stop, a forced stop, a failed start, a daemon shutdown or crash all kill
+  the VM's cgroup, swtpm with it. A start fails if swtpm has exited by the
+  time QMP answers, or if QEMU's `query-tpm` does not show the swtpm TPM.
+- **State.** `/var/lib/stallo/vms/<vm>/tpm/` (0700), created at the first
+  start; `stallo rm` removes it with the VM. No `swtpm_setup`, no EK
+  certificates, no state encryption: Windows Setup only needs a TPM 2.0.
+  Its log is `swtpm.log` in the VM directory.
+- **Confinement.** swtpm runs TPM commands from the guest (libtpms), so it
+  is confined like QEMU: a Landlock ruleset with read-only `/usr`
+  (executing only swtpm and the ELF loader) and its own `tpm/` only (no
+  other VM's state, not even its own VM's disk), the daemon's seccomp
+  filter (swtpm runs under it unchanged; `--tpmstate` has
+  no `mode=`, which would need `fchmod`), its own seccomp filter, and the
+  AppArmor profile above in production. Its memory (32 MiB) counts in the
+  VM's cgroup limit and in admission.
+- **Snapshots.** A RAM snapshot (taken while the VM runs) includes the TPM
+  state: QEMU's TPM emulator backend saves swtpm's state with the RAM and
+  loads it back, also into a fresh swtpm when a stopped VM is restored. A
+  disk-only snapshot (taken while the VM is stopped) gets a copy of
+  `tpm/` (a few KiB) in `tpm-snapshots/<name>/`, out of reach of QEMU and
+  swtpm; restoring it puts the copy back with the disk and firmware
+  variables, and deleting the snapshot deletes the copy. A disk-only
+  snapshot of a Windows VM without a copy is refused at restore.
+- **Limits.** swtpm may write files of at most 16 MiB (`RLIMIT_FSIZE`; its
+  state is tens of KiB). If swtpm exits while QEMU still runs, the daemon
+  kills the VM: a guest never runs on without its TPM.
 
 ## M5 gate (lab VM)
 

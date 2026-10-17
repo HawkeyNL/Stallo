@@ -38,6 +38,12 @@ start and every 10 s after, and kills a VM that is not confined by it.
 The profile is shared by all VMs; keeping one VM's QEMU away from
 another's stays the job of Landlock and seccomp.
 
+A Windows VM's TPM runs in its own `swtpm` process, which handles TPM
+commands from the guest. It gets the same seccomp filter, a Landlock
+ruleset limited to its own TPM state directory, and in production the
+AppArmor profile `stallo-swtpm`, checked like QEMU's
+(see `docs/production.md`).
+
 ## Remote MCP
 
 `stallo mcp --http <ip>:<port>` serves the agent tools over HTTP. It is a
