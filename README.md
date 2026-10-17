@@ -200,6 +200,9 @@ user: they can reach the daemon socket just like `stallo` can.
     opens to those ranges.
   - Guest DNS goes to a public resolver (`[net] dns` in `stallod.toml`,
     default `9.9.9.9`).
+  - IPv4 only for now: guests get no IPv6, and port forwards bind IPv4
+    addresses only (see "Known gaps" in
+    [docs/network-verification.md](docs/network-verification.md)).
   - Optional TCP port forwards: host ports above 1024, on `127.0.0.1`
     unless `--bind` names one host address:
 

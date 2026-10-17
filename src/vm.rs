@@ -707,6 +707,14 @@ impl Manager {
         if cfg.net != NetProfile::Offline && !images::is_iso(&cfg.image)? {
             images::find(&cfg.image)?.check_net(cfg.net)?;
         }
+        // passt runs IPv4 only (net::passt_args), so it refuses IPv6
+        // listeners; say why here, before passt starts.
+        if let Some(f) = cfg.forwards.iter().find(|f| f.bind.is_ipv6()) {
+            bail!(
+                "port forward {} binds IPv6, but guests get IPv4 only for now; bind 127.0.0.1 or another IPv4 address",
+                std::net::SocketAddr::new(f.bind, f.host)
+            );
+        }
         match (cfg.net, self.mode) {
             (NetProfile::Offline, _) => Ok(()),
             // The host's table matches the daemon's user; in dev mode that

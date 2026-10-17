@@ -682,6 +682,31 @@ mod tests {
         }
     }
 
+    /// Guests get IPv4 only (passt `-4`), so an IPv6 port forward is
+    /// refused with a reason, in both modes and before the isolation check.
+    #[tokio::test]
+    async fn ipv6_forwards_are_refused() {
+        for mode in [Mode::Dev, Mode::Production] {
+            let tmp = tempfile::tempdir().unwrap();
+            let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+            let dir = m.paths.vm_dir("web");
+            fs::create_dir_all(&dir).unwrap();
+            VmConfig {
+                net: NetProfile::Internet,
+                forwards: vec![crate::config::PortForward {
+                    bind: "::1".parse().unwrap(),
+                    host: 8081,
+                    guest: 80,
+                }],
+                ..vm("web", None)
+            }
+            .save(&dir)
+            .unwrap();
+            let err = m.start("web").await.err().unwrap();
+            assert!(err.to_string().contains("IPv4 only"), "{err}");
+        }
+    }
+
     async fn internet_is_refused_in(mode: Mode, why: &str) {
         let tmp = tempfile::tempdir().unwrap();
         let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
