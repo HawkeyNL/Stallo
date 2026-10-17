@@ -256,7 +256,8 @@ turn it on. `stallo set <vm> --vnc off` removes it at the next start.
 
 An installer ISO gives you a full desktop that you install yourself on
 the VM's screen, as on a real PC. Stallo only boots the installer: there
-is no seed, no cloud-init and no guest password, and the VM is offline.
+is no seed, no cloud-init and no guest password. The VM is offline unless
+you create it with `--net internet` (production mode).
 
 1. Pull the ISO (humans only). Fedora's is about 2.7 GB, Ubuntu's about
    6 GB. A pull needs the disk floor (`disk_floor_gib`, 20 GiB by
