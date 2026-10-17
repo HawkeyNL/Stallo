@@ -1406,12 +1406,11 @@ impl Limits {
 /// Why the internet cannot be turned on for `image`, if so. Only the
 /// production daemon has the isolation the internet profile needs.
 pub fn internet_block(image: &ImageChoice, production: bool) -> Option<&'static str> {
-    // As the daemon's `check_net`.
-    if image.windows || stallo::images::is_local(&image.id) {
-        Some("No internet yet for VMs from Windows or your own ISO.")
-    } else if !production {
+    // As the daemon's `check_net`: an installer ISO (catalog or imported,
+    // Linux or Windows) may use it; a cloud image only if verified.
+    if !production {
         Some("Not available: the dev-mode daemon keeps VMs offline.")
-    } else if !image.internet {
+    } else if !image.internet && !image.installer && !image.windows {
         Some("Not available for this image yet.")
     } else {
         None
@@ -1444,6 +1443,12 @@ pub fn suggest_vm_name(image: &str, taken: &[String]) -> String {
         })
         .find(|n| vm_name(n, taken).is_ok())
         .unwrap_or(base)
+}
+
+/// A free name for a VM from `image`: as [`suggest_vm_name`], with
+/// `windows` for Windows (an imported ISO's id is the file's name).
+pub fn suggest_name_for(image: &ImageChoice, taken: &[String]) -> String {
+    suggest_vm_name(if image.windows { "windows" } else { &image.id }, taken)
 }
 
 /// The name typed for a new VM, checked as the daemon checks it.
@@ -4099,17 +4104,23 @@ mod tests {
                 .contains("memory")
         );
 
-        // Offline only, as the daemon's `check_net`, in production too.
-        for row in &rows[1..] {
-            assert_eq!(
-                internet_block(row, true),
-                Some("No internet yet for VMs from Windows or your own ISO.")
-            );
+        // Internet in production, as the daemon's `check_net`; not in
+        // dev mode.
+        for row in &rows {
+            assert_eq!(internet_block(row, true), None, "{}", row.id);
+            assert!(internet_block(row, false).unwrap().contains("dev-mode"));
         }
-        assert_eq!(internet_block(&rows[0], true), None);
 
         // The prefix is no name.
         assert_eq!(suggest_vm_name("local-win11-25h2", &[]), "win");
+        // Windows is called so.
+        assert_eq!(suggest_name_for(&rows[1], &[]), "windows");
+        assert_eq!(
+            suggest_name_for(&rows[1], &["windows".to_owned()]),
+            "windows-2"
+        );
+        assert_eq!(suggest_name_for(&rows[2], &[]), "mint");
+        assert_eq!(suggest_name_for(&rows[0], &[]), "ubuntu");
         assert_eq!(suggest_vm_name("local-2604", &[]), "vm");
         assert_eq!(
             suggest_vm_name("local-mint", &["mint".to_owned()]),
@@ -4246,12 +4257,22 @@ mod tests {
 
     #[test]
     fn internet_option() {
-        let rows = image_choices(&[image("ubuntu-26.04", true, None), image("arch", true, None)]);
+        let rows = image_choices(&[
+            image("ubuntu-26.04", true, None),
+            image("arch", true, None),
+            // A catalog installer: allowed like an imported one.
+            ImageInfo {
+                kind: Some(stallo::images::Kind::Iso),
+                ..image("fedora-44-workstation", true, None)
+            },
+        ]);
         assert_eq!(internet_block(&rows[0], true), None);
         assert_eq!(
             internet_block(&rows[1], true),
             Some("Not available for this image yet.")
         );
+        assert!(rows[2].installer);
+        assert_eq!(internet_block(&rows[2], true), None);
         for row in &rows {
             assert!(internet_block(row, false).unwrap().contains("dev-mode"));
         }

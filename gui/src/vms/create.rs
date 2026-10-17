@@ -322,7 +322,7 @@ impl Form {
         installer_group.add(&own_iso);
         installer_group.add(&import_row);
 
-        let suggested = model::suggest_vm_name(&images[selected].id, &taken);
+        let suggested = model::suggest_name_for(&images[selected], &taken);
         let name = adw::EntryRow::builder()
             .title("Name")
             .text(&suggested)
@@ -518,7 +518,7 @@ impl Form {
                 wanted.set(value);
             }
         }
-        let new = model::suggest_vm_name(&image.id, &self.taken);
+        let new = model::suggest_name_for(&image, &self.taken);
         let old = self.suggested.replace(new.clone());
         if self.name.text() == old {
             self.name.set_text(&new);
