@@ -123,6 +123,7 @@ struct Detail {
     /// VNC on or off from the next start.
     live_screen: adw::SwitchRow,
     /// Shown while an installer ISO is in the VM's drive.
+    installer_group: adw::PreferencesGroup,
     installer: adw::ActionRow,
     eject: gtk::Button,
     agent: adw::SwitchRow,
@@ -1127,7 +1128,7 @@ impl Detail {
             .active(vm.vnc)
             .build();
         let eject = gtk::Button::builder()
-            .label("Eject Installer")
+            .label("Eject")
             .valign(gtk::Align::Center)
             .build();
         let (v, name) = (Rc::downgrade(vms), vm.name.clone());
@@ -1136,16 +1137,21 @@ impl Detail {
                 v.run(Action::Eject, &name);
             }
         });
+        eject.update_property(&[gtk::accessible::Property::Label("Eject Installer")]);
         let installer = adw::ActionRow::builder()
             .title("Installer Attached")
             .use_markup(false)
-            .visible(false)
             .build();
         installer.add_suffix(&eject);
+        let installer_group = adw::PreferencesGroup::builder()
+            .title("Installer")
+            .visible(false)
+            .build();
+        installer_group.add(&installer);
         let screen_group = adw::PreferencesGroup::builder().title("Screen").build();
         screen_group.add(&live_screen);
-        screen_group.add(&installer);
         overview.add(&screen_group);
+        overview.add(&installer_group);
 
         let agent = adw::SwitchRow::builder()
             .title("Agent Control")
@@ -1323,6 +1329,7 @@ impl Detail {
             busy,
             values,
             live_screen,
+            installer_group,
             installer,
             eject,
             agent,
@@ -1385,7 +1392,7 @@ impl Detail {
         }
         self.connect_agent.set_visible(vm.agent_control);
         let note = model::installer_note(vm);
-        self.installer.set_visible(note.is_some());
+        self.installer_group.set_visible(note.is_some());
         if let Some(note) = note
             && self.installer.subtitle().as_deref() != Some(note.as_str())
         {

@@ -697,9 +697,7 @@ impl Action {
             }
             Action::Remove => Some(format!("{vm} deleted")),
             Action::Resize { .. } => Some(format!("Resources of {vm} changed")),
-            Action::Eject => Some(format!(
-                "Installer ejected from {vm}. This takes effect at the next start."
-            )),
+            Action::Eject => Some(format!("Installer ejected from {vm}. {AT_NEXT_START}")),
             Action::Take(_) => Some(match data.get("name").and_then(|n| n.as_str()) {
                 Some(n) => format!("Snapshot {} taken", printable(n, 64)),
                 None => "Snapshot taken".to_owned(),
@@ -1055,7 +1053,6 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
     let addresses = match details.map(|d| &d.addresses) {
         _ if k == Kind::Stopped => "None".to_owned(),
         None => "Unknown".to_owned(),
-        Some(None) if from_installer(vm) => NO_GUEST_AGENT.to_owned(),
         Some(None) => "Unknown (install qemu-guest-agent in the VM to see addresses)".to_owned(),
         Some(Some(a)) if a.is_empty() => "None".to_owned(),
         Some(Some(a)) => a
@@ -1064,6 +1061,13 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
             .map(|(iface, addr)| format!("{}  {}", printable(iface, 32), printable(addr, 64)))
             .collect::<Vec<_>>()
             .join("\n"),
+    };
+    let agent = match details.map(|d| &d.addresses) {
+        _ if k == Kind::Stopped => "Not running",
+        None => "Unknown",
+        Some(Some(_)) => "Answering",
+        Some(None) if from_installer(vm) => NO_GUEST_AGENT,
+        Some(None) => "Not answering (still starting, busy or not installed)",
     };
     vec![
         (
@@ -1084,11 +1088,12 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
                 ("Addresses", addresses),
             ],
         ),
+        ("Guest", vec![("Guest Agent", agent.to_owned())]),
     ]
 }
 
 /// What a VM installed from an ISO offers while no guest agent answers.
-pub const NO_GUEST_AGENT: &str = "Guest agent not installed: screen, keyboard and mouse work; files and commands need qemu-guest-agent";
+pub const NO_GUEST_AGENT: &str = "No guest agent answering: screen, keyboard and mouse work; files and commands need qemu-guest-agent";
 
 /// Whether `vm` was made from an installer ISO, by the catalog this app
 /// was built with.
@@ -1099,13 +1104,17 @@ fn from_installer(vm: &VmInfo) -> bool {
         .is_some_and(|e| e.kind == stallo::images::Kind::Iso)
 }
 
-/// The Overview's Installer Attached row, while an installer ISO is in
+/// When a change to the VM's settings takes effect.
+pub const AT_NEXT_START: &str =
+    "This takes effect the next time Stallo starts the VM (a restart inside the VM is not enough).";
+
+/// The Overview's Installer row, while an installer ISO is in
 /// the VM's drive. Safe for plain labels.
 pub fn installer_note(vm: &VmInfo) -> Option<String> {
     let iso = vm.cdrom.as_deref()?;
     let name = stallo::images::find(iso).map_or_else(|_| iso.to_owned(), |e| e.name);
     Some(format!(
-        "{}. Eject it once the system is installed; this takes effect at the next start.",
+        "{} is in the VM's drive. Eject it once the system is installed. {AT_NEXT_START}",
         printable(&name, 96)
     ))
 }
@@ -2975,7 +2984,15 @@ mod tests {
         assert_eq!(
             values(stopped),
             [
-                "Stopped", "2", "2 GiB", "20 GiB", "Unknown", "Off", "None", "None"
+                "Stopped",
+                "2",
+                "2 GiB",
+                "20 GiB",
+                "Unknown",
+                "Off",
+                "None",
+                "None",
+                "Not running"
             ]
         );
 
@@ -3021,6 +3038,7 @@ mod tests {
                 "On",
                 "127.0.0.1:8080 → 80\n[::1]:2222 → 22",
                 "eth0  10.0.2.15/24\nevil  fe80::1/64",
+                "Answering",
             ]
         );
         let addresses =
@@ -3030,8 +3048,9 @@ mod tests {
             addresses(Some(details(None)), "running"),
             "Unknown (install qemu-guest-agent in the VM to see addresses)"
         );
-        // A VM from an installer ISO says what works without a guest agent;
-        // one from a cloud image, or from an older daemon, does not.
+        // The Guest Agent row: a VM from an installer ISO says what works
+        // without one; one from a cloud image, or from an older daemon,
+        // may still be starting. Addresses stay as they are.
         let desk = |image: Option<&str>| VmInfo {
             image: image.map(Into::into),
             ..vm("running")
@@ -3041,13 +3060,17 @@ mod tests {
                 vm: desk(image),
                 ..details(None)
             };
-            values(facts(&desk(image), Some(&d)))[7].clone()
+            let v = values(facts(&desk(image), Some(&d)));
+            assert!(v[7].starts_with("Unknown (install"), "{v:?}");
+            v[8].clone()
         };
         assert_eq!(installed(Some("fedora-44-workstation")), NO_GUEST_AGENT);
-        assert!(installed(Some("ubuntu-26.04")).starts_with("Unknown"));
-        assert!(installed(None).starts_with("Unknown"));
-        let stopped = values(facts(&desk(Some("fedora-44-workstation")), None));
-        assert_eq!(stopped[7], "Unknown");
+        assert!(NO_GUEST_AGENT.starts_with("No guest agent answering"));
+        for other in [Some("ubuntu-26.04"), None] {
+            assert!(installed(other).starts_with("Not answering"), "{other:?}");
+        }
+        let unknown = values(facts(&desk(Some("fedora-44-workstation")), None));
+        assert_eq!(unknown[8], "Unknown");
         // The daemon cut the network of an internet VM.
         let cut = VmInfo {
             net: NetProfile::Internet,
@@ -4279,7 +4302,7 @@ mod tests {
             Action::Eject
                 .done("desk", &serde_json::Value::Null)
                 .unwrap(),
-            "Installer ejected from desk. This takes effect at the next start."
+            "Installer ejected from desk. This takes effect the next time Stallo starts the VM (a restart inside the VM is not enough)."
         );
         let f = Action::Eject.failed("desk", &CallError::Failed("busy".into()));
         assert!(f.title.starts_with("Could not eject the installer of desk"));
@@ -4291,7 +4314,8 @@ mod tests {
         };
         let note = installer_note(&attached(Some("fedora-44-workstation"))).unwrap();
         assert!(
-            note.starts_with("Fedora 44 Workstation") && note.ends_with("at the next start."),
+            note.starts_with("Fedora 44 Workstation")
+                && note.ends_with("(a restart inside the VM is not enough)."),
             "{note}"
         );
         assert_eq!(installer_note(&attached(None)), None);
