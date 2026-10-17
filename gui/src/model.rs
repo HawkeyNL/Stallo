@@ -1408,7 +1408,7 @@ impl Limits {
 pub fn internet_block(image: &ImageChoice, production: bool) -> Option<&'static str> {
     // As the daemon's `check_net`.
     if image.windows || stallo::images::is_local(&image.id) {
-        Some("Offline for now: VMs from Windows or your own ISO have no internet yet.")
+        Some("No internet yet for VMs from Windows or your own ISO.")
     } else if !production {
         Some("Not available: the dev-mode daemon keeps VMs offline.")
     } else if !image.internet {
@@ -1472,14 +1472,67 @@ pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64, internet: bo
     format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk · {net}")
 }
 
-/// The system an ISO probably installs, from its file name: a guess the
-/// user confirms before the import.
-pub fn guess_os(file_name: &str) -> Os {
-    if file_name.to_ascii_lowercase().contains("win") {
-        Os::Windows
-    } else {
-        Os::Linux
+/// Parts of the file names and volume labels of Windows ISOs: Microsoft
+/// names them by build (`…CLIENTCONSUMER_RET_x64FRE_en-us.iso`) and labels
+/// them `CCCOMA_X64FRE_EN-US_DV9`, `CENA_X64FREE_EN-US_DV9` and the like.
+const WINDOWS_MARKS: &[&str] = &[
+    "win",
+    "x64fre",
+    "x86fre",
+    "arm64fre",
+    "a64fre",
+    "cccoma",
+    "cena_",
+    "cpba_",
+    "ccsa_",
+    "clientconsumer",
+    "clientbusiness",
+];
+/// Parts of the names and labels of Linux ISOs.
+const LINUX_MARKS: &[&str] = &[
+    "linux",
+    "ubuntu",
+    "fedora",
+    "debian",
+    "mint",
+    "arch",
+    "opensuse",
+    "suse",
+    "manjaro",
+    "pop-os",
+    "pop_os",
+    "elementary",
+    "zorin",
+    "centos",
+    "rocky",
+    "alma",
+    "kali",
+    "nixos",
+    "gentoo",
+    "endeavouros",
+    "rhel",
+];
+
+/// The system an ISO installs, guessed from its file name and its ISO 9660
+/// volume label; `None` when unsure, and the user is asked. Only a label:
+/// nothing about the file is trusted.
+pub fn guess_os(file_name: &str, label: &str) -> Option<Os> {
+    let text = format!("{file_name} {label}").to_ascii_lowercase();
+    let has = |marks: &[&str]| marks.iter().any(|m| text.contains(m));
+    match (has(WINDOWS_MARKS), has(LINUX_MARKS)) {
+        (true, false) => Some(Os::Windows),
+        (false, true) => Some(Os::Linux),
+        _ => None,
     }
+}
+
+/// What the import row says while it runs.
+pub fn importing(label: &str, os: Os) -> String {
+    let os = match os {
+        Os::Linux => "Linux",
+        Os::Windows => "Windows",
+    };
+    format!("Importing {label} as {os}…")
 }
 
 /// An import's progress: done as a share, 0 to 1, and in words.
@@ -1496,6 +1549,9 @@ pub fn import_progress(done: u64, total: u64) -> (f64, String) {
     );
     (share, text)
 }
+
+/// An import failed for a reason with no next step to give.
+pub const IMPORT_FAILED: &str = "Could not import the ISO. Try again.";
 
 /// An ISO with the same id is there already.
 pub const IMPORTED_ALREADY: &str =
@@ -1524,6 +1580,8 @@ pub fn import_error(e: &CallError) -> String {
         "Another image is being downloaded or imported. Try again when it ends.".to_owned()
     } else if m.contains("not a regular file") {
         "Only regular files can be imported. Choose an ISO file.".to_owned()
+    } else if m.starts_with("cannot open ") {
+        "Stallo cannot read this file. Check that you can open it, then try again.".to_owned()
     } else if m.contains("larger than") {
         format!(
             "This file is larger than {} GiB, the most Stallo imports.",
@@ -4039,7 +4097,7 @@ mod tests {
         for row in &rows[1..] {
             assert_eq!(
                 internet_block(row, true),
-                Some("Offline for now: VMs from Windows or your own ISO have no internet yet.")
+                Some("No internet yet for VMs from Windows or your own ISO.")
             );
         }
         assert_eq!(internet_block(&rows[0], true), None);
@@ -4055,16 +4113,48 @@ mod tests {
 
     #[test]
     fn import_wording() {
-        for (file, os) in [
-            ("Win11_25H2_English_x64.iso", Os::Windows),
-            ("windows-server.iso", Os::Windows),
-            ("en-us_WINDOWS_10.iso", Os::Windows),
-            ("ubuntu-26.04-desktop-amd64.iso", Os::Linux),
-            ("Fedora-Workstation.iso", Os::Linux),
-            ("", Os::Linux),
+        let windows = Some(Os::Windows);
+        let linux = Some(Os::Linux);
+        for (file, label, os) in [
+            ("Win11_25H2_English_x64.iso", "", windows),
+            (
+                "26100.1742.240906-0331.ge_release_svc_refresh_CLIENTCONSUMER_RET_x64FRE_en-us.iso",
+                "CCCOMA_X64FRE_EN-US_DV9",
+                windows,
+            ),
+            ("download.iso", "CENA_X64FREE_EN-US_DV9", windows),
+            ("setup.iso", "CPBA_A64FRE_NL-NL_DV9", windows),
+            ("en-us_WINDOWS_10.iso", "", windows),
+            (
+                "ubuntu-26.04-desktop-amd64.iso",
+                "Ubuntu 26.04 LTS amd64",
+                linux,
+            ),
+            ("Fedora-Workstation-Live-44.iso", "Fedora-WS-Live-44", linux),
+            (
+                "debian-13.1.0-amd64-netinst.iso",
+                "Debian 13.1.0 amd64 n",
+                linux,
+            ),
+            ("linuxmint-22-cinnamon.iso", "Linux Mint 22 Cinnamon", linux),
+            ("archlinux-2026.10.01-x86_64.iso", "ARCH_202610", linux),
+            ("openSUSE-Tumbleweed-DVD.iso", "", linux),
+            // Unsure: the user is asked.
+            ("download.iso", "", None),
+            ("install.iso", "CDROM", None),
+            ("", "", None),
+            ("linux-and-windows.iso", "", None),
         ] {
-            assert_eq!(guess_os(file), os, "{file}");
+            assert_eq!(guess_os(file, label), os, "{file} {label}");
         }
+        assert_eq!(
+            importing("Win11.iso", Os::Windows),
+            "Importing Win11.iso as Windows…"
+        );
+        assert_eq!(
+            importing("mint.iso", Os::Linux),
+            "Importing mint.iso as Linux…"
+        );
 
         assert_eq!(
             import_progress(0, 6 << 30),
@@ -4110,8 +4200,12 @@ mod tests {
             "This file is larger than 12 GiB, the most Stallo imports."
         );
         assert_eq!(
-            failed("cannot open /x.iso: Permission denied\u{1b}[2J"),
-            "Could not import the ISO: cannot open /x.iso: Permission denied[2J"
+            failed("cannot open /x.iso: Permission denied (os error 13)"),
+            "Stallo cannot read this file. Check that you can open it, then try again."
+        );
+        assert_eq!(
+            failed("stallod said no\u{1b}[2J"),
+            "Could not import the ISO: stallod said no[2J"
         );
         assert_eq!(
             import_error(&CallError::NotRunning),

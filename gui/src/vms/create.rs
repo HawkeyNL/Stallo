@@ -19,7 +19,7 @@ use tokio::sync::watch;
 
 use super::{Vms, name_spinner};
 use crate::client;
-use crate::model::{self, Action, CallError, ImageChoice, NewVm, Op};
+use crate::model::{self, Action, ImageChoice, NewVm, Op};
 
 const LIVE_SCREEN_NOTE: &str =
     "See and use the VM's screen here. Anyone in the stallo group can too.";
@@ -178,13 +178,17 @@ fn ask(vms: &Rc<Vms>) {
     });
 }
 
-/// Ends an ISO import when dropped: the stream closes, and the daemon
-/// drops what it got.
-struct Importing(tokio::task::AbortHandle);
+/// The import that runs. Ends it when dropped: the stream closes, and the
+/// daemon drops what it got.
+struct Importing {
+    /// Tells this import's handlers from an earlier one's.
+    generation: u64,
+    task: tokio::task::AbortHandle,
+}
 
 impl Drop for Importing {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -204,9 +208,11 @@ struct Form {
     /// An import's progress, or why it failed.
     import_row: adw::ActionRow,
     import_bar: gtk::ProgressBar,
-    import_cancel: gtk::Button,
+    import_stop: gtk::Button,
     /// The import that runs, if any: one at a time.
     importing: RefCell<Option<Importing>>,
+    /// Imports started so far.
+    generations: Cell<u64>,
     name: adw::EntryRow,
     /// Shown only while the name is refused.
     hint: gtk::Label,
@@ -301,8 +307,8 @@ impl Form {
             .width_request(96)
             .build();
         import_bar.update_property(&[gtk::accessible::Property::Label("Import progress")]);
-        let import_cancel = gtk::Button::builder()
-            .label("Cancel")
+        let import_stop = gtk::Button::builder()
+            .label("Stop Import")
             .valign(gtk::Align::Center)
             .build();
         let import_row = adw::ActionRow::builder()
@@ -310,7 +316,7 @@ impl Form {
             .visible(false)
             .build();
         import_row.add_suffix(&import_bar);
-        import_row.add_suffix(&import_cancel);
+        import_row.add_suffix(&import_stop);
         installer_group.add(&own_iso);
         installer_group.add(&import_row);
 
@@ -391,8 +397,9 @@ impl Form {
             own_iso,
             import_row,
             import_bar,
-            import_cancel,
+            import_stop,
             importing: RefCell::new(None),
+            generations: Cell::new(0),
             name,
             hint,
             advanced_group,
@@ -426,7 +433,7 @@ impl Form {
             }
         });
         let f = Rc::downgrade(&form);
-        form.import_cancel.connect_clicked(move |_| {
+        form.import_stop.connect_clicked(move |_| {
             if let Some(f) = f.upgrade() {
                 f.cancel_import();
             }
@@ -465,6 +472,13 @@ impl Form {
         });
         // The image list comes first: that is the one choice to make.
         dialog.set_focus(Some(&form.checks.borrow()[selected]));
+        // While an import runs, closing asks first (`can_close` is off).
+        let f = Rc::downgrade(&form);
+        dialog.connect_close_attempt(move |_| {
+            if let Some(f) = f.upgrade() {
+                f.ask_stop();
+            }
+        });
         // Closing the dialog drops the form, and so ends an import.
         let keep = Cell::new(Some(form));
         dialog.connect_closed(move |_| drop(keep.take()));
@@ -586,6 +600,9 @@ impl Form {
         // Creating would close the dialog, and so end the import.
         let importing = self.importing.borrow().is_some();
         self.own_iso.set_sensitive(!importing);
+        if let Some(d) = self.dialog.upgrade() {
+            d.set_can_close(!importing);
+        }
         self.create
             .set_sensitive(name.is_ok() && full.is_none() && !importing);
     }
@@ -662,8 +679,8 @@ impl Form {
         });
     }
 
-    /// Asks which system the ISO installs, guessed from its name, then
-    /// imports it.
+    /// Imports the ISO as the system it installs: guessed from its name
+    /// and volume label, or asked when unsure.
     fn ask_os(self: &Rc<Self>, file: &gio::File) {
         let Some(path) = file.path() else {
             return self.import_failed("", "Only files on this computer can be imported.");
@@ -677,15 +694,29 @@ impl Form {
         if self.images.borrow().iter().any(|i| i.id == id) {
             return self.import_failed(&label, model::IMPORTED_ALREADY);
         }
+        let f = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let p = path.clone();
+            let volume = client::spawn(client::iso_label(p))
+                .await
+                .unwrap_or_default();
+            let Some(f) = f.upgrade() else {
+                return;
+            };
+            match model::guess_os(&file_name, &volume) {
+                Some(os) => f.import(path, label, id, os),
+                None => f.ask_unsure(path, label, id),
+            }
+        });
+    }
+
+    /// Asks Linux or Windows, then imports.
+    fn ask_unsure(self: &Rc<Self>, path: PathBuf, label: String, id: String) {
         let systems = gtk::StringList::new(&["Linux", "Windows"]);
         let os = adw::ComboRow::builder()
             .title("Operating System")
             .use_markup(false)
             .model(&systems)
-            .selected(match model::guess_os(&file_name) {
-                Os::Linux => 0,
-                Os::Windows => 1,
-            })
             .build();
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -695,7 +726,7 @@ impl Form {
         let alert = adw::AlertDialog::builder()
             .heading(format!("Import {label}"))
             .heading_use_markup(false)
-            .body("Stallo keeps its own copy of the file.")
+            .body("Which system does it install?")
             .body_use_markup(false)
             .extra_child(&list)
             .build();
@@ -718,8 +749,16 @@ impl Form {
         alert.present(Some(&self.own_iso));
     }
 
+    /// Whether `generation` is the import that runs now.
+    fn current(&self, generation: u64) -> bool {
+        self.importing
+            .borrow()
+            .as_ref()
+            .is_some_and(|i| i.generation == generation)
+    }
+
     /// Streams the ISO to the daemon on the I/O thread, with progress and
-    /// Cancel in the import row. When done, the new image is selected.
+    /// Stop Import in the import row. When done, the new image is selected.
     fn import(self: &Rc<Self>, path: PathBuf, label: String, id: String, os: Os) {
         if self.importing.borrow().is_some() {
             return;
@@ -732,12 +771,17 @@ impl Form {
             os,
             sent,
         ));
-        self.importing.replace(Some(Importing(task.abort_handle())));
-        self.import_row.set_title(&format!("Importing {label}…"));
+        let generation = self.generations.get() + 1;
+        self.generations.set(generation);
+        self.importing.replace(Some(Importing {
+            generation,
+            task: task.abort_handle(),
+        }));
+        self.import_row.set_title(&model::importing(&label, os));
         self.import_row.set_subtitle("Starting…");
         self.import_bar.set_fraction(0.0);
         self.import_bar.set_visible(true);
-        self.import_cancel.set_visible(true);
+        self.import_stop.set_visible(true);
         self.import_row.set_visible(true);
         self.update();
 
@@ -746,7 +790,7 @@ impl Form {
             // Ends when the import does: its sender is gone.
             while progress.changed().await.is_ok() {
                 let (done, total) = *progress.borrow_and_update();
-                let Some(f) = f.upgrade().filter(|f| f.importing.borrow().is_some()) else {
+                let Some(f) = f.upgrade().filter(|f| f.current(generation)) else {
                     return;
                 };
                 let (share, text) = model::import_progress(done, total);
@@ -757,35 +801,39 @@ impl Form {
         let f = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let got = task.await;
-            // Closed meanwhile, or cancelled: nothing to show.
+            // Closed meanwhile: nothing to show.
             let Some(f) = f.upgrade() else {
                 return;
             };
-            if f.importing.take().is_none() {
-                return;
+            let current = f.current(generation);
+            if current {
+                drop(f.importing.take());
             }
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let info = |data: serde_json::Value| ImageInfo {
+                id: id.clone(),
+                name: stallo::images::clean_name(&stem),
+                cached: true,
+                kind: Some(stallo::images::Kind::Iso),
+                os: Some(os),
+                trust: None,
+                size_bytes: data["size"].as_u64(),
+                sig_date: None,
+                notes: vec![],
+            };
             match got {
                 Ok(Ok(data)) => {
-                    f.import_row.set_visible(false);
-                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                    let info = ImageInfo {
-                        id,
-                        name: stallo::images::clean_name(&stem),
-                        cached: true,
-                        kind: Some(stallo::images::Kind::Iso),
-                        os: Some(os),
-                        trust: None,
-                        size_bytes: data["size"].as_u64(),
-                        sig_date: None,
-                        notes: vec![],
-                    };
-                    f.add_image(model::image_choices(&[info]).remove(0));
+                    if current {
+                        f.import_row.set_visible(false);
+                    }
+                    // Stopped too late: the daemon has it all the same, so
+                    // it is listed, but not chosen.
+                    f.add_image(model::image_choices(&[info(data)]).remove(0), current);
                 }
+                // Stopped (or a newer import runs): its row says so.
+                _ if !current => {}
                 Ok(Err(e)) => f.import_failed(&label, &model::import_error(&e)),
-                Err(e) => f.import_failed(
-                    &label,
-                    &model::import_error(&CallError::Failed(e.to_string())),
-                ),
+                Err(_) => f.import_failed(&label, model::IMPORT_FAILED),
             }
             f.update();
         });
@@ -797,6 +845,33 @@ impl Form {
         self.update();
     }
 
+    /// Closing while an import runs: stop it, or keep the dialog.
+    fn ask_stop(self: &Rc<Self>) {
+        if self.importing.borrow().is_none() {
+            return;
+        }
+        let alert = adw::AlertDialog::builder()
+            .heading("Stop Importing?")
+            .body("The ISO is not imported yet. Stopping drops what was copied so far.")
+            .body_use_markup(false)
+            .build();
+        alert.add_response("keep", "Keep Importing");
+        alert.add_response("stop", "Stop");
+        alert.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+        alert.set_default_response(Some("keep"));
+        alert.set_close_response("keep");
+        let f = Rc::downgrade(self);
+        alert.connect_response(Some("stop"), move |_, _| {
+            if let Some(f) = f.upgrade() {
+                f.cancel_import();
+                if let Some(d) = f.dialog.upgrade() {
+                    d.close();
+                }
+            }
+        });
+        alert.present(Some(&self.own_iso));
+    }
+
     /// Shows why the import of `label` failed, in the import row.
     fn import_failed(&self, label: &str, why: &str) {
         self.import_row.set_title(&if label.is_empty() {
@@ -806,12 +881,16 @@ impl Form {
         });
         self.import_row.set_subtitle(why);
         self.import_bar.set_visible(false);
-        self.import_cancel.set_visible(false);
+        self.import_stop.set_visible(false);
         self.import_row.set_visible(true);
     }
 
-    /// Lists an imported image with the installers and selects it.
-    fn add_image(self: &Rc<Self>, image: ImageChoice) {
+    /// Lists an imported image with the installers, unless it is there,
+    /// and selects it if `select`.
+    fn add_image(self: &Rc<Self>, image: ImageChoice, select: bool) {
+        if self.images.borrow().iter().any(|i| i.id == image.id) {
+            return;
+        }
         let (row, check) = image_row(&image, self.checks.borrow().first(), false);
         // After the other installers, before "Use My Own ISO…".
         self.installer_group.remove(&self.own_iso);
@@ -822,8 +901,10 @@ impl Form {
         self.images.borrow_mut().push(image);
         self.checks.borrow_mut().push(check.clone());
         self.connect_check(&check);
-        check.set_active(true);
-        check.grab_focus();
+        if select {
+            check.set_active(true);
+            check.grab_focus();
+        }
     }
 }
 

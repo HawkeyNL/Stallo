@@ -240,6 +240,33 @@ pub async fn import(
         .map_err(call_error)
 }
 
+/// The ISO 9660 volume label of the file at `path` (32 bytes at 0x8028),
+/// trimmed; empty if it has none or cannot be read. A hint for the OS
+/// guess only. Read on the blocking pool.
+pub async fn iso_label(path: PathBuf) -> String {
+    blocking(move || {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let mut label = [0u8; 32];
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(&path)
+            .and_then(|f| {
+                f.metadata()?
+                    .is_file()
+                    .then_some(f)
+                    .ok_or(io::ErrorKind::InvalidInput.into())
+            })
+            .and_then(|f| f.read_exact_at(&mut label, 0x8028));
+        Ok(file.map_or_else(
+            |_| String::new(),
+            |()| String::from_utf8_lossy(&label).trim().to_owned(),
+        ))
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// Counts the bytes read through it into `sent`: every 16 MiB and at the
 /// end, which is all a progress bar needs.
 struct Counted<R> {
@@ -621,6 +648,22 @@ mod tests {
             "the body is the file"
         );
         assert_eq!(*progress.borrow(), (len as u64, len as u64));
+    }
+
+    #[test]
+    fn iso_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.iso");
+        let mut head = vec![0u8; 0x8028];
+        head.extend_from_slice(b"CENA_X64FREE_EN-US_DV9           ");
+        std::fs::write(&path, &head).unwrap();
+        let label = |p: PathBuf| run(async move { iso_label(p).await });
+        assert_eq!(label(path.clone()), "CENA_X64FREE_EN-US_DV9");
+        // Too short, a directory, missing: no label.
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(label(path), "");
+        assert_eq!(label(dir.path().to_owned()), "");
+        assert_eq!(label(dir.path().join("missing.iso")), "");
     }
 
     #[test]
