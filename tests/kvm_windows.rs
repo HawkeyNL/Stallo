@@ -2,15 +2,28 @@
 //! through RAM and disk-only snapshots, stops when swtpm dies, and leaves
 //! nothing behind. No Windows ISO needed: a dummy ISO (not bootable) is
 //! imported as a Windows image, and the firmware alone runs.
+//!
+//! W4 gate, part B, only with `STALLO_WIN_ISO=/path/to/Win11.iso`: the
+//! daemon's Enter presses get the real installer past its CD prompt and
+//! Windows Setup shows its first screen. No install.
+//!
+//! The RFB client lives in the GUI crate; it is compiled in here as a
+//! module, as in `kvm_screen.rs`.
 
 mod common;
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::time::Duration;
+#[allow(dead_code)]
+#[path = "../gui/src/rfb.rs"]
+mod rfb;
 
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use base64::Engine;
 use common::Daemon;
+use stallo::api::{Request, ScreenResult, Via, VmDetails};
 use stallo::config::VmConfig;
 use stallo::tpm;
 
@@ -151,6 +164,225 @@ fn windows_vm_runs_with_swtpm() {
     // `rm` takes the TPM state and its snapshot copies with the VM.
     d.ok(&["rm", "win", "--yes"]);
     assert!(!tpm_dir.exists() && !vm_dir.exists());
+}
+
+#[test]
+#[ignore = "boots the Windows installer to its first Setup screen; run with STALLO_IT=1 and STALLO_WIN_ISO"]
+fn windows_setup_starts() {
+    if !common::enabled() {
+        return;
+    }
+    let Some(iso) = std::env::var_os("STALLO_WIN_ISO") else {
+        eprintln!("skipped: set STALLO_WIN_ISO=/path/to/Win11.iso");
+        return;
+    };
+    let iso = iso
+        .to_str()
+        .expect("STALLO_WIN_ISO is not UTF-8")
+        .to_owned();
+    if !Path::new(tpm::SWTPM).exists() {
+        eprintln!("skipped: {} is missing", tpm::SWTPM);
+        return;
+    }
+    let need = MEMORY_MIB + 512 + tpm::MEMORY_MIB + common::HEADROOM_MIB;
+    let available = Daemon::host_available_mib();
+    assert!(
+        available >= need,
+        "{available} MiB available, {need} MiB needed"
+    );
+    let d = Daemon::start_without_image("windows-setup", "", MEMORY_MIB);
+    let copy = d.data.join("images/local-win11.iso");
+
+    let t = Instant::now();
+    d.ok(&["images", "import", &iso, "--os", "windows", "--id", "win11"]);
+    eprintln!("MEASURE import: {:.1} s", t.elapsed().as_secs_f64());
+    assert_eq!(
+        fs::metadata(&copy).unwrap().len(),
+        fs::metadata(&iso).unwrap().len()
+    );
+
+    let started = Instant::now();
+    d.ok(&[
+        "new",
+        "win",
+        "--image",
+        "local-win11",
+        "--cpus",
+        "2",
+        "--mem",
+        "4G",
+        "--disk",
+        "64G",
+        "--net",
+        "offline",
+    ]);
+    d.assert_safe("win");
+
+    // Setup's first screen: most of the screen lit and blue-dominant
+    // (unlike the black CD prompt, boot logo and firmware menu), then
+    // stable for 5 s.
+    // ponytail: colour heuristic; OCR or a UI tree if it ever misfires.
+    let info: VmDetails = serde_json::from_value(
+        d.api(Via::Cli, Request::Info { name: "win".into() })
+            .unwrap(),
+    )
+    .unwrap();
+    let socket = info.vnc_socket.expect("no VNC socket while running");
+    let mut seen = Look::default();
+    let setup = common::wait_for(Duration::from_secs(240), || {
+        seen = look(&socket);
+        seen.setup() || {
+            std::thread::sleep(Duration::from_secs(2));
+            false
+        }
+    });
+    let to_setup = started.elapsed();
+    let shot = settled(&d);
+    let saved = d.base.parent().unwrap().join("windows-setup.png");
+    fs::write(&saved, &shot.0).unwrap();
+    eprintln!("MEASURE screen: {seen:?}; saved {}", saved.display());
+    setup.expect("Windows Setup did not show in 240 s");
+    assert!(shot.1, "the Setup screen did not settle");
+    eprintln!(
+        "MEASURE start -> Setup: {:.1} s, settled after {:.1} s",
+        to_setup.as_secs_f64(),
+        started.elapsed().as_secs_f64()
+    );
+    let seen = look(&socket);
+    assert!(seen.setup(), "Setup went away: {seen:?}");
+    if std::env::var_os("STALLO_WIN_SETUP_DEEP").is_some_and(|v| v == "1") {
+        click_through_setup(&d, &socket);
+    }
+
+    // Setup only read the ISO: the sparse disk holds next to nothing.
+    let used: u64 = fs::read_dir(d.vm_dir("win"))
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().blocks() * 512)
+        .sum();
+    eprintln!("MEASURE VM directory: {} MiB", used >> 20);
+    assert!(used < 1 << 30, "{used} bytes");
+
+    d.assert_safe("win");
+    d.ok(&["stop", "win", "--force"]);
+    d.ok(&["rm", "win", "--yes"]);
+    d.ok(&["images", "rm", "local-win11", "--yes"]);
+    assert!(!copy.exists());
+}
+
+/// What a frame looks like: its size, the share of lit pixels and the mean
+/// of each colour.
+#[derive(Debug, Default)]
+struct Look {
+    size: (u16, u16),
+    lit_pct: usize,
+    mean_rgb: [u64; 3],
+}
+
+impl Look {
+    fn setup(&self) -> bool {
+        let [r, g, b] = self.mean_rgb;
+        self.size.0 >= 1024 && self.lit_pct > 60 && b > r && b >= g
+    }
+}
+
+/// The current frame over VNC.
+fn frame(socket: &Path) -> rfb::Frame {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (_session, mut frames) = rfb::Session::connect(socket).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), frames.changed())
+                .await
+                .expect("no frame in 10 s")
+                .expect("the session ended");
+            frames.borrow_and_update().clone()
+        })
+}
+
+fn look(socket: &Path) -> Look {
+    let frame = frame(socket);
+    // B G R x.
+    let px = frame.pixels.chunks_exact(4);
+    let n = px.len().max(1);
+    let lit = px
+        .clone()
+        .filter(|p| p[..3].iter().any(|&c| c > 48))
+        .count();
+    let mut sum = [0u64; 3];
+    for p in px {
+        for (s, c) in sum.iter_mut().zip([p[2], p[1], p[0]]) {
+            *s += u64::from(c);
+        }
+    }
+    Look {
+        size: (frame.width, frame.height),
+        lit_pct: lit * 100 / n,
+        mean_rgb: sum.map(|s| s / n as u64),
+    }
+}
+
+/// More than 1% of the pixels differ (a new page, not a caret blink).
+fn differs(a: &rfb::Frame, b: &rfb::Frame) -> bool {
+    let (a, b) = (a.pixels.chunks_exact(4), b.pixels.chunks_exact(4));
+    let n = a.len();
+    n != b.len() || a.zip(b).filter(|(p, q)| p[..3] != q[..3]).count() * 100 > n
+}
+
+/// `STALLO_WIN_SETUP_DEEP=1`: Enter is Next on the language and keyboard
+/// screens. Stops at the setup option screen, before anything that asks for
+/// a key, a licence or the disk.
+fn click_through_setup(d: &Daemon, socket: &Path) {
+    let mut last = frame(socket);
+    for page in ["keyboard", "option"] {
+        d.api(
+            Via::Cli,
+            Request::Key {
+                name: "win".into(),
+                keys: "enter".into(),
+            },
+        )
+        .unwrap();
+        let mut next = None;
+        let turned = common::wait_for(Duration::from_secs(60), || {
+            let (png, stable) = settled(d);
+            let now = frame(socket);
+            let done = stable && differs(&last, &now);
+            next = Some((png, now));
+            done
+        });
+        let (png, now) = next.unwrap();
+        let saved = d
+            .base
+            .parent()
+            .unwrap()
+            .join(format!("windows-setup-{page}.png"));
+        fs::write(&saved, &png).unwrap();
+        eprintln!("MEASURE {page} screen saved {}", saved.display());
+        turned.unwrap_or_else(|_| panic!("Enter did not lead to the {page} screen"));
+        last = now;
+    }
+}
+
+/// `wait_for_screen` for 5 s of stillness: (PNG, whether it settled).
+fn settled(d: &Daemon) -> (Vec<u8>, bool) {
+    let shot: ScreenResult = serde_json::from_value(
+        d.api(
+            Via::Cli,
+            Request::WaitForScreen {
+                name: "win".into(),
+                stable_ms: Some(5000),
+                timeout_ms: Some(60_000),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(shot.png_base64)
+        .unwrap();
+    (png, shot.stable == Some(true))
 }
 
 fn cmdline(pid: u32) -> Vec<String> {

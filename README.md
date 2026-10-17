@@ -357,6 +357,43 @@ every `internet` VM and is enforced on the host only; the checks to run
 inside Windows are in
 [docs/network-verification.md](docs/network-verification.md#windows-guests).
 
+### Install Windows 11
+
+Stallo ships no Windows: download the Windows 11 ISO from Microsoft's
+website and use your own licence.
+
+1. Import it with `stallo images import … --os windows` (above), or
+   **Use My Own ISO…** in the desktop app's new-VM dialog.
+2. Create the VM. Windows VMs get Secure Boot, a TPM 2.0 (swtpm) and at
+   least 2 vCPUs, 4 GiB and a 64 GiB disk. On a production install, add
+   `--net internet`; offline also works:
+
+   ```sh
+   stallo new win --image local-win11-25h2-english-x64 --net internet
+   ```
+
+3. Open the screen. You need not catch "Press any key to boot from CD or
+   DVD": while the ISO is in the drive, the daemon presses Enter for you
+   in the first seconds after each start.
+4. In Setup, choose the keyboard layout **US** (not US-International):
+   the agents' `type_text` assumes it. Install on the unallocated space.
+5. Setup asks for a Microsoft account. For a local account, press
+   Shift+F10 for a command prompt and run `start ms-cxh:localonly`. If
+   that does nothing, run `OOBE\BYPASSNRO`; the VM restarts, and Setup
+   then offers "I don't have internet". Microsoft keeps removing these
+   bypasses, so a newer build may not have them.
+6. Eject the ISO when the install is done (`stallo set win --cdrom eject`),
+   then stop and start the VM.
+
+Take snapshots while the VM runs (`stallo snap win before-update`): a RAM
+snapshot keeps the running Windows and its TPM state together.
+
+Costs: the imported ISO copy (5 to 8 GB) until `stallo images rm`, a
+sparse 64 GiB disk that grows as Windows installs and updates, 4 GiB of
+RAM while it runs, and up to 4 GiB for each RAM snapshot. File copies
+(`stallo cp`), commands (`stallo exec`) and a guest agent are not
+available for Windows yet; the screen, keyboard and mouse are.
+
 ## Agents (MCP)
 
 `stallo mcp` is an MCP server on stdin/stdout. Register it with Claude Code

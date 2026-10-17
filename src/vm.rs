@@ -82,6 +82,17 @@ const DRAG_STEPS: u32 = 10;
 const INPUT_BUSY_WAIT: Duration = Duration::from_secs(30);
 /// Most wheel clicks in one scroll.
 const MAX_SCROLL: u32 = 50;
+/// Windows' CD loader shows "Press any key to boot from CD or DVD" for
+/// about 5 s, too short for a human to reach the screen. The daemon presses
+/// Enter for them: [`BOOT_KEYS`] times, one every [`BOOT_KEY_EVERY`], the
+/// first [`BOOT_KEYS_FROM`] after the start: 2 s to 9 s. Measured on the
+/// Win11 24H2 ISO here: the prompt shows at about 2 s, Setup at 14 s;
+/// stopping at 9 s keeps a late press off Setup's first page.
+/// ponytail: fixed timing; a host too slow to show the prompt in 9 s needs
+/// a stop and start to retry.
+const BOOT_KEYS_FROM: Duration = Duration::from_secs(2);
+const BOOT_KEY_EVERY: Duration = Duration::from_secs(1);
+const BOOT_KEYS: u32 = 8;
 
 /// A pointer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -628,7 +639,7 @@ impl Manager {
                 );
             }
         }
-        match self.spawn(&cfg, &argv, link, tpm_link).await {
+        let started = match self.spawn(&cfg, &argv, link, tpm_link).await {
             Ok(running) if hold && !paused => match running.qmp.execute("cont", None).await {
                 Ok(_) => Ok(running),
                 Err(e) => {
@@ -645,7 +656,18 @@ impl Manager {
                 let _ = safe_remove(&self.paths.runtime, &vnc_dir);
                 Err(e)
             }
+        };
+        // Not after a paused start: that restores a snapshot, past the boot.
+        if let Ok(vm) = &started
+            && !paused
+            && presses_boot_keys(&cfg, &iso)
+        {
+            tokio::spawn(
+                vm.clone()
+                    .boot_keys(BOOT_KEYS_FROM, BOOT_KEY_EVERY, BOOT_KEYS),
+            );
         }
+        started
     }
 
     /// For a VM made from an installer ISO, its CD-ROM drive: the attached
@@ -1483,6 +1505,28 @@ impl Running {
         Ok(guard)
     }
 
+    /// Presses Enter `presses` times, `every` apart, the first after
+    /// `first`, for Windows' CD boot prompt. Ends early when the VM exits.
+    /// A press that fails (paused VM, busy input) is skipped.
+    async fn boot_keys(self: Arc<Self>, first: Duration, every: Duration, presses: u32) {
+        let name = &self.config.name;
+        tracing::info!("{name}: pressing Enter {presses} times for the CD boot prompt");
+        let mut wait = first;
+        for _ in 0..presses {
+            if self.wait_exited(wait).await {
+                return;
+            }
+            wait = every;
+            let pressed = async {
+                let _input = self.input().await?;
+                self.send_key(&["ret"], CHORD_HOLD).await
+            };
+            if let Err(e) = pressed.await {
+                tracing::debug!("{name}: boot key skipped: {e:#}");
+            }
+        }
+    }
+
     async fn mouse_move(&self, x: u32, y: u32) -> Result<()> {
         let _input = self.input().await?;
         self.send_events(self.move_events(x, y)?).await
@@ -1959,6 +2003,12 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
     ("systemd-run".to_owned(), args)
 }
 
+/// Whether a start presses Enter for the CD boot prompt: Windows VMs with
+/// an ISO in the drive (`iso` as from [`Manager::cdrom`]) only.
+fn presses_boot_keys(cfg: &VmConfig, iso: &Option<Option<PathBuf>>) -> bool {
+    !cfg.machine.is_linux() && matches!(iso, Some(Some(_)))
+}
+
 /// QEMU's `query-tpm` reply for a Windows VM: exactly one TPM, the CRB
 /// device on swtpm (`qemu::argv`). QEMU's reply is not echoed.
 fn check_tpm(reply: &Value) -> Result<()> {
@@ -2262,6 +2312,40 @@ mod tests {
         log.lock().unwrap().clear();
         assert!(vm.drag((0, 0), (0, 800)).await.is_err());
         assert!(summary(&log).is_empty(), "nothing pressed for a bad drag");
+    }
+
+    /// Enter for the CD prompt: only Windows with an ISO in the drive;
+    /// every press is sent and released, failures skip a press, and an
+    /// exited VM gets none.
+    #[tokio::test]
+    async fn boot_keys() {
+        let (_d, mut vm, log) = fake_vm("running", Some(2)).await;
+        let iso = Some(Some(PathBuf::from("/x.iso")));
+        let win = VmConfig {
+            machine: images::Os::Windows,
+            ..vm.config.clone()
+        };
+        assert!(presses_boot_keys(&win, &iso));
+        assert!(!presses_boot_keys(&win, &Some(None)));
+        assert!(!presses_boot_keys(&win, &None));
+        assert!(!presses_boot_keys(&vm.config, &iso));
+
+        let (tx, rx) = watch::channel(false);
+        vm.exited = rx;
+        let vm = Arc::new(vm);
+        let step = Duration::from_millis(1);
+        vm.clone().boot_keys(Duration::ZERO, step, 3).await;
+        assert_eq!(summary(&log), ["key ret true", "key ret false"].repeat(3));
+        log.lock().unwrap().clear();
+        tx.send(true).unwrap();
+        vm.clone().boot_keys(Duration::ZERO, step, 3).await;
+        assert!(summary(&log).is_empty());
+
+        let (_d, mut vm, log) = fake_vm("paused", None).await;
+        let (_tx, rx) = watch::channel(false);
+        vm.exited = rx;
+        Arc::new(vm).boot_keys(Duration::ZERO, step, 2).await;
+        assert!(summary(&log).is_empty());
     }
 
     /// A fake guest agent that counts connections and answers sync and
