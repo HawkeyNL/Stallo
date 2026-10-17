@@ -179,20 +179,20 @@ async fn script(ui: &Rc<Ui>, out: &Path, full: PathBuf, empty: PathBuf) -> anyho
     let windows = windows().ok_or_else(|| anyhow::anyhow!("no Windows image"))?;
     ActionRowExt::activate(&windows);
     shot("create-windows").await?;
-    // Advanced open, scrolled to the network.
-    let internet = ui
+    // Advanced open, scrolled to the bottom.
+    let processors = ui
         .window
         .visible_dialog()
-        .and_then(|d| find_row(d.upcast_ref(), "Internet Access"))
-        .ok_or_else(|| anyhow::anyhow!("no Internet Access row"))?;
-    if let Some(advanced) = internet
+        .and_then(|d| find_row(d.upcast_ref(), "Processors"))
+        .ok_or_else(|| anyhow::anyhow!("no Processors row"))?;
+    if let Some(advanced) = processors
         .ancestor(adw::ExpanderRow::static_type())
         .and_downcast::<adw::ExpanderRow>()
     {
         advanced.set_expanded(true);
     }
-    // To the bottom, again as the expander's animation grows the page.
-    if let Some(scroll) = internet
+    // Again as the expander's animation grows the page.
+    if let Some(scroll) = processors
         .ancestor(gtk::ScrolledWindow::static_type())
         .and_downcast::<gtk::ScrolledWindow>()
     {

@@ -1410,7 +1410,7 @@ pub fn internet_block(image: &ImageChoice, production: bool) -> Option<&'static 
     // Linux or Windows) may use it; a cloud image only if verified.
     if !production {
         Some("Not available: the dev-mode daemon keeps VMs offline.")
-    } else if !image.internet && !image.installer && !image.windows {
+    } else if !image.internet && !image.installer {
         Some("Not available for this image yet.")
     } else {
         None
@@ -1471,10 +1471,9 @@ pub fn vm_name(typed: &str, taken: &[String]) -> Result<String, String> {
 }
 
 /// The collapsed Advanced row says what the VM gets.
-pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64, internet: bool) -> String {
+pub fn advanced_summary(vcpus: u32, memory_gib: u64, disk_gib: u64) -> String {
     let s = if vcpus == 1 { "" } else { "s" };
-    let net = if internet { "Internet" } else { "Offline" };
-    format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk · {net}")
+    format!("{vcpus} processor{s} · {memory_gib} GiB memory · {disk_gib} GiB disk")
 }
 
 /// Starts of words in the file names and volume labels of Windows ISOs:
@@ -4336,12 +4335,12 @@ mod tests {
             "web is still being created"
         );
         assert_eq!(
-            advanced_summary(2, 2, 20, false),
-            "2 processors · 2 GiB memory · 20 GiB disk · Offline"
+            advanced_summary(2, 2, 20),
+            "2 processors · 2 GiB memory · 20 GiB disk"
         );
         assert_eq!(
-            advanced_summary(1, 4, 40, true),
-            "1 processor · 4 GiB memory · 40 GiB disk · Internet"
+            advanced_summary(1, 4, 40),
+            "1 processor · 4 GiB memory · 40 GiB disk"
         );
         let mut vm = vm("running");
         assert_eq!(first_tab(&vm), "overview");
