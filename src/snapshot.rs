@@ -576,7 +576,7 @@ impl Manager {
     }
 
     /// The VM's snapshots with their RAM sizes (lifecycle lock held).
-    async fn list_snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
+    pub(crate) async fn list_snapshots(&self, name: &str) -> Result<Vec<Snapshot>> {
         let vm_dir = self.paths.vm_dir(name);
         let list = match self.running(name) {
             Some(vm) => list_live(&vm.qmp).await?.0,
@@ -726,7 +726,7 @@ impl Manager {
 /// RAM image is gone: restoring only the disk would revert to a
 /// crash-consistent state without saying so. Disk-only snapshots of stopped
 /// VMs have a guest clock of 0.
-fn ram_missing(snap: &Snapshot) -> bool {
+pub fn ram_missing(snap: &Snapshot) -> bool {
     snap.vm_clock_ms > 0 && snap.ram_bytes == 0
 }
 

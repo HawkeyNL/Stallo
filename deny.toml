@@ -13,10 +13,17 @@ unused-allowed-license = "allow"
 # Stallo itself is proprietary (LICENSE) and not published (publish = false);
 # skip the licence check for it.
 private = { ignore = true }
+# target-lexicon is only a build-time dependency of the GUI (system-deps uses
+# it while looking up GTK with pkg-config) and never ends up in a binary. The
+# LLVM exception only adds permissions to Apache-2.0.
+exceptions = [{ crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] }]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The GUI uses the stallo library by path; both are private (publish = false),
+# so nothing outside this repository can resolve that path.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

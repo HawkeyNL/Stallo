@@ -112,6 +112,8 @@ pub struct NewVm {
     /// Download the image if it is not cached (humans only); otherwise
     /// creation needs a pulled image.
     pub may_pull: bool,
+    /// A VNC socket from the first start (humans only).
+    pub vnc: bool,
 }
 
 /// A running QEMU process.
@@ -386,7 +388,7 @@ impl Manager {
             agent_control: new.agent_control,
             throwaway_of: None,
             forwards: new.forwards.clone(),
-            vnc: false,
+            vnc: new.vnc,
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
@@ -825,6 +827,56 @@ impl Manager {
         );
         cfg.vnc = on;
         cfg.save(&self.paths.vm_dir(name))
+    }
+
+    /// Changes a stopped VM's vCPUs and memory (`None`: unchanged), with
+    /// the limits and host checks of `new`. Refused while the VM has RAM
+    /// snapshots: they only load into a VM of the size they were taken at.
+    pub async fn set_resources(
+        &self,
+        name: &str,
+        vcpus: Option<u32>,
+        memory_mib: Option<u64>,
+    ) -> Result<VmConfig> {
+        ensure!(
+            vcpus.is_some() || memory_mib.is_some(),
+            "nothing to change: give vcpus, memory or both"
+        );
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        ensure!(
+            self.running(name).is_none(),
+            "{name} is running; stop it first to change its CPUs or memory: stallo stop {name}"
+        );
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        let old = (cfg.vcpus, cfg.memory_mib);
+        cfg.vcpus = vcpus.unwrap_or(cfg.vcpus);
+        cfg.memory_mib = memory_mib.unwrap_or(cfg.memory_mib);
+        cfg.validate()?;
+        let ram: Vec<String> = self
+            .list_snapshots(name)
+            .await?
+            .into_iter()
+            .filter(|s| s.ram_bytes > 0)
+            .map(|s| s.name)
+            .collect();
+        ensure!(
+            ram.is_empty(),
+            "{name} has RAM snapshots ({}) that only restore at its current size; delete them first: stallo snap {name} --delete <name>",
+            ram.join(", ")
+        );
+        // As `new` (no new disk): would it start next to the running VMs?
+        // Only for growth: shrinking never makes it fit worse, and every
+        // start checks again.
+        if cfg.vcpus > old.0 || cfg.memory_mib > old.1 {
+            self.admit(&cfg, 0)?;
+        }
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok(cfg)
     }
 
     /// Continues a paused VM, unless the disk is still below the floor.
@@ -2107,5 +2159,118 @@ mod tests {
             "--scope --quiet --collect --expand-environment=no -p KillSignal=SIGKILL -p RuntimeMaxSec=1500ms -- \
              setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
         );
+    }
+
+    /// `set_resources`: limits and host checks of `new`, stopped VMs only,
+    /// no run clones, no RAM snapshots; saved in vm.toml.
+    #[tokio::test]
+    async fn resources_setting() {
+        use crate::config::{DaemonConfig, MAX_MEMORY_MIB, Mode};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let mut config = DaemonConfig::default();
+        // Admission must pass on any test host's disk.
+        config.host.disk_floor_gib = 0;
+        let m = Manager::new(paths, config, Cgroups::at(root.join("cg")), Mode::Dev);
+        m.cleanup_leftovers().await.unwrap();
+        let (_d, running, _) = fake_vm("running", None).await;
+        let base = running.config.clone();
+        let clone = VmConfig {
+            name: "run-0a1b2c3d".into(),
+            throwaway_of: Some("dev".into()),
+            ..base.clone()
+        };
+        for cfg in [&base, &clone] {
+            let dir = m.paths.vm_dir(&cfg.name);
+            fs::create_dir(&dir).unwrap();
+            cfg.save(&dir).unwrap();
+        }
+        let err = |r: Result<VmConfig>| r.unwrap_err().to_string();
+
+        assert!(err(m.set_resources("dev", None, None).await).contains("nothing to change"));
+        assert!(err(m.set_resources("nope", Some(1), None).await).contains("nope"));
+        assert!(err(m.set_resources("dev", Some(0), None).await).contains("vcpus must be"));
+        assert!(err(m.set_resources("dev", None, Some(255)).await).contains("memory must be"));
+        let e = err(m.set_resources("run-0a1b2c3d", Some(2), None).await);
+        assert!(e.contains("clone"), "{e}");
+        m.running
+            .lock()
+            .unwrap()
+            .insert("dev".into(), Arc::new(running));
+        let e = err(m.set_resources("dev", Some(2), None).await);
+        assert!(e.contains("dev is running; stop it first"), "{e}");
+        m.running.lock().unwrap().clear();
+        assert_eq!(m.load("dev").unwrap(), base, "nothing saved");
+
+        // Below: snapshots are listed with a confined qemu-img.
+        if !confine::available() {
+            return;
+        }
+        let dir = m.paths.vm_dir("dev");
+        for (file, size) in [(qemu::DISK, "1G"), (qemu::VARS, "1M")] {
+            let ok = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(dir.join(file))
+                .arg(size)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        let cfg = m.set_resources("dev", Some(2), Some(1024)).await.unwrap();
+        assert_eq!((cfg.vcpus, cfg.memory_mib), (2, 1024));
+        assert_eq!(m.load("dev").unwrap(), cfg, "vm.toml round-trip");
+        let cfg = m.set_resources("dev", None, Some(768)).await.unwrap();
+        assert_eq!((cfg.vcpus, cfg.memory_mib), (2, 768), "vcpus kept");
+        assert_eq!(
+            VmConfig {
+                vcpus: base.vcpus,
+                memory_mib: base.memory_mib,
+                ..cfg.clone()
+            },
+            base,
+            "nothing else changed"
+        );
+
+        // Growth must fit the host; shrinking is always allowed (start
+        // checks again), even for a VM that does not fit now.
+        let over = m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await;
+        assert!(err(over).contains("over the VM memory budget"));
+        assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
+        let huge = VmConfig {
+            vcpus: 255,
+            memory_mib: MAX_MEMORY_MIB,
+            ..cfg.clone()
+        };
+        huge.save(&dir).unwrap();
+        let shrunk = m
+            .set_resources("dev", Some(254), Some(MAX_MEMORY_MIB - 1024))
+            .await
+            .unwrap();
+        assert_eq!(
+            (shrunk.vcpus, shrunk.memory_mib),
+            (254, MAX_MEMORY_MIB - 1024)
+        );
+        let e = err(m.set_resources("dev", Some(255), None).await);
+        assert!(e.contains("too many"), "{e}");
+        cfg.save(&dir).unwrap();
+
+        // A RAM snapshot only loads at the size it was taken at; checked
+        // before the host (a growth names the snapshots, not the budget).
+        crate::snapshot::create_offline(&dir, "s1").await.unwrap();
+        ensure_private_dir(&dir.join(qemu::STATES)).unwrap();
+        fs::write(crate::snapshot::state_file(&dir, "s1"), b"ram").unwrap();
+        let e = err(m.set_resources("dev", Some(1), None).await);
+        assert!(e.contains("RAM snapshots (s1)"), "{e}");
+        assert_eq!(m.load("dev").unwrap(), cfg, "nothing saved");
+        let e = err(m.set_resources("dev", None, Some(MAX_MEMORY_MIB)).await);
+        assert!(e.contains("RAM snapshots (s1)"), "{e}");
     }
 }

@@ -115,6 +115,11 @@ fn agent_drives_the_console() {
         },
         Request::Rm { name: "dev".into() },
         Request::Resume { name: "dev".into() },
+        Request::SetResources {
+            name: "dev".into(),
+            vcpus: Some(1),
+            memory_mib: None,
+        },
         Request::New {
             name: "two".into(),
             image: d.image.clone(),
@@ -124,6 +129,7 @@ fn agent_drives_the_console() {
             net: stallo::config::NetProfile::Offline,
             forwards: vec![],
             wait: false,
+            vnc: false,
         },
     ] {
         let err = d.api(Via::Mcp, r.clone()).unwrap_err().to_string();

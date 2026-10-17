@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Stallo
+Comment=Manage virtual machines for people and AI agents
+Exec=stallo-gui
+Icon=io.github.hawkeynl.Stallo
+Terminal=false
+Categories=System;Emulator;
+Keywords=VM;virtual machine;QEMU;KVM;
+StartupNotify=true
