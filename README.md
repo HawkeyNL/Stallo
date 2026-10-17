@@ -347,7 +347,7 @@ its publisher lists. It then works like a pulled ISO: `stallo new`,
 `stallo set --cdrom` and `stallo images rm`. A Linux ISO boots without
 Secure Boot, a Windows ISO with it.
 
-A VM from an imported ISO may use `--net internet` (it cannot be changed
+A VM from an installer ISO (catalog or imported) may use `--net internet` (it cannot be changed
 after `stallo new`). Windows gets an e1000e network card, which it has a
 driver for. That emulated card is QEMU code the guest can reach, a larger
 surface than virtio-net; QEMU's seccomp filter, Landlock rules and
