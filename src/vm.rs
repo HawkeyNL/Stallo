@@ -659,16 +659,13 @@ impl Manager {
     /// Whether `cfg`'s network profile may start here. Fail closed: the
     /// internet profile needs production mode and a passing isolation
     /// probe (`net::check_isolation`).
+    ///
+    /// The catalog's per-image `internet` flag is about the seed: its
+    /// network config must bring the NIC up, or the VM never gets ready.
+    /// A VM from an imported ISO (every Windows VM) has no seed; its own OS
+    /// asks passt's DHCP. The isolation is on the host either way.
     fn check_net(&self, cfg: &VmConfig) -> Result<()> {
-        ensure!(
-            cfg.machine.is_linux() || cfg.net == NetProfile::Offline,
-            "Windows VMs are offline only for now: the internet profile is not verified with Windows yet"
-        );
-        if cfg.net != NetProfile::Offline {
-            ensure!(
-                !images::is_local(&cfg.image),
-                "VMs from an imported ISO are offline only for now"
-            );
+        if cfg.net != NetProfile::Offline && !images::is_local(&cfg.image) {
             images::find(&cfg.image)?.check_net(cfg.net)?;
         }
         match (cfg.net, self.mode) {

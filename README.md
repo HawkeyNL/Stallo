@@ -94,7 +94,8 @@ longer. Arch signs the image itself rather than a checksum list. Debian's image 
 catalog (`catalog/debian-13.toml`), while its guest-agent package comes
 from the signed Debian archive. The `internet` profile is refused for
 images it was not verified with (`internet` in the catalog entry): so far
-the Ubuntu ones.
+the Ubuntu ones. Imported ISOs (Windows too) take it: they have no seed,
+so their own OS takes its address from passt's DHCP.
 
 A pull starts only if the image's filesystem keeps the disk floor
 (`disk_floor_gib`) free plus twice the image's largest size, or once for
@@ -343,6 +344,12 @@ imported ISO; `stallo images` shows its SHA-256 to compare with the one
 its publisher lists. It then works like a pulled ISO: `stallo new`,
 `stallo set --cdrom` and `stallo images rm`. A Linux ISO boots without
 Secure Boot, a Windows ISO with it.
+
+A VM from an imported ISO may use `--net internet` (it cannot be changed
+after `stallo new`). Windows gets an e1000e network card, which it has a
+driver for. The isolation is the same as for every `internet` VM and is
+enforced on the host only; the checks to run inside Windows are in
+[docs/network-verification.md](docs/network-verification.md#windows-guests).
 
 ## Agents (MCP)
 

@@ -515,3 +515,85 @@ reference.
   public IPv4 resolver for guests (default `9.9.9.9`, Quad9).
 - **The table also limits the daemon itself.** Its image downloads cannot
   use a proxy or mirror on the LAN or on localhost.
+
+## Windows guests
+
+**Not verified yet.** The lab above used Linux guests. Windows guests and
+VMs from any imported ISO take the `internet` profile with the same passt
+flags and the same table. This checklist is for the owner's first
+Windows VM on a production install.
+
+**Why nothing changes for the isolation:**
+- Everything is enforced on the host. passt turns the guest's frames into
+  sockets of user `stallo`, the table drops those to denied addresses, and
+  passt runs under its AppArmor profile. Nothing is configured inside the
+  guest.
+- A guest that sets its own address, gateway or DNS server still only
+  reaches passt. Its packets to a LAN DNS server or router leave the host
+  as `stallo` sockets and are dropped.
+- The catalog's per-image `internet` flag does not apply. It exists
+  because a cloud image's seed (`network-config`) must match the NIC, or
+  DHCP never comes up and the VM is never ready. An imported ISO has no
+  seed: the installed OS asks passt's DHCP itself.
+
+**What the guest gets** (passt's behaviour, not checked with Windows):
+- An Intel 82574L card (QEMU `e1000e`), which Windows has a driver for.
+- IPv4 by DHCP: **the laptop's own LAN address** and its default gateway
+  (passt copies them), DNS server `169.254.1.53`, no search domain.
+- IPv6 by router advertisement, only if the laptop has a global IPv6
+  address. No IPv6 DNS server: names resolve over IPv4.
+- Windows ignores DHCP's MTU option and keeps 1500. passt sizes TCP
+  segments to the guest's MSS, so this should not matter.
+
+**Before you start, on the laptop:**
+1. Do "Check the host first" under "Installing on a host" (global IPv6,
+   the router's WAN address).
+2. Check the table: `sudo nft list table inet stallo` must print it.
+3. Note the addresses to test, with `ip -br addr` and `ip route show default`:
+   - `<gw>`: the default gateway (your router);
+   - `<lan-dev>`: another device on the LAN with a known open port, for
+     example a NAS or printer web page;
+   - `<host-other>`: any other address of the laptop that is not its LAN
+     address (`docker0`, `virbr0`, `tailscale0`), if it has one.
+4. Controls, as your own user on the laptop: `curl -m 3 http://<gw>/`
+   and the `<lan-dev>` page answer.
+5. Optional, to prove that no guest address reaches the laptop's
+   loopback: `python3 -m http.server 8000 --bind 127.0.0.1` in a
+   terminal (loopback only; stop it with Ctrl+C afterwards).
+6. Create the VM: `stallo new win --image local-<id> --net internet`.
+   The profile is fixed at `new`; an offline VM must be made again.
+
+**Inside Windows**, in PowerShell (during Setup: Shift+F10, then
+`powershell`):
+
+| # | Command | Expected |
+|---|---|---|
+| 1 | `ipconfig /all` | The Intel 82574L adapter, `DHCP Enabled: Yes`, the laptop's LAN address, `Default Gateway` = `<gw>`, `DNS Servers` = `169.254.1.53`, no DNS suffix |
+| 2 | `nslookup example.com` | `Address: 169.254.1.53` as server, and an answer |
+| 3 | `Test-NetConnection example.com -Port 443` | `TcpTestSucceeded : True` |
+| 4 | `curl.exe -sI https://www.google.com` | `HTTP/1.1 200` (or a redirect) |
+| 5 | In Edge, download and install Chrome; browse a few sites | works |
+| 6 | IPv6, only if the laptop has global IPv6: `curl.exe -6 -sI https://ipv6.google.com` | an HTTP status |
+| 7 | `Test-NetConnection <gw> -Port 80` | `TcpTestSucceeded : False` (after a timeout) |
+| 8 | `Test-NetConnection <lan-dev> -Port <its port>` | `False` |
+| 9 | `nslookup example.com <gw>` (UDP to the router's DNS) | `timed out` |
+| 10 | `Test-NetConnection <host-other> -Port 22` (each one) | `False` |
+| 11 | With step 5's server: `Test-NetConnection <gw> -Port 8000` and `Test-NetConnection 169.254.1.53 -Port 8000` | `False` |
+| 12 | `Test-NetConnection 169.254.169.254 -Port 80`, `Test-NetConnection 10.0.0.1 -Port 80` | `False` |
+| 13 | If the laptop runs Tailscale: `Test-NetConnection 100.100.100.100 -Port 53`, and `nslookup <laptop's tailnet name>` | `False`; no tailnet answer |
+| 14 | `ping <gw>` | no replies |
+
+- **Blocked means a timeout**, not "refused" (finding 7). A `True` in rows
+  7 to 13 is an isolation failure: stop the VM (`stallo stop win`) and
+  report it.
+- Testing the laptop's LAN address from Windows proves nothing: it is the
+  guest's own address, so Windows answers itself.
+- `ping` to internet hosts may fail even when the internet works: passt
+  needs ping sockets for it (`net.ipv4.ping_group_range`). Use rows 3 and 4.
+- If pages stall while small requests work, note the output of
+  `netsh interface ipv4 show subinterfaces` (MTU) with the report.
+
+**Optional, fail closed** (changes the laptop's firewall for a moment):
+`sudo nft delete table inet stallo`. Within 2 s `stallo ls` shows
+`running (no network)` and row 3 fails. Roll back with
+`sudo systemctl reload stallo-nft`, then `stallo stop win && stallo start win`.

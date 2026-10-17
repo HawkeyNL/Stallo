@@ -486,6 +486,8 @@ mod tests {
         };
         let a = argv(&inet, d, r, Some(9), vnc, Agent::Manual, Media::Cdrom(None)).unwrap();
         assert!(a.contains(&"e1000e,netdev=net0,mac=52:54:00:4f:1c:2b,romfile=".to_owned()));
+        // passt's end of the socketpair, as for Linux guests.
+        assert!(a.contains(&"stream,id=net0,server=off,addr.type=fd,addr.str=9".to_owned()));
         assert!(!a.iter().any(|x| x.contains("virtio-net") || x == "-nic"));
         // A Windows VM always comes from an ISO.
         assert!(argv(&windows(), d, r, None, vnc, Agent::Manual, Media::Seed).is_err());

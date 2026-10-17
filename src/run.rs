@@ -617,7 +617,7 @@ mod tests {
         }
     }
 
-    /// A Windows VM fails closed: no start without a TPM, no internet, no
+    /// A Windows VM fails closed: no start without a TPM, no
     /// `stallo run` clone and nothing below its minimum size.
     #[tokio::test]
     async fn windows_vms_are_refused() {
@@ -649,20 +649,36 @@ mod tests {
         let err = m.set_resources("win", Some(1), None).await.unwrap_err();
         assert!(err.to_string().contains("at least 2 vCPUs"), "{err}");
         assert_eq!(m.load("win").unwrap(), win);
+    }
 
-        for mode in [Mode::Dev, Mode::Production] {
-            let tmp = tempfile::tempdir().unwrap();
-            let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
-            let dir = m.paths.vm_dir("win");
-            fs::create_dir_all(&dir).unwrap();
-            VmConfig {
-                net: NetProfile::Internet,
-                ..win.clone()
+    /// The internet profile for VMs from an imported ISO, Windows or
+    /// Linux: no per-image gate (they have no seed), only the host's
+    /// isolation, which refuses here in both modes (no table).
+    #[tokio::test]
+    async fn local_isos_take_internet_only_with_isolation() {
+        for machine in [Os::Windows, Os::Linux] {
+            for (mode, why) in [
+                (Mode::Dev, "dev mode"),
+                (Mode::Production, "isolation unavailable"),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let m = manager_in(&fs::canonicalize(tmp.path()).unwrap(), mode);
+                let dir = m.paths.vm_dir("win");
+                fs::create_dir_all(&dir).unwrap();
+                VmConfig {
+                    image: "local-win11".into(),
+                    net: NetProfile::Internet,
+                    machine,
+                    vcpus: 2,
+                    memory_mib: 4096,
+                    disk_gib: 64,
+                    ..vm("win", None)
+                }
+                .save(&dir)
+                .unwrap();
+                let err = m.start("win").await.err().unwrap();
+                assert!(err.to_string().contains(why), "{machine:?} {err}");
             }
-            .save(&dir)
-            .unwrap();
-            let err = m.start("win").await.err().unwrap();
-            assert!(err.to_string().contains("offline only"), "{err}");
         }
     }
 
