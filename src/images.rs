@@ -114,11 +114,20 @@ pub enum Kind {
     Iso,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The guest operating system of an image, and the machine profile of a
+/// VM (`VmConfig::machine`, `qemu::argv`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Os {
+    #[default]
     Linux,
     Windows,
+}
+
+impl Os {
+    pub fn is_linux(&self) -> bool {
+        *self == Os::Linux
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

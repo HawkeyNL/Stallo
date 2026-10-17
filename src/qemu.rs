@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::process::Command;
 
 use crate::config::{NetProfile, VmConfig};
-use crate::images::{Agent, Firmware};
+use crate::images::{Agent, Firmware, Os};
 use crate::run_tool;
 
 pub const QEMU: &str = "/usr/bin/qemu-system-x86_64";
@@ -61,6 +61,10 @@ const QGA_AFTER_CLOUD_INIT: &str = "[Unit]\nAfter=cloud-final.service\n";
 /// state. Ubuntu 26.04 ships QEMU 10.2.
 pub const MACHINE: &str = "pc-q35-10.2";
 
+/// Hyper-V enlightenments for Windows guests: paravirtual timers, clocks,
+/// TLB flushes and IPIs. `hv-stimer` replaces the HPET (`hpet=off`).
+const HYPERV: &str = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-synic,hv-stimer,hv-time,hv-frequencies,hv-tlbflush,hv-ipi";
+
 /// The second drive of a VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Media<'a> {
@@ -77,6 +81,11 @@ pub enum Media<'a> {
 /// refused for `offline`. `vnc` is the VNC socket: required when `vm.vnc`
 /// is on, and refused otherwise. `agent` is how the image gets its guest
 /// agent.
+///
+/// `vm.machine` picks the hardware. A Windows VM (always from an ISO) gets
+/// devices Windows has drivers for out of the box: an AHCI disk, an e1000e
+/// NIC and a USB tablet instead of virtio ones, plus Hyper-V
+/// enlightenments and an RTC in local time.
 pub fn argv(
     vm: &VmConfig,
     vm_dir: &Path,
@@ -88,6 +97,8 @@ pub fn argv(
 ) -> Result<Vec<String>> {
     // Names and uuids end up inside option strings; never trust the caller.
     vm.validate()?;
+    let windows = vm.machine == Os::Windows;
+    ensure!(!windows || media != Media::Seed, "a Windows VM has no seed");
     ensure!(
         vm.vnc == vnc.is_some(),
         "vnc {} with socket {vnc:?}",
@@ -127,7 +138,8 @@ pub fn argv(
         (NetProfile::Internet, Some(fd)) => vec![
             format!("-netdev stream,id=net0,server=off,addr.type=fd,addr.str={fd}"),
             format!(
-                "-device virtio-net-pci,netdev=net0,mac={},romfile=",
+                "-device {},netdev=net0,mac={},romfile=",
+                if windows { "e1000e" } else { "virtio-net-pci" },
                 crate::net::mac(vm)
             ),
         ],
@@ -161,6 +173,23 @@ pub fn argv(
     let (qmp, qga) = (file(rt_dir, QMP_SOCK)?, file(rt_dir, QGA_SOCK)?);
     let (name, uuid) = (&vm.name, &vm.uuid);
     let (w, h) = SCREEN;
+    let (hpet, hyperv, disk_dev, pointer) = if windows {
+        (
+            ",hpet=off",
+            format!(",{HYPERV}"),
+            "ide-hd,drive=disk0,bus=ide.1",
+            "-device qemu-xhci,id=usb -device usb-tablet,bus=usb.0",
+        )
+    } else {
+        (
+            "",
+            String::new(),
+            "virtio-blk-pci,drive=disk0",
+            "-device virtio-tablet-pci",
+        )
+    };
+    // Windows keeps the RTC in local time.
+    let rtc = windows.then(|| "-rtc base=localtime,driftfix=slew".to_owned());
 
     let args = [
         format!("-name guest={name},debug-threads=on"),
@@ -170,13 +199,16 @@ pub fn argv(
         // mem-merge=off: no KSM page sharing between guests and the host
         // (side channels). vmport=off: no VMware backdoor port.
         format!(
-            "-machine {MACHINE},accel=kvm,smm=on,dump-guest-core=off,mem-merge=off,vmport=off,pflash0=fw-code,pflash1=fw-vars"
+            "-machine {MACHINE},accel=kvm,smm=on,dump-guest-core=off,mem-merge=off,vmport=off,pflash0=fw-code,pflash1=fw-vars{hpet}"
         ),
         "-global driver=cfi.pflash01,property=secure,value=on".into(),
         // Guests cannot suspend or hibernate and wedge automation.
         "-global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1".into(),
         // No nested virtualisation: it exposes KVM's nested code to the guest.
-        format!("-cpu host,-svm,-vmx -smp {} -m {}", vm.vcpus, vm.memory_mib),
+        format!(
+            "-cpu host,-svm,-vmx{hyperv} -smp {} -m {}",
+            vm.vcpus, vm.memory_mib
+        ),
         format!("-blockdev driver=file,node-name=fw-code,filename={OVMF_CODE},read-only=on"),
         format!("-blockdev driver=file,node-name=fw-vars-file,filename={vars}"),
         "-blockdev driver=qcow2,node-name=fw-vars,file=fw-vars-file".into(),
@@ -184,12 +216,13 @@ pub fn argv(
             "-blockdev driver=file,node-name=disk0-file,filename={disk},cache.direct=on,aio=native,discard=unmap"
         ),
         "-blockdev driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap".into(),
-        "-device virtio-blk-pci,drive=disk0,bootindex=1,werror=stop,rerror=stop".into(),
+        format!("-device {disk_dev},bootindex=1,werror=stop,rerror=stop"),
     ];
     let devices = [
-        // No legacy VGA and no USB controller: less emulated hardware.
+        // No legacy VGA, and a USB controller only for Windows, which has
+        // no virtio-input driver: less emulated hardware.
         format!("-device bochs-display,edid=on,xres={w},yres={h}"),
-        "-device virtio-tablet-pci".into(),
+        pointer.into(),
         format!("-chardev socket,id=qmp,path={qmp},server=on,wait=off"),
         "-mon chardev=qmp,mode=control".into(),
         format!("-chardev socket,id=qga0,path={qga},server=on,wait=off"),
@@ -200,6 +233,7 @@ pub fn argv(
     // are checked in `opt_path`.
     Ok(args
         .iter()
+        .chain(&rtc)
         .chain(&media)
         .chain(&devices)
         .chain(&network)
@@ -286,6 +320,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             cdrom: None,
+            machine: Os::Linux,
         }
     }
 
@@ -384,6 +419,76 @@ mod tests {
         assert!(with(Agent::Manual, Media::Cdrom(Some(Path::new("/a b.iso")))).is_err());
         let comma = with(Agent::Manual, Media::Cdrom(Some(Path::new("/a,b.iso")))).unwrap();
         assert!(comma.contains("filename=/a,,b.iso,read-only=on"));
+    }
+
+    fn windows() -> VmConfig {
+        VmConfig {
+            machine: Os::Windows,
+            memory_mib: 4096,
+            disk_gib: 64,
+            image: "local-win11".into(),
+            cdrom: Some("local-win11".into()),
+            vnc: true,
+            ..vm()
+        }
+    }
+
+    /// The Windows profile: Hyper-V enlightenments, no HPET, an RTC in
+    /// local time, an AHCI disk, a USB tablet and no systemd credentials.
+    #[test]
+    fn golden_windows() {
+        let got = argv(
+            &windows(),
+            Path::new("/d/vms/dev"),
+            Path::new("/r/vms/dev"),
+            None,
+            Some(Path::new("/r/vnc/dev/vnc.sock")),
+            Agent::Manual,
+            Media::Cdrom(Some(Path::new("/d/images/local-win11.iso"))),
+        )
+        .unwrap();
+        let want = "\
+-name guest=dev,debug-threads=on -uuid 4f1c2b9e-0d3a-4c5e-8f7a-1b2c3d4e5f60 \
+-nodefaults -no-user-config -display none -msg timestamp=on \
+-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+-machine pc-q35-10.2,accel=kvm,smm=on,dump-guest-core=off,mem-merge=off,vmport=off,pflash0=fw-code,pflash1=fw-vars,hpet=off \
+-global driver=cfi.pflash01,property=secure,value=on \
+-global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1 \
+-cpu host,-svm,-vmx,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-synic,hv-stimer,hv-time,hv-frequencies,hv-tlbflush,hv-ipi -smp 2 -m 4096 \
+-blockdev driver=file,node-name=fw-code,filename=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd,read-only=on \
+-blockdev driver=file,node-name=fw-vars-file,filename=/d/vms/dev/vars.qcow2 \
+-blockdev driver=qcow2,node-name=fw-vars,file=fw-vars-file \
+-blockdev driver=file,node-name=disk0-file,filename=/d/vms/dev/disk.qcow2,cache.direct=on,aio=native,discard=unmap \
+-blockdev driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap \
+-device ide-hd,drive=disk0,bus=ide.1,bootindex=1,werror=stop,rerror=stop \
+-rtc base=localtime,driftfix=slew \
+-blockdev driver=file,node-name=cd0-file,filename=/d/images/local-win11.iso,read-only=on \
+-blockdev driver=raw,node-name=cd0,file=cd0-file,read-only=on \
+-device ide-cd,id=cd0,drive=cd0,bus=ide.0,bootindex=2 \
+-device bochs-display,edid=on,xres=1280,yres=800 \
+-device qemu-xhci,id=usb -device usb-tablet,bus=usb.0 \
+-chardev socket,id=qmp,path=/r/vms/dev/qmp.sock,server=on,wait=off \
+-mon chardev=qmp,mode=control \
+-chardev socket,id=qga0,path=/r/vms/dev/qga.sock,server=on,wait=off \
+-device virtio-serial-pci \
+-device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+-nic none \
+-vnc unix:/r/vnc/dev/vnc.sock";
+        assert_eq!(got.join(" "), want);
+        assert!(!want.contains("smbios") && !want.contains("virtio-tablet"));
+
+        let (d, r) = (Path::new("/d"), Path::new("/r"));
+        let vnc = Some(Path::new("/r/vnc.sock"));
+        // The internet profile gets an e1000e NIC, still without option ROM.
+        let inet = VmConfig {
+            net: NetProfile::Internet,
+            ..windows()
+        };
+        let a = argv(&inet, d, r, Some(9), vnc, Agent::Manual, Media::Cdrom(None)).unwrap();
+        assert!(a.contains(&"e1000e,netdev=net0,mac=52:54:00:4f:1c:2b,romfile=".to_owned()));
+        assert!(!a.iter().any(|x| x.contains("virtio-net") || x == "-nic"));
+        // A Windows VM always comes from an ISO.
+        assert!(argv(&windows(), d, r, None, vnc, Agent::Manual, Media::Seed).is_err());
     }
 
     /// S4: the security-relevant flags, checked one by one.

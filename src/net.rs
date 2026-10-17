@@ -302,6 +302,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             cdrom: None,
+            machine: crate::images::Os::Linux,
         }
     }
 
