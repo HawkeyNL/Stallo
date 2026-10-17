@@ -520,6 +520,8 @@ pub enum Action {
         vcpus: Option<u32>,
         memory_mib: Option<u64>,
     },
+    /// Empties the CD-ROM drive (the installer ISO) from the next start.
+    Eject,
 }
 
 impl Action {
@@ -552,6 +554,7 @@ impl Action {
                 vcpus: *vcpus,
                 memory_mib: *memory_mib,
             }],
+            Action::Eject => vec![Request::SetCdrom { name, iso: None }],
             Action::Restart { live_screen: on } => on
                 .then(|| live_screen(true))
                 .into_iter()
@@ -578,6 +581,7 @@ impl Action {
                 | Action::Agent(_)
                 | Action::Remove
                 | Action::Resize { .. }
+                | Action::Eject
         )
     }
 
@@ -628,6 +632,7 @@ impl Action {
             ),
             Action::Remove => (format!("delete {vm}"), None),
             Action::Resize { .. } => (format!("change the resources of {vm}"), None),
+            Action::Eject => (format!("eject the installer of {vm}"), None),
             Action::Take(_) => (
                 format!("take a snapshot of {vm}"),
                 Some(format!("Snapshot of {vm} still running")),
@@ -677,6 +682,7 @@ impl Action {
             Action::Agent(false) => "Turning off agent control…",
             Action::Remove => "Deleting VM…",
             Action::Resize { .. } => "Changing resources…",
+            Action::Eject => "Ejecting installer…",
         }
     }
 
@@ -691,6 +697,7 @@ impl Action {
             }
             Action::Remove => Some(format!("{vm} deleted")),
             Action::Resize { .. } => Some(format!("Resources of {vm} changed")),
+            Action::Eject => Some(format!("Installer ejected from {vm}. {AT_NEXT_START}")),
             Action::Take(_) => Some(match data.get("name").and_then(|n| n.as_str()) {
                 Some(n) => format!("Snapshot {} taken", printable(n, 64)),
                 None => "Snapshot taken".to_owned(),
@@ -1055,6 +1062,13 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
             .collect::<Vec<_>>()
             .join("\n"),
     };
+    let agent = match details.map(|d| &d.addresses) {
+        _ if k == Kind::Stopped => "Not running",
+        None => "Unknown",
+        Some(Some(_)) => "Answering",
+        Some(None) if from_installer(vm) => NO_GUEST_AGENT,
+        Some(None) => "Not answering (still starting, busy or not installed)",
+    };
     vec![
         (
             "Resources",
@@ -1074,7 +1088,35 @@ pub fn facts(vm: &VmInfo, details: Option<&VmDetails>) -> Facts {
                 ("Addresses", addresses),
             ],
         ),
+        ("Guest", vec![("Guest Agent", agent.to_owned())]),
     ]
+}
+
+/// What a VM installed from an ISO offers while no guest agent answers.
+pub const NO_GUEST_AGENT: &str = "No guest agent answering: screen, keyboard and mouse work; files and commands need qemu-guest-agent";
+
+/// Whether `vm` was made from an installer ISO, by the catalog this app
+/// was built with.
+fn from_installer(vm: &VmInfo) -> bool {
+    vm.image
+        .as_deref()
+        .and_then(|i| stallo::images::find(i).ok())
+        .is_some_and(|e| e.kind == stallo::images::Kind::Iso)
+}
+
+/// When a change to the VM's settings takes effect.
+pub const AT_NEXT_START: &str =
+    "This takes effect the next time Stallo starts the VM (a restart inside the VM is not enough).";
+
+/// The Overview's Installer row, while an installer ISO is in
+/// the VM's drive. Safe for plain labels.
+pub fn installer_note(vm: &VmInfo) -> Option<String> {
+    let iso = vm.cdrom.as_deref()?;
+    let name = stallo::images::find(iso).map_or_else(|_| iso.to_owned(), |e| e.name);
+    Some(format!(
+        "{} is in the VM's drive. Eject it once the system is installed. {AT_NEXT_START}",
+        printable(&name, 96)
+    ))
 }
 
 /// The host budget meter in the sidebar.
@@ -1130,6 +1172,28 @@ pub const NEW_IMAGE: &str = "ubuntu-26.04";
 pub const NEW_VCPUS: u32 = 2;
 pub const NEW_MEMORY_GIB: u64 = 2;
 pub const NEW_DISK_GIB: u64 = 20;
+/// `stallo new`'s memory and disk for an installer ISO: a desktop.
+pub const NEW_INSTALLER_MEMORY_GIB: u64 = 4;
+pub const NEW_INSTALLER_DISK_GIB: u64 = 32;
+
+/// The processors, memory (GiB) and disk (GiB) a VM from `image` gets
+/// unless changed, as `stallo new` gives it.
+pub fn new_defaults(image: &ImageChoice) -> (u32, u64, u64) {
+    if image.installer {
+        (NEW_VCPUS, NEW_INSTALLER_MEMORY_GIB, NEW_INSTALLER_DISK_GIB)
+    } else {
+        (NEW_VCPUS, NEW_MEMORY_GIB, NEW_DISK_GIB)
+    }
+}
+
+/// Why the Live Screen switch stays on for `image`, if so: an installer
+/// is used on the VM's screen (the daemon turns it on anyway).
+pub fn live_screen_lock(image: &ImageChoice) -> Option<&'static str> {
+    image
+        .installer
+        .then_some("Always on: you install the system on the VM's screen.")
+}
+
 /// The smallest disk offered: above the virtual size of every catalog
 /// image, which the daemon requires.
 pub const MIN_DISK_GIB: u64 = 10;
@@ -1152,6 +1216,11 @@ pub struct ImageChoice {
     pub cached: bool,
     /// Disk space a download may still take, at most.
     pub download_bytes: u64,
+    /// Disk space the download needs free while it runs
+    /// (`images::pull_reserve`); 0 when nothing is downloaded.
+    pub download_reserve: u64,
+    /// An installer ISO: installed by hand on the VM's screen.
+    pub installer: bool,
     /// The internet profile was verified with this image.
     pub internet: bool,
 }
@@ -1171,18 +1240,22 @@ fn split_name(name: &str) -> (String, Option<String>) {
     (printable(short, 64), Some(printable(detail, 64)))
 }
 
+/// The images to choose from: cloud images first, then installers.
 pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
-    images
+    let mut choices: Vec<ImageChoice> = images
         .iter()
         .map(|i| {
             // The catalog this app was built with; an image only a newer
             // daemon knows gets no size and no internet.
             let entry = stallo::images::find(&i.id).ok();
             // A file that is there lacks only the small guest-agent packages.
-            let download_bytes = match (&entry, i.cached || i.size_bytes.is_some()) {
-                (Some(e), false) => e.max_size,
-                _ => 0,
-            };
+            let (download_bytes, download_reserve) =
+                match (&entry, i.cached || i.size_bytes.is_some()) {
+                    (Some(e), false) => (e.max_size, stallo::images::pull_reserve(e)),
+                    _ => (0, 0),
+                };
+            let installer =
+                i.kind.or(entry.as_ref().map(|e| e.kind)) == Some(stallo::images::Kind::Iso);
             let (title, detail) = split_name(&i.name);
             let os = i.os.map(|os| match os {
                 stallo::images::Os::Linux => "Linux".to_owned(),
@@ -1207,11 +1280,19 @@ pub fn image_choices(images: &[ImageInfo]) -> Vec<ImageChoice> {
                 subtitle,
                 cached: i.cached,
                 download_bytes,
+                download_reserve,
+                installer,
                 internet: entry.is_some_and(|e| e.internet),
             }
         })
-        .collect()
+        .collect();
+    // Stable: the catalog's order within each group.
+    choices.sort_by_key(|c| c.installer);
+    choices
 }
+
+/// What the installers are, under their heading in the New VM dialog.
+pub const INSTALLER_NOTE: &str = "Install it yourself on the screen, like a real PC";
 
 /// The image selected at first: the CLI's default if it is downloaded,
 /// else any downloaded one, else the CLI's default.
@@ -1235,10 +1316,11 @@ pub struct Limits {
     pub download_fits: bool,
 }
 
-/// What `host` leaves for a new VM, after a download of `download_bytes`.
+/// What `host` leaves for a new VM, after a download of `download_bytes`
+/// that needs `reserve` bytes free while it runs.
 // ponytail: the daemon's [host] settings are not in `host`, so its defaults
 // stand in; with other settings the daemon's own refusal is shown.
-pub fn limits(host: &HostInfo, download_bytes: u64) -> Limits {
+pub fn limits(host: &HostInfo, download_bytes: u64, reserve: u64) -> Limits {
     let cfg = stallo::config::HostConfig::default();
     let room = host
         .memory_budget_mib
@@ -1261,8 +1343,8 @@ pub fn limits(host: &HostInfo, download_bytes: u64) -> Limits {
         vcpus: host.cores.saturating_sub(cfg.reserved_cores),
         memory_gib,
         disk_gib: (above_floor.saturating_sub(download_bytes) >> 30).min(MAX_DISK_GIB),
-        // `host::check_pull_space`: room for the download twice.
-        download_fits: above_floor >= download_bytes.saturating_mul(2),
+        // `host::check_pull_space`, with `images::pull_reserve`.
+        download_fits: above_floor >= reserve,
     }
 }
 
@@ -1371,6 +1453,8 @@ pub struct NewVm {
     pub internet: bool,
     /// The live screen from the first start.
     pub live_screen: bool,
+    /// From an installer ISO: started, not ready to use.
+    pub installer: bool,
 }
 
 impl NewVm {
@@ -1409,7 +1493,12 @@ impl NewVm {
     }
 
     pub fn done(&self) -> String {
-        format!("{} is ready", printable(&self.name, 64))
+        let name = printable(&self.name, 64);
+        if self.installer {
+            format!("{name} started. Install the system on its screen.")
+        } else {
+            format!("{name} is ready")
+        }
     }
 
     /// A failed `new` leaves no VM behind, except one still on its way.
@@ -1722,7 +1811,7 @@ pub struct ResizeForm {
 /// stopped, so it uses nothing yet). Keeping or shrinking is always
 /// allowed, so the caps never go below what the VM has.
 pub fn resize_form(vm: &VmInfo, host: &HostInfo) -> ResizeForm {
-    let limits = limits(host, 0);
+    let limits = limits(host, 0, 0);
     // Whole GiB in the editor; a VM made with odd MiB keeps them unless
     // memory is changed.
     let memory_gib = (vm.memory_mib / 1024).max(1);
@@ -2588,6 +2677,8 @@ mod tests {
             forwards: vec![],
             agent_control: false,
             vnc: false,
+            image: None,
+            cdrom: None,
         }
     }
 
@@ -2893,7 +2984,15 @@ mod tests {
         assert_eq!(
             values(stopped),
             [
-                "Stopped", "2", "2 GiB", "20 GiB", "Unknown", "Off", "None", "None"
+                "Stopped",
+                "2",
+                "2 GiB",
+                "20 GiB",
+                "Unknown",
+                "Off",
+                "None",
+                "None",
+                "Not running"
             ]
         );
 
@@ -2939,6 +3038,7 @@ mod tests {
                 "On",
                 "127.0.0.1:8080 → 80\n[::1]:2222 → 22",
                 "eth0  10.0.2.15/24\nevil  fe80::1/64",
+                "Answering",
             ]
         );
         let addresses =
@@ -2948,6 +3048,29 @@ mod tests {
             addresses(Some(details(None)), "running"),
             "Unknown (install qemu-guest-agent in the VM to see addresses)"
         );
+        // The Guest Agent row: a VM from an installer ISO says what works
+        // without one; one from a cloud image, or from an older daemon,
+        // may still be starting. Addresses stay as they are.
+        let desk = |image: Option<&str>| VmInfo {
+            image: image.map(Into::into),
+            ..vm("running")
+        };
+        let installed = |image| {
+            let d = VmDetails {
+                vm: desk(image),
+                ..details(None)
+            };
+            let v = values(facts(&desk(image), Some(&d)));
+            assert!(v[7].starts_with("Unknown (install"), "{v:?}");
+            v[8].clone()
+        };
+        assert_eq!(installed(Some("fedora-44-workstation")), NO_GUEST_AGENT);
+        assert!(NO_GUEST_AGENT.starts_with("No guest agent answering"));
+        for other in [Some("ubuntu-26.04"), None] {
+            assert!(installed(other).starts_with("Not answering"), "{other:?}");
+        }
+        let unknown = values(facts(&desk(Some("fedora-44-workstation")), None));
+        assert_eq!(unknown[8], "Unknown");
         // The daemon cut the network of an internet VM.
         let cut = VmInfo {
             net: NetProfile::Internet,
@@ -3400,6 +3523,7 @@ mod tests {
             id: id.into(),
             name: format!("{id} cloud"),
             cached,
+            kind: None,
             os: Some(stallo::images::Os::Linux),
             trust: None,
             size_bytes,
@@ -3439,7 +3563,7 @@ mod tests {
         let host = roomy_host();
         // 2 cores stay with the host; 15 GiB + max(256, 960) MiB QEMU +
         // 64 MiB passt is exactly the 16 GiB budget; 20 GiB disk floor.
-        let l = limits(&host, 0);
+        let l = limits(&host, 0, 0);
         assert_eq!(
             l,
             Limits {
@@ -3459,7 +3583,7 @@ mod tests {
             ]
         );
         // A download still to come takes its space first.
-        assert_eq!(limits(&host, 4 << 30).disk_gib, 176);
+        assert_eq!(limits(&host, 4 << 30, 8 << 30).disk_gib, 176);
         // The defaults fit a roomy host.
         assert!(NEW_VCPUS <= l.vcpus);
         assert!(NEW_MEMORY_GIB <= l.memory_gib && NEW_DISK_GIB <= l.disk_gib);
@@ -3469,43 +3593,44 @@ mod tests {
             memory_used_mib: 14000,
             ..host.clone()
         };
-        assert_eq!(limits(&busy, 0).memory_gib, 2);
+        assert_eq!(limits(&busy, 0, 0).memory_gib, 2);
         let tight = HostInfo {
             memory_available_mib: 4096 + 1500,
             ..host.clone()
         };
-        assert_eq!(limits(&tight, 0).memory_gib, 1);
+        assert_eq!(limits(&tight, 0, 0).memory_gib, 1);
         // No disk beyond the daemon's largest.
         let huge = HostInfo {
             disk_free_bytes: 1 << 50,
             ..host.clone()
         };
-        assert_eq!(limits(&huge, 0).disk_gib, MAX_DISK_GIB);
+        assert_eq!(limits(&huge, 0, 0).disk_gib, MAX_DISK_GIB);
         // Nothing fits: Create says why.
         let small = HostInfo {
             cores: 2,
             ..host.clone()
         };
-        assert!(limits(&small, 0).block().unwrap().contains("processor"));
+        assert!(limits(&small, 0, 0).block().unwrap().contains("processor"));
         let full = HostInfo {
             memory_used_mib: 16000,
             ..host.clone()
         };
-        assert!(limits(&full, 0).block().unwrap().contains("memory"));
+        assert!(limits(&full, 0, 0).block().unwrap().contains("memory"));
         let disk = HostInfo {
             disk_free_bytes: 29 << 30,
             ..host.clone()
         };
-        assert_eq!(limits(&disk, 0).disk_gib, 9);
-        assert!(limits(&disk, 0).block().unwrap().contains("for this VM"));
-        // The daemon wants room for a download twice above the floor.
+        assert_eq!(limits(&disk, 0, 0).disk_gib, 9);
+        assert!(limits(&disk, 0, 0).block().unwrap().contains("for this VM"));
+        // The daemon wants room for the download's reserve above the floor
+        // (twice a cloud image, once an installer ISO).
         let edge = HostInfo {
             disk_free_bytes: 40 << 30,
             ..host.clone()
         };
-        assert!(limits(&edge, 10 << 30).download_fits);
-        assert_eq!(limits(&edge, 10 << 30).block(), None);
-        let short = limits(&edge, (10 << 30) + 1);
+        assert!(limits(&edge, 10 << 30, 20 << 30).download_fits);
+        assert_eq!(limits(&edge, 10 << 30, 20 << 30).block(), None);
+        let short = limits(&edge, 10 << 30, (20 << 30) + 1);
         assert!(!short.download_fits);
         assert!(short.block().unwrap().contains("download this image"));
         // Below the floor: no underflow.
@@ -3517,7 +3642,7 @@ mod tests {
             ..host
         };
         assert_eq!(
-            limits(&below, 4 << 30),
+            limits(&below, 4 << 30, 8 << 30),
             Limits {
                 vcpus: 0,
                 memory_gib: 0,
@@ -3553,7 +3678,7 @@ mod tests {
             },
         ];
         for host in hosts {
-            let l = limits(&host, 0);
+            let l = limits(&host, 0, 0);
             assert_eq!(l.block(), None, "{host:?}");
             // With the internet profile: the most overhead there is.
             let admit = |vcpus: u32, gib: u64, disk_gib: u64| {
@@ -3672,6 +3797,55 @@ mod tests {
         assert_eq!(named("Odd ("), pair("Odd", "Linux · ( · Downloaded"));
     }
 
+    /// Installers come after the cloud images, keep the catalog order and
+    /// reserve their download once; cloud images reserve it twice.
+    #[test]
+    fn installer_images() {
+        let iso = |id: &str, kind| ImageInfo {
+            kind,
+            ..image(id, false, None)
+        };
+        let rows = image_choices(&[
+            iso("fedora-44-workstation", Some(stallo::images::Kind::Iso)),
+            image("arch", false, None),
+            // An older daemon sends no kind: the catalog knows it.
+            iso("ubuntu-26.04-desktop", None),
+            image("ubuntu-26.04", true, None),
+        ]);
+        let order: Vec<(&str, bool)> = rows.iter().map(|r| (r.id.as_str(), r.installer)).collect();
+        assert_eq!(
+            order,
+            [
+                ("arch", false),
+                ("ubuntu-26.04", false),
+                ("fedora-44-workstation", true),
+                ("ubuntu-26.04-desktop", true),
+            ]
+        );
+        let fedora = stallo::images::find("fedora-44-workstation").unwrap();
+        assert_eq!(
+            (rows[2].download_bytes, rows[2].download_reserve),
+            (fedora.max_size, fedora.max_size)
+        );
+        assert_eq!(rows[0].download_reserve, 2 * rows[0].download_bytes);
+        assert_eq!((rows[1].download_bytes, rows[1].download_reserve), (0, 0));
+        // The CLI's default stays the first pick.
+        assert_eq!(default_image(&rows), 1);
+
+        // A desktop gets more, and its screen is how it is installed.
+        assert_eq!(new_defaults(&rows[2]), (2, 4, 32));
+        assert_eq!(new_defaults(&rows[0]), (2, 2, 20));
+        assert!(live_screen_lock(&rows[2]).unwrap().contains("Always on"));
+        assert_eq!(live_screen_lock(&rows[0]), None);
+        // Room for one copy of the ISO is enough.
+        let host = HostInfo {
+            disk_free_bytes: (20 << 30) + fedora.max_size,
+            ..roomy_host()
+        };
+        let l = limits(&host, rows[2].download_bytes, rows[2].download_reserve);
+        assert!(l.download_fits);
+    }
+
     #[test]
     fn first_image() {
         let pick = |images: &[ImageInfo]| default_image(&image_choices(images));
@@ -3718,6 +3892,7 @@ mod tests {
             disk_gib: 30,
             internet: true,
             live_screen: false,
+            installer: false,
         };
         let json = |r: Request| serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -3740,6 +3915,14 @@ mod tests {
         );
         assert_eq!(cached.progress(), "Starting web…");
         assert_eq!(plan.done(), "web is ready");
+        let desk = NewVm {
+            installer: true,
+            ..plan.clone()
+        };
+        assert_eq!(
+            desk.done(),
+            "web started. Install the system on its screen."
+        );
         assert_eq!(
             plan.failed(&CallError::Failed("a VM named web already exists".into())),
             Failure {
@@ -4103,6 +4286,44 @@ mod tests {
         }
     }
 
+    /// Eject Installer: one `set_cdrom` that empties the drive, from the
+    /// next start; the row shows only while an installer is in it.
+    #[test]
+    fn eject_installer() {
+        let sent: Vec<String> = Action::Eject
+            .requests("desk")
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        assert_eq!(sent, [r#"{"op":"set_cdrom","name":"desk","iso":null}"#]);
+        assert!(Action::Eject.lifecycle());
+        assert_eq!(Action::Eject.progress(), "Ejecting installer…");
+        assert_eq!(
+            Action::Eject
+                .done("desk", &serde_json::Value::Null)
+                .unwrap(),
+            "Installer ejected from desk. This takes effect the next time Stallo starts the VM (a restart inside the VM is not enough)."
+        );
+        let f = Action::Eject.failed("desk", &CallError::Failed("busy".into()));
+        assert!(f.title.starts_with("Could not eject the installer of desk"));
+
+        let attached = |cdrom: Option<&str>| VmInfo {
+            image: Some("fedora-44-workstation".into()),
+            cdrom: cdrom.map(Into::into),
+            ..vm("stopped")
+        };
+        let note = installer_note(&attached(Some("fedora-44-workstation"))).unwrap();
+        assert!(
+            note.starts_with("Fedora 44 Workstation")
+                && note.ends_with("(a restart inside the VM is not enough)."),
+            "{note}"
+        );
+        assert_eq!(installer_note(&attached(None)), None);
+        // An ISO only a newer daemon knows: its id, made printable.
+        let odd = installer_note(&attached(Some("new\u{202E}iso"))).unwrap();
+        assert!(odd.starts_with("new"), "{odd}");
+    }
+
     #[test]
     fn live_screen_actions() {
         let wire = |a: Action| {
@@ -4464,7 +4685,7 @@ mod tests {
     #[test]
     fn changing_resources() {
         let host = roomy_host();
-        let room = limits(&host, 0);
+        let room = limits(&host, 0, 0);
         let stopped = vm("stopped");
         assert_eq!(resize_block(&stopped), None);
         assert!(

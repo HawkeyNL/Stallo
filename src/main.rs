@@ -30,20 +30,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a VM, start it and wait until it is ready.
+    /// Create a VM, start it and wait until it is ready (a VM from an
+    /// installer ISO: until QEMU runs; install it over VNC).
     New {
         #[arg(default_value = "dev")]
         name: String,
         #[arg(long, default_value = "ubuntu-26.04")]
         image: String,
-        #[arg(long, default_value_t = 2)]
-        cpus: u32,
-        /// Memory, e.g. 2G or 1536M.
-        #[arg(long, default_value = "2G", value_parser = parse_mib)]
-        mem: u64,
-        /// Disk size, e.g. 20G.
-        #[arg(long, default_value = "20G", value_parser = parse_gib)]
-        disk: u64,
+        /// [default: 2]
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory, e.g. 2G or 1536M [default: 2G; 4G for an installer ISO].
+        #[arg(long, value_parser = parse_mib)]
+        mem: Option<u64>,
+        /// Disk size, e.g. 20G [default: 20G; 32G for an installer ISO].
+        #[arg(long, value_parser = parse_gib)]
+        disk: Option<u64>,
         #[arg(long, value_enum, default_value = "offline")]
         net: Net,
         /// Forward a host TCP port into the guest (`--net internet` only),
@@ -62,7 +64,8 @@ enum Cmd {
     },
     /// List VMs.
     Ls,
-    /// Start a stopped VM and wait until it is ready.
+    /// Start a stopped VM and wait until it is ready. A VM made from an
+    /// installer ISO is not waited for, even with a guest agent installed.
     Start {
         vm: String,
         #[arg(long)]
@@ -147,6 +150,10 @@ enum Cmd {
         /// Memory, e.g. 4G or 1536M (the VM must be stopped).
         #[arg(long, value_parser = parse_mib, group = "change")]
         mem: Option<u64>,
+        /// Empty the CD-ROM drive of a VM made from an installer ISO
+        /// (`eject`), or put a pulled ISO in it (its image id).
+        #[arg(long, value_name = "eject|ISO", group = "change")]
+        cdrom: Option<String>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
@@ -293,12 +300,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .iter()
                 .map(|f| stallo::net::parse_forward(f, bind))
                 .collect::<Result<_>>()?;
+            let (def_cpus, def_mem, def_disk) = new_defaults(&image);
             let v = call(Request::New {
+                vcpus: cpus.unwrap_or(def_cpus),
+                memory_mib: mem.unwrap_or(def_mem),
+                disk_gib: disk.unwrap_or(def_disk),
                 name,
                 image,
-                vcpus: cpus,
-                memory_mib: mem,
-                disk_gib: disk,
                 net,
                 forwards,
                 wait: !no_wait,
@@ -456,7 +464,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{vm}  {}", restored_line(&r));
             }
         }
-        Cmd::Set { vm, vnc, cpus, mem } => {
+        Cmd::Set {
+            vm,
+            vnc,
+            cpus,
+            mem,
+            cdrom,
+        } => {
             // First, so a running VM is refused before VNC changes.
             let resources = if cpus.is_some() || mem.is_some() {
                 let v = call(Request::SetResources {
@@ -500,8 +514,39 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 vnc_result = Some(v);
             }
+            let mut cdrom_result = None;
+            if let Some(cdrom) = cdrom {
+                let iso = (cdrom != "eject").then_some(cdrom);
+                let v = call(Request::SetCdrom {
+                    name: vm.clone(),
+                    iso: iso.clone(),
+                })
+                .await
+                .map_err(|e| match (&resources, &vnc_result) {
+                    (None, None) => e,
+                    _ => e.context(format!(
+                        "the other changes of {vm} were applied, the CD-ROM change was not"
+                    )),
+                })?;
+                if !json {
+                    let when = if v["running"] == true {
+                        " from the next start"
+                    } else {
+                        ""
+                    };
+                    match &iso {
+                        Some(iso) => println!("{vm}  cdrom {iso}{when}"),
+                        None => println!("{vm}  cdrom ejected{when}"),
+                    }
+                }
+                cdrom_result = Some(v);
+            }
             if json {
-                print_json(&serde_json::json!({"resources": resources, "vnc": vnc_result}));
+                print_json(&serde_json::json!({
+                    "resources": resources,
+                    "vnc": vnc_result,
+                    "cdrom": cdrom_result,
+                }));
             }
         }
         Cmd::Agent { vm, state } => {
@@ -852,9 +897,19 @@ fn snaps_table(list: &[Snapshot], now: u64) -> String {
     out
 }
 
+/// `stallo new`'s (vcpus, memory MiB, disk GiB) for `image`: a desktop
+/// installed from an ISO needs more than a cloud image.
+fn new_defaults(image: &str) -> (u32, u64, u64) {
+    match stallo::images::find(image).map(|e| e.kind) {
+        Ok(stallo::images::Kind::Iso) => (2, 4096, 32),
+        _ => (2, 2048, 20),
+    }
+}
+
 fn images_table(images: &[ImageInfo]) -> String {
+    let w = images.iter().map(|i| i.id.len()).fold(16, usize::max);
     let mut s = format!(
-        "{:<16} {:<14} {:>9}  {:<12} NOTES\n",
+        "{:<w$} {:<14} {:>9}  {:<12} NOTES\n",
         "ID", "STATE", "SIZE", "TRUST"
     );
     for i in images {
@@ -868,7 +923,7 @@ fn images_table(images: &[ImageInfo]) -> String {
             .collect::<Vec<_>>()
             .join("; ");
         s.push_str(&format!(
-            "{:<16} {:<14} {:>9}  {:<12} {notes}\n",
+            "{:<w$} {:<14} {:>9}  {:<12} {notes}\n",
             i.id,
             state,
             size,
@@ -1067,6 +1122,15 @@ mod tests {
     }
 
     #[test]
+    fn defaults_per_image_kind() {
+        assert_eq!(new_defaults("ubuntu-26.04"), (2, 2048, 20));
+        assert_eq!(new_defaults("fedora-44-workstation"), (2, 4096, 32));
+        assert_eq!(new_defaults("ubuntu-26.04-desktop"), (2, 4096, 32));
+        // An image only a newer daemon knows: the cloud defaults.
+        assert_eq!(new_defaults("other"), (2, 2048, 20));
+    }
+
+    #[test]
     fn images_columns() {
         let v = serde_json::json!([{"id": "ubuntu-26.04", "name": "Ubuntu", "cached": false,
             "os": "linux", "trust": "signed-sums", "size_bytes": 865115136,
@@ -1084,6 +1148,14 @@ mod tests {
         assert_eq!(
             table.lines().nth(1),
             Some("ubuntu-26.04     cached                 -  -            Ubuntu")
+        );
+        // A longer id widens the column.
+        let long =
+            serde_json::json!([{"id": "fedora-44-workstation", "name": "F", "cached": false}]);
+        let images: Vec<ImageInfo> = serde_json::from_value(long).unwrap();
+        assert_eq!(
+            images_table(&images).lines().nth(1),
+            Some("fedora-44-workstation not downloaded         -  -            F")
         );
     }
 
@@ -1288,6 +1360,17 @@ mod tests {
             }
         ));
         assert!(set(&["--mem", "1G", "--vnc", "off"]).is_ok());
+        let c = set(&["--cdrom", "eject", "--vnc", "on"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                cdrom: Some(ref c),
+                vnc: Some(OnOff::On),
+                ..
+            } if c == "eject"
+        ));
+        assert!(set(&["--cdrom", "fedora-44-workstation"]).is_ok());
+        assert!(set(&["--cdrom"]).is_err());
         assert!(set(&[]).is_err(), "at least one setting");
         assert!(set(&["--mem", "2T"]).is_err());
         let c = Cli::try_parse_from(["stallo", "new", "dev", "--vnc"]).unwrap();

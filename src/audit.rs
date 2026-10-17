@@ -35,7 +35,8 @@ pub struct Entry {
     pub pid: Option<i32>,
     pub via: Via,
     pub op: &'static str,
-    /// The image `pull` and `image_rm` act on, if it is a valid image id.
+    /// The image `pull`, `image_rm` and `set_cdrom` act on, if it is a
+    /// valid image id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// Sizes in bytes (or counts) of the arguments that carry content.
@@ -157,6 +158,13 @@ pub fn describe(r: &Request) -> Described<'_> {
         }
         Request::SetAgent { name, on } => ("agent", Some(name), vec![("on", u64::from(*on))], None),
         Request::SetVnc { name, on } => ("vnc", Some(name), vec![("on", u64::from(*on))], None),
+        // The ISO is in `image` (see [`image`]).
+        Request::SetCdrom { name, iso } => (
+            "set_cdrom",
+            Some(name),
+            vec![("eject", u64::from(iso.is_none()))],
+            None,
+        ),
         // The requested values (0: unchanged); numbers, not content.
         Request::SetResources {
             name,
@@ -178,11 +186,16 @@ pub fn describe(r: &Request) -> Described<'_> {
     }
 }
 
-/// The image a request acts on (`pull`, `image_rm`), if its id is valid:
-/// anything else is untrusted text and stays out of the log.
+/// The image a request acts on (`pull`, `image_rm`, the ISO of
+/// `set_cdrom`), if its id is valid: anything else is untrusted text and
+/// stays out of the log.
 pub fn image(r: &Request) -> Option<String> {
     match r {
-        Request::Pull { image } | Request::ImageRm { image } => {
+        Request::Pull { image }
+        | Request::ImageRm { image }
+        | Request::SetCdrom {
+            iso: Some(image), ..
+        } => {
             crate::config::validate_image_id(image).ok()?;
             Some(image.clone())
         }
@@ -409,6 +422,22 @@ mod tests {
         };
         assert_eq!(image(&bad), None);
         assert_eq!(image(&Request::List), None);
+        // `set_cdrom` names the ISO it puts in; an eject names none.
+        let mut cd = Request::SetCdrom {
+            name: "desk".into(),
+            iso: Some("fedora-44-workstation".into()),
+        };
+        assert_eq!(
+            describe(&cd),
+            ("set_cdrom", Some("desk"), vec![("eject", 0)], None)
+        );
+        assert_eq!(image(&cd).as_deref(), Some("fedora-44-workstation"));
+        let Request::SetCdrom { iso, .. } = &mut cd else {
+            unreachable!()
+        };
+        *iso = None;
+        assert_eq!(describe(&cd).2, [("eject", 1)]);
+        assert_eq!(image(&cd), None);
         let e = Entry {
             time_ms: 1,
             uid: 1000,

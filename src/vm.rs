@@ -165,7 +165,7 @@ pub struct Manager {
     /// VM creation shares it while it builds a disk on an image. Lock
     /// order: a VM's lifecycle lock, then this one. Pulls and removals
     /// take no VM lock.
-    images: tokio::sync::RwLock<()>,
+    pub(crate) images: tokio::sync::RwLock<()>,
     /// Serialises admission: checking what fits and starting it is atomic.
     admission: tokio::sync::Mutex<()>,
     /// VMs whose disk a `stallo run` clone uses; their lifecycle lock is
@@ -317,13 +317,13 @@ impl Manager {
     pub async fn pull(&self, id: &str) -> Result<()> {
         let entry = images::find(id)?;
         let _guard = self.images.write().await;
-        if !images::image_path(&self.paths, id).is_file() {
+        if !images::cached_path(&self.paths, &entry).is_file() {
             let dir = self.paths.images_dir();
             ensure_private_dir(&dir)?;
             host::check_pull_space(
                 host::disk_free(&dir)?,
                 self.config.host.disk_floor_gib,
-                entry.max_size,
+                images::pull_reserve(&entry),
                 images::resumable_bytes(&self.paths, &entry),
             )?;
         }
@@ -331,9 +331,12 @@ impl Manager {
     }
 
     /// Deletes a cached image (`stallo images rm`). Refused while any VM,
-    /// stopped or a `stallo run` clone included, was made from it: by its
-    /// `vm.toml`, or by its disk's backing file (also for a VM directory
-    /// whose `vm.toml` is missing or broken).
+    /// stopped or a `stallo run` clone included, was made from it or has it
+    /// in its CD-ROM drive: by its `vm.toml` or by its disk's backing file.
+    /// A running VM counts with the ISO it started with: an eject in its
+    /// `vm.toml` empties the drive only at the next start. Fails closed: a
+    /// VM directory whose `vm.toml` or disk cannot be read refuses the
+    /// removal.
     pub async fn remove_image(&self, id: &str) -> Result<()> {
         validate_image_id(id)?;
         let _guard = self.images.write().await;
@@ -346,7 +349,12 @@ impl Manager {
             }
             let (dir, name) = (entry.path(), entry.file_name());
             let name = name.to_string_lossy();
-            let by_config = VmConfig::load(&dir).is_ok_and(|c| c.image == id);
+            let cfg = VmConfig::load(&dir).with_context(|| {
+                format!(
+                    "cannot tell whether {name} uses image {id}; if a `stallo run` is in progress, try again when it ends, otherwise remove it first (stallo rm {name}) or move it out of the vms directory"
+                )
+            })?;
+            let by_config = cfg.image == id || cfg.cdrom.as_deref() == Some(id);
             // A disk is written by its QEMU: only its file name counts, and
             // a disk that cannot be read refuses the removal.
             let by_disk = images::backing_file(&dir.join(qemu::DISK))
@@ -356,7 +364,14 @@ impl Manager {
                 users.push(name.into_owned());
             }
         }
+        // Started before an eject: the ISO is still in the live drive.
+        for vm in self.all_running() {
+            if vm.config.cdrom.as_deref() == Some(id) {
+                users.push(vm.config.name.clone());
+            }
+        }
         users.sort();
+        users.dedup();
         ensure!(
             users.is_empty(),
             "image {id} is in use by {}; remove those VMs first (stallo rm)",
@@ -371,11 +386,20 @@ impl Manager {
 
     /// Creates the VM's directory, disk, firmware variables, password and
     /// seed. On failure nothing is left behind.
+    ///
+    /// A VM from an installer ISO gets a blank disk, the ISO in its CD-ROM
+    /// drive, VNC (the install is done by hand) and no seed or password.
     pub async fn create(&self, new: &NewVm) -> Result<VmConfig> {
         validate_name(&new.name)?;
         ensure!(
             !new.name.starts_with(RUN_PREFIX),
             "names starting with {RUN_PREFIX} are kept for `stallo run`"
+        );
+        let iso = images::find(&new.image)?.kind == images::Kind::Iso;
+        // The agent gate refuses this already; fail closed here too.
+        ensure!(
+            !(iso && new.agent_control),
+            "agents may not create VMs from installer ISOs"
         );
         let cfg = VmConfig {
             name: new.name.clone(),
@@ -388,7 +412,8 @@ impl Manager {
             agent_control: new.agent_control,
             throwaway_of: None,
             forwards: new.forwards.clone(),
-            vnc: new.vnc,
+            vnc: new.vnc || iso,
+            cdrom: iso.then(|| new.image.clone()),
         };
         cfg.validate()?;
         // Refuse early, before downloading or writing anything.
@@ -428,6 +453,12 @@ impl Manager {
     async fn populate(&self, cfg: &VmConfig) -> Result<()> {
         let dir = self.paths.vm_dir(&cfg.name);
         let entry = images::find(&cfg.image)?;
+        if entry.kind == images::Kind::Iso {
+            qemu::create_disk(None, &dir.join(qemu::DISK), cfg.disk_gib).await?;
+            qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
+            ensure_private_dir(&dir.join(qemu::STATES))?;
+            return cfg.save(&dir);
+        }
         let base = images::image_path(&self.paths, &cfg.image);
         let info = images::check_image(&base).await?;
         ensure!(
@@ -436,7 +467,7 @@ impl Manager {
             info.virtual_size.div_ceil(1 << 30),
             cfg.image
         );
-        qemu::create_disk(&base, &dir.join(qemu::DISK), cfg.disk_gib).await?;
+        qemu::create_disk(Some(&base), &dir.join(qemu::DISK), cfg.disk_gib).await?;
         qemu::create_vars(&dir.join(qemu::VARS), entry.firmware).await?;
         ensure_private_dir(&dir.join(qemu::STATES))?;
 
@@ -510,7 +541,20 @@ impl Manager {
         // An image that left the catalog gets no drop-in: on a disk that
         // already booted, the guest agent need not wait for cloud-init.
         let agent = images::find(&cfg.image).map_or(images::Agent::Deb, |e| e.agent);
-        let mut argv = qemu::argv(&cfg, &vm_dir, &rt_dir, qemu_fd, vnc.as_deref(), agent)?;
+        let iso = self.cdrom(&cfg)?;
+        let media = match &iso {
+            Some(iso) => qemu::Media::Cdrom(iso.as_deref()),
+            None => qemu::Media::Seed,
+        };
+        let mut argv = qemu::argv(
+            &cfg,
+            &vm_dir,
+            &rt_dir,
+            qemu_fd,
+            vnc.as_deref(),
+            agent,
+            media,
+        )?;
         // Production: the guest's CPUs wait until the spawn checks (AppArmor
         // label, VNC socket, passt) have passed, so no guest code runs in
         // a QEMU that is about to be refused.
@@ -556,6 +600,25 @@ impl Manager {
                 Err(e)
             }
         }
+    }
+
+    /// For a VM made from an installer ISO, its CD-ROM drive: the attached
+    /// ISO's path, or `None` if empty. `None` for a VM from a cloud image
+    /// (or from an image that left the catalog), which has a seed instead.
+    /// Fails closed unless the drive holds a catalog ISO.
+    fn cdrom(&self, cfg: &VmConfig) -> Result<Option<Option<PathBuf>>> {
+        if !images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso) {
+            return Ok(None);
+        }
+        let Some(id) = &cfg.cdrom else {
+            return Ok(Some(None));
+        };
+        ensure!(
+            images::find(id)?.kind == images::Kind::Iso,
+            "{id} in the CD-ROM drive of {} is not an installer ISO",
+            cfg.name
+        );
+        Ok(Some(Some(images::iso_path(&self.paths, id))))
     }
 
     /// Whether `cfg`'s network profile may start here. Fail closed: the
@@ -629,7 +692,11 @@ impl Manager {
         if self.mode == Mode::Production {
             confine::apparmor_on_exec(&mut cmd);
         }
-        let mut backing = vec![images::image_path(&self.paths, &cfg.image)];
+        // A VM from an ISO has a blank disk: no base image, the ISO instead.
+        let mut backing = match self.cdrom(cfg)? {
+            Some(iso) => iso.into_iter().collect(),
+            None => vec![images::image_path(&self.paths, &cfg.image)],
+        };
         if let Some(source) = &cfg.throwaway_of {
             backing.push(self.paths.vm_dir(source).join(qemu::DISK));
         }
@@ -826,6 +893,40 @@ impl Manager {
             "{name} is a `stallo run` clone; it has no VNC"
         );
         cfg.vnc = on;
+        cfg.save(&self.paths.vm_dir(name))
+    }
+
+    /// Puts pulled installer ISO `iso` into the CD-ROM drive of a VM made
+    /// from an ISO, or empties the drive (`None`); it takes effect at the
+    /// next start. A RAM snapshot restored later runs with the drive as it
+    /// is then, as if the disc had been swapped while the guest ran.
+    pub async fn set_cdrom(&self, name: &str, iso: Option<&str>) -> Result<()> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        ensure!(
+            images::find(&cfg.image).is_ok_and(|e| e.kind == images::Kind::Iso),
+            "{name} has no CD-ROM drive; only VMs made from an installer ISO have one"
+        );
+        // Held until vm.toml names the ISO, so `images rm` sees it. Not
+        // waited for: a pull holds it for its whole download, and the VM's
+        // lock (stop, start) must not wait that long.
+        let _image = self.images.try_read().map_err(|_| {
+            anyhow::anyhow!("an image pull or removal is in progress; try again when it ends")
+        })?;
+        if let Some(id) = iso {
+            let entry = images::find(id)?;
+            ensure!(
+                entry.kind == images::Kind::Iso,
+                "{id} is not an installer ISO; see `stallo images`"
+            );
+            images::ensure_pulled(&self.paths, id)?;
+        }
+        cfg.cdrom = iso.map(str::to_owned);
         cfg.save(&self.paths.vm_dir(name))
     }
 
@@ -1896,6 +1997,7 @@ mod tests {
                 throwaway_of: None,
                 forwards: vec![],
                 vnc: false,
+                cdrom: None,
             },
             pid: 0,
             qmp,
@@ -2159,6 +2261,53 @@ mod tests {
             "--scope --quiet --collect --expand-environment=no -p KillSignal=SIGKILL -p RuntimeMaxSec=1500ms -- \
              setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
         );
+    }
+
+    /// `images rm` keeps an ISO that a running VM started with, even after
+    /// an eject in its vm.toml (it applies at the next start).
+    #[tokio::test]
+    async fn image_rm_sees_the_live_drive() {
+        use crate::config::{DaemonConfig, Mode};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        m.cleanup_leftovers().await.unwrap();
+        let id = "fedora-44-workstation";
+        ensure_private_dir(&m.paths.images_dir()).unwrap();
+        fs::write(images::iso_path(&m.paths, id), b"iso").unwrap();
+        let (_d, mut running, _) = fake_vm("running", None).await;
+        // Made from another ISO, so only the drive names this one.
+        running.config.image = "ubuntu-26.04-desktop".into();
+        running.config.cdrom = Some(id.into());
+        let ejected = VmConfig {
+            cdrom: None,
+            ..running.config.clone()
+        };
+        let dir = m.paths.vm_dir("dev");
+        fs::create_dir(&dir).unwrap();
+        ejected.save(&dir).unwrap();
+        m.running
+            .lock()
+            .unwrap()
+            .insert("dev".into(), Arc::new(running));
+        let e = m.remove_image(id).await.unwrap_err().to_string();
+        assert!(e.contains("in use by dev;"), "{e}");
+        // Stopped, the eject has applied.
+        m.running.lock().unwrap().clear();
+        m.remove_image(id).await.unwrap();
+        assert!(!images::iso_path(&m.paths, id).exists());
     }
 
     /// `set_resources`: limits and host checks of `new`, stopped VMs only,

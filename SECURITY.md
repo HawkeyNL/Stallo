@@ -70,11 +70,24 @@ file private and rotate it by restarting with a new one.
 A cached image is a VM disk's read-only base, so `stallo images rm` (humans
 only) is refused while any VM, stopped VMs and `stallo run` clones
 included, names it in `vm.toml` or has a disk whose qcow2 header names it
-as backing file; it never follows symlinks. A pull needs the disk floor
-plus twice the image's largest size free, so a download cannot push the
-host below the floor. Signatures on moving URLs are refused when too old:
+as backing file, and while a VM directory's `vm.toml` cannot be read (it
+might name the image); it never follows symlinks. A pull needs the disk
+floor plus twice the image's largest size free (once for an installer
+ISO, which is kept as downloaded), so a download cannot push the host
+below the floor. Signatures on moving URLs are refused when too old:
 over 90 days for Ubuntu's `current/` checksum lists, over 45 days for
 Arch's `latest/` image.
+
+Installer ISOs are verified like images (a signed checksum list, then the
+SHA-256), but are otherwise untrusted guest input: the host never mounts or
+parses them (no `qemu-img`); only QEMU reads them, as a raw (never
+probed), read-only CD-ROM. Landlock grants that QEMU read access to the one
+ISO in its drive, and the AppArmor profile allows `images/*.iso`
+read-only. `images rm` is refused while a VM has the ISO in its drive,
+including a running VM whose drive was ejected in its settings but not
+yet restarted.
+Such a guest is the user's own system: it gets none of the SMBIOS systemd
+credentials that tune the boot of Stallo's cloud guests.
 
 ## Agent policy
 
@@ -85,7 +98,12 @@ VM creation unless `agents_can_create = true` in `stallod.toml`, and
 never lets agents delete VMs, pull or delete images, resume VMs, change
 agent control, turn VNC on (also not through `new`) or change a VM's CPUs
 and memory: agent control of a small VM must not let an agent claim the
-host's CPU and memory budget. Agents create VMs only from images a human has already pulled
+host's CPU and memory budget. Nor may agents create VMs from installer
+ISOs (or from images the daemon does not know as cloud images) or change
+what is in a VM's CD-ROM drive: those are installed by hand over VNC. Such
+a guest has no guest agent until its user installs one: until then,
+agent control of it covers the screen, input, power and snapshots, but
+not files or commands. Agents create VMs only from images a human has already pulled
 (`stallo images pull <id>`). Turning agent control off stops new agent
 calls; calls already running (an `exec` can run up to an hour) finish
 first.

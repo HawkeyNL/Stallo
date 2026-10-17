@@ -405,7 +405,8 @@ pub struct Restored {
     /// After a RAM snapshot: how long after the load the guest agent
     /// answered again (reconnected and synced), in milliseconds, roughly.
     /// `None` if it did not within 10 s (for example, the snapshot was taken
-    /// before the agent ran) or the VM is not running.
+    /// before the agent ran), the VM is not running, or it was installed
+    /// from an ISO (not waited for).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_ms: Option<u64>,
 }
@@ -645,8 +646,12 @@ impl Manager {
         };
         // The old agent connection was dropped with the load: reconnect and
         // sync now, so the caller knows the guest is usable. Never fails
-        // the restore, which has happened.
-        let agent = if state == "running" {
+        // the restore, which has happened. Not for a guest installed from
+        // an ISO: it rarely has an agent, and the wait would only add 10 s.
+        let has_agent = self
+            .load(name)
+            .map_or(true, |c| crate::images::has_agent(&c.image));
+        let agent = if state == "running" && has_agent {
             self.wait_ready(name, AGENT_AFTER_RESTORE)
                 .await
                 .inspect_err(|e| tracing::warn!("{name}: {e:#}"))

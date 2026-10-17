@@ -370,6 +370,7 @@ async fn dispatch(
                 // Agents never get here with vnc (Gate::Closed).
                 vnc,
             };
+            let wait = wait && images::has_agent(&new.image);
             let started = Instant::now();
             m.create(&new).await?;
             // `new` is all or nothing: a VM that never became ready is
@@ -405,7 +406,7 @@ async fn dispatch(
         }
         Request::Start { name, wait } => {
             m.start(&name).await?;
-            if wait {
+            if wait && images::has_agent(&m.load(&name)?.image) {
                 m.wait_ready(&name, READY_TIMEOUT).await?;
             }
             json!(info(m, &m.load(&name)?).await)
@@ -558,6 +559,13 @@ async fn dispatch(
                 "socket": on.then(|| m.paths.vnc_socket(&name)),
             })
         }
+        Request::SetCdrom { name, iso } => {
+            m.set_cdrom(&name, iso.as_deref()).await?;
+            json!({
+                "running": m.running(&name).is_some(),
+                "cdrom": iso,
+            })
+        }
         Request::SetResources {
             name,
             vcpus,
@@ -583,7 +591,7 @@ async fn dispatch(
                 .into_iter()
                 .map(|e| {
                     let cached = images::is_cached(&m.paths, &e);
-                    let size_bytes = std::fs::metadata(images::image_path(&m.paths, &e.id))
+                    let size_bytes = std::fs::metadata(images::cached_path(&m.paths, &e))
                         .ok()
                         .filter(|f| f.is_file())
                         .map(|f| f.len());
@@ -594,6 +602,9 @@ async fn dispatch(
                     if e.trust == images::Trust::Pinned {
                         notes.push("pinned (upstream unsigned)".into());
                     }
+                    if e.kind == images::Kind::Iso {
+                        notes.push("install by hand over VNC; no guest agent".into());
+                    }
                     if e.firmware == images::Firmware::Uefi {
                         notes.push("no Secure Boot".into());
                     }
@@ -602,6 +613,7 @@ async fn dispatch(
                         .and_then(|p| p.sig_date);
                     ImageInfo {
                         cached,
+                        kind: Some(e.kind),
                         os: Some(e.os),
                         trust: Some(e.trust),
                         size_bytes,
@@ -653,5 +665,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         forwards: cfg.forwards.clone(),
         agent_control: cfg.agent_control,
         vnc: cfg.vnc,
+        image: Some(cfg.image.clone()),
+        cdrom: cfg.cdrom.clone(),
     }
 }

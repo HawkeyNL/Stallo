@@ -13,6 +13,11 @@
 //! images are read-only and never replaced, because VM disks are overlays on
 //! them; `stallo images rm` deletes one that no VM uses.
 //!
+//! An installer ISO (`kind = "iso"`) is verified the same way, up to its
+//! SHA-256; it is untrusted guest input that only QEMU reads, so nothing on
+//! the host mounts or parses it (no `qemu-img`). It is cached as
+//! `<id>.iso`, read-only.
+//!
 //! Keyrings are host files (Ubuntu's, from its keyring packages) or
 //! vendored in `catalog/keys/` and compiled in.
 //!
@@ -48,9 +53,11 @@ use crate::run_tool;
 pub struct CatalogEntry {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub kind: Kind,
     pub os: Os,
     pub firmware: Firmware,
-    /// The qcow2 image (HTTPS).
+    /// The qcow2 image or installer ISO (HTTPS).
     pub url: String,
     /// Largest image download accepted, in bytes.
     pub max_size: u64,
@@ -92,6 +99,19 @@ pub struct CatalogEntry {
     /// their old signatures stay valid. (`signed-image` always checks it.)
     #[serde(default)]
     pub moving: bool,
+}
+
+/// What the catalog entry downloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    /// A qcow2 cloud image: VM disks are overlays on it, and the seed ISO
+    /// sets the guest up.
+    #[default]
+    CloudImage,
+    /// An installer ISO, attached as a read-only CD-ROM to a blank disk. The
+    /// user installs over VNC.
+    Iso,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +159,8 @@ pub enum Agent {
     Preinstalled,
     /// `.deb` packages on the seed ISO.
     Deb,
+    /// None until the user installs one: installer ISOs, which get no seed.
+    Manual,
 }
 
 impl CatalogEntry {
@@ -207,11 +229,25 @@ impl CatalogEntry {
                 !self.debs.is_empty() && !self.deb_sources.is_empty() && self.deb_keyring.is_some(),
                 "{id}: agent \"deb\" needs debs, deb_sources and deb_keyring"
             ),
-            Agent::Preinstalled => ensure!(
+            Agent::Preinstalled | Agent::Manual => ensure!(
                 self.debs.is_empty() && self.deb_sources.is_empty() && self.deb_keyring.is_none(),
-                "{id}: a preinstalled agent takes no debs, deb_sources or deb_keyring"
+                "{id}: a preinstalled or manual agent takes no debs, deb_sources or deb_keyring"
             ),
         }
+        ensure!(
+            (self.kind == Kind::Iso) == (self.agent == Agent::Manual),
+            "{id}: an ISO, and only an ISO, has agent \"manual\""
+        );
+        // An ISO gets no seed (so nothing for qga_permissive to do), and the
+        // internet profile is not verified with any installer.
+        ensure!(
+            self.kind == Kind::CloudImage
+                || (self.trust == Trust::SignedSums
+                    && self.url.ends_with(".iso")
+                    && !self.qga_permissive
+                    && !self.internet),
+            "{id}: an ISO needs signed-sums and a .iso url, and takes no qga_permissive or internet"
+        );
         // Both go into sources.list lines: no options, comments or breaks.
         let plain = |w: &str| {
             !w.is_empty()
@@ -280,6 +316,8 @@ const CATALOG: &[&str] = &[
     include_str!("../catalog/fedora-44.toml"),
     include_str!("../catalog/arch.toml"),
     include_str!("../catalog/debian-13.toml"),
+    include_str!("../catalog/ubuntu-26.04-desktop.toml"),
+    include_str!("../catalog/fedora-44-workstation.toml"),
 ];
 
 /// OpenPGP keyrings (binary) that catalog entries name in `keyring` or
@@ -338,6 +376,19 @@ pub fn image_path(paths: &Paths, id: &str) -> PathBuf {
     paths.images_dir().join(format!("{id}.qcow2"))
 }
 
+/// `<data>/images/<id>.iso`.
+pub fn iso_path(paths: &Paths, id: &str) -> PathBuf {
+    paths.images_dir().join(format!("{id}.iso"))
+}
+
+/// Where a pull of `entry` caches its image or ISO.
+pub fn cached_path(paths: &Paths, entry: &CatalogEntry) -> PathBuf {
+    match entry.kind {
+        Kind::CloudImage => image_path(paths, &entry.id),
+        Kind::Iso => iso_path(paths, &entry.id),
+    }
+}
+
 /// `<data>/images/<id>.debs/`.
 pub fn debs_dir(paths: &Paths, id: &str) -> PathBuf {
     paths.images_dir().join(format!("{id}.debs"))
@@ -367,8 +418,26 @@ pub fn pulled(paths: &Paths, id: &str) -> Option<Pulled> {
 
 /// Whether the image and its guest-agent packages (if any) are cached.
 pub fn is_cached(paths: &Paths, entry: &CatalogEntry) -> bool {
-    image_path(paths, &entry.id).is_file()
-        && (entry.agent == Agent::Preinstalled || debs_dir(paths, &entry.id).is_dir())
+    cached_path(paths, entry).is_file()
+        && (entry.agent != Agent::Deb || debs_dir(paths, &entry.id).is_dir())
+}
+
+/// Disk space a pull of `entry` may take: a cloud image twice its largest
+/// size (the download plus as much headroom for its conversion), an ISO,
+/// cached as downloaded, once.
+pub fn pull_reserve(entry: &CatalogEntry) -> u64 {
+    match entry.kind {
+        Kind::CloudImage => entry.max_size.saturating_mul(2),
+        Kind::Iso => entry.max_size,
+    }
+}
+
+/// Whether a VM from image `id` has a guest agent to wait for. A guest
+/// installed from an ISO has none unless its user installs one, and
+/// nothing tells a missing agent from a slow one, so waits skip it. An
+/// image that left the catalog counts as having one.
+pub fn has_agent(id: &str) -> bool {
+    find(id).map_or(true, |e| e.agent != Agent::Manual)
 }
 
 /// Refuses an image that is not cached: agents create VMs only from
@@ -424,6 +493,7 @@ pub fn remove(paths: &Paths, id: &str) -> Result<bool> {
     // The image first: without it nothing counts as cached.
     for name in [
         format!("{id}.qcow2"),
+        format!("{id}.iso"),
         format!("{id}.toml"),
         format!("{id}.debs"),
         format!(".partial-{id}"),
@@ -499,7 +569,7 @@ pub fn backing_file(disk: &Path) -> Result<Option<String>> {
 /// Downloads and verifies whatever of `entry` is not cached yet.
 pub async fn pull(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     ensure_private_dir(&paths.images_dir())?;
-    if !image_path(paths, &entry.id).is_file() {
+    if !cached_path(paths, entry).is_file() {
         pull_image(paths, entry).await?;
     }
     if entry.agent == Agent::Deb && !debs_dir(paths, &entry.id).is_dir() {
@@ -533,7 +603,10 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
             (image, vec![])
         }
     };
-    if let Err(e) = check_image(&image).await {
+    // An ISO is only ever read by QEMU: its SHA-256 is all the host checks.
+    if entry.kind == Kind::CloudImage
+        && let Err(e) = check_image(&image).await
+    {
         // Otherwise the next pull would find the same file complete.
         safe_remove(&root, &image)?;
         return Err(e);
@@ -551,8 +624,9 @@ async fn pull_image(paths: &Paths, entry: &CatalogEntry) -> Result<()> {
     fs::File::open(&tmp)?.sync_all()?;
     fs::rename(&tmp, record_path(paths, &entry.id))?;
     // A hard link fails if the target exists: a cached base image is never
-    // replaced, because VM disks are overlays on it.
-    fs::hard_link(&image, image_path(paths, &entry.id))?;
+    // replaced, because VM disks are overlays on it (and VMs boot from a
+    // cached ISO).
+    fs::hard_link(&image, cached_path(paths, entry))?;
     fs::File::open(&root)?.sync_all()?;
     safe_remove(&root, &work)?;
     Ok(())
@@ -1157,13 +1231,41 @@ mod tests {
         );
         assert_eq!(e.debs, ["qemu-guest-agent"]);
         assert_eq!(e.deb_keyring.as_deref(), Some("debian-archive-trixie.gpg"));
+        let e = find("ubuntu-26.04-desktop").unwrap();
+        assert_eq!(e.file(), "ubuntu-26.04.1-desktop-amd64.iso");
+        assert_eq!(
+            (e.kind, e.trust, e.sums_format, e.agent, e.moving),
+            (
+                Kind::Iso,
+                Trust::SignedSums,
+                Some(SumsFormat::Gnu),
+                Agent::Manual,
+                false
+            )
+        );
+        let e = find("fedora-44-workstation").unwrap();
+        assert_eq!(e.file(), "Fedora-Workstation-Live-44-1.7.x86_64.iso");
+        assert_eq!(
+            (e.kind, e.sums_format, e.agent, e.sig_url.as_deref()),
+            (Kind::Iso, Some(SumsFormat::Bsd), Agent::Manual, Some(""))
+        );
+        for e in catalog() {
+            assert_eq!(
+                e.kind == Kind::Iso,
+                e.id.ends_with("-desktop") || e.id.ends_with("-workstation")
+            );
+        }
         assert!(find("../x").is_err());
     }
 
     /// The built-in entry with `edit` applied: a TOML value sets a key,
     /// `None` removes it.
     fn entry_with(edit: &[(&str, Option<&str>)]) -> Result<CatalogEntry> {
-        let mut t: toml::Table = toml::from_str(CATALOG[0])?;
+        edited(CATALOG[0], edit)
+    }
+
+    fn edited(text: &str, edit: &[(&str, Option<&str>)]) -> Result<CatalogEntry> {
+        let mut t: toml::Table = toml::from_str(text)?;
         for &(key, value) in edit {
             match value {
                 Some(v) => t.insert(
@@ -1176,6 +1278,21 @@ mod tests {
         let entry: CatalogEntry = t.try_into()?;
         entry.validate()?;
         Ok(entry)
+    }
+
+    /// An ISO is cached as downloaded: its pull reserves it once, a cloud
+    /// image (converted) twice. Only images known to have no guest agent
+    /// skip the waits for one.
+    #[test]
+    fn pull_reserve_and_agent_waits() {
+        let iso = find("fedora-44-workstation").unwrap();
+        assert_eq!(pull_reserve(&iso), iso.max_size);
+        let cloud = find("ubuntu-26.04").unwrap();
+        assert_eq!(pull_reserve(&cloud), 2 * cloud.max_size);
+        assert!(!has_agent("fedora-44-workstation"));
+        assert!(!has_agent("ubuntu-26.04-desktop"));
+        assert!(has_agent("ubuntu-26.04"));
+        assert!(has_agent("left-the-catalog"));
     }
 
     #[test]
@@ -1300,6 +1417,45 @@ mod tests {
         assert!(err(&[pinned.as_slice(), &[("moving", Some("true"))]].concat()).contains("moving"));
     }
 
+    /// ISO entries: signed-sums, a .iso URL, a manual agent and no seed
+    /// options; cloud images never have a manual agent.
+    #[test]
+    fn iso_invariants() {
+        let iso = include_str!("../catalog/ubuntu-26.04-desktop.toml");
+        let err = |edit: &[(&str, Option<&str>)]| format!("{:#}", edited(iso, edit).unwrap_err());
+        edited(iso, &[]).unwrap();
+        assert!(err(&[("agent", Some(r#""preinstalled""#))]).contains("only an ISO"));
+        assert!(err(&[("kind", None)]).contains("only an ISO"));
+        assert!(err(&[("kind", Some(r#""cloud-image""#))]).contains("only an ISO"));
+        assert!(entry_with(&[("kind", Some(r#""disk""#))]).is_err());
+        // A cloud image (Deb, the default kind) with a manual agent.
+        let manual = [
+            ("agent", Some(r#""manual""#)),
+            ("debs", None),
+            ("deb_sources", None),
+            ("deb_keyring", None),
+        ];
+        assert!(format!("{:#}", entry_with(&manual).unwrap_err()).contains("only an ISO"));
+        assert!(
+            err(&[("debs", Some(r#"["qemu-guest-agent"]"#))])
+                .contains("manual agent takes no debs")
+        );
+        assert!(err(&[("url", Some(r#""https://example.com/a.img""#))]).contains("an ISO needs"));
+        assert!(err(&[("internet", Some("true"))]).contains("an ISO needs"));
+        assert!(err(&[("qga_permissive", Some("true"))]).contains("an ISO needs"));
+        let sha = format!("{:?}", "a".repeat(128));
+        let pinned = [
+            ("trust", Some(r#""pinned""#)),
+            ("sha512", Some(sha.as_str())),
+            ("sums_url", None),
+            ("sig_url", None),
+            ("sums_format", None),
+            ("keyring", None),
+            ("signing_key", None),
+        ];
+        assert!(err(&pinned).contains("an ISO needs"));
+    }
+
     /// Only images verified with the internet profile take it.
     #[test]
     fn internet_profile_per_image() {
@@ -1309,6 +1465,8 @@ mod tests {
             ("fedora-44", false),
             ("arch", false),
             ("debian-13", false),
+            ("ubuntu-26.04-desktop", false),
+            ("fedora-44-workstation", false),
         ] {
             let e = find(id).unwrap();
             e.check_net(NetProfile::Offline).unwrap();
@@ -1785,6 +1943,80 @@ mod tests {
         );
     }
 
+    /// The real Fedora 44 Workstation checksum list (tests/fixtures/)
+    /// verifies with the vendored keyring and gives the ISO's SHA-256.
+    /// Offline.
+    #[tokio::test]
+    async fn fedora_iso_checksum_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
+        let entry = find("fedora-44-workstation").unwrap();
+        let keyring = keyring_path(&paths, entry.keyring.as_deref().unwrap()).unwrap();
+        let name = "Fedora-Workstation-44-1.7-x86_64-CHECKSUM";
+        assert!(
+            entry
+                .sums_url
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("/{name}"))
+        );
+        let sums = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        let out = dir.path().join("signed");
+        let fpr = entry.signing_key.as_deref().unwrap();
+        let (text, _) = signed_text(&keyring, fpr, &sums, None, &out).await.unwrap();
+        assert_eq!(
+            expected_sha256(&text, entry.file(), SumsFormat::Bsd).unwrap(),
+            "1620295f6a00c27c3208f0c00b8ece4eab1ec69b9002152d97488bf26a426ddf"
+        );
+    }
+
+    /// Fetches the checksum lists of the ISO entries (a few KB each, not
+    /// the ISOs): `cargo test -- --ignored iso_sums_live`. Their signatures
+    /// verify with the pinned keys and list the pinned files.
+    #[tokio::test]
+    #[ignore = "downloads checksum lists"]
+    async fn iso_sums_live() {
+        let dir = tempfile::tempdir().unwrap();
+        for e in catalog().into_iter().filter(|e| e.kind == Kind::Iso) {
+            let (text, validsig) = live_sums(&e, dir.path()).await;
+            let sha = expected_sha256(&text, e.file(), e.sums_format.unwrap()).unwrap();
+            eprintln!("{}: signed {}, {sha}", e.id, sig_date(&validsig).unwrap());
+        }
+    }
+
+    /// Downloads and checks `e`'s checksum list into `dir`; returns the
+    /// signed text and the VALIDSIG fields.
+    async fn live_sums(e: &CatalogEntry, dir: &Path) -> (String, Vec<String>) {
+        let paths = Paths::new(dir.join("data"), dir.join("run")).unwrap();
+        let (sums, sig, out) = (
+            dir.join(format!("{}.sums", e.id)),
+            dir.join(format!("{}.sig", e.id)),
+            dir.join(format!("{}.out", e.id)),
+        );
+        download(e.sums_url.as_deref().unwrap(), &sums, 1 << 20, false)
+            .await
+            .unwrap();
+        let sig = match e.sig_url.as_deref().unwrap() {
+            "" => None,
+            url => {
+                download(url, &sig, 1 << 20, false).await.unwrap();
+                Some(sig.as_path())
+            }
+        };
+        let keyring = keyring_path(&paths, e.keyring.as_deref().unwrap()).unwrap();
+        signed_text(
+            &keyring,
+            e.signing_key.as_deref().unwrap(),
+            &sums,
+            sig,
+            &out,
+        )
+        .await
+        .unwrap()
+    }
+
     /// Pulls the Arch image for real (network, about 600 MB):
     /// `cargo test -- --ignored signed_image_live`. A file larger than the
     /// image already sits where the download goes, as after an upstream
@@ -1968,6 +2200,13 @@ mod tests {
         assert!(ensure_pulled(&paths, "fedora-44").is_err());
         fs::write(image_path(&paths, "fedora-44"), b"").unwrap();
         ensure_pulled(&paths, "fedora-44").unwrap();
+        // An ISO is cached as <id>.iso; a .qcow2 of that name does not count.
+        let iso = find("fedora-44-workstation").unwrap();
+        assert_eq!(cached_path(&paths, &iso), iso_path(&paths, &iso.id));
+        fs::write(image_path(&paths, &iso.id), b"").unwrap();
+        assert!(ensure_pulled(&paths, &iso.id).is_err());
+        fs::write(iso_path(&paths, &iso.id), b"").unwrap();
+        ensure_pulled(&paths, &iso.id).unwrap();
     }
 
     /// Fetches the guest-agent packages for real (network, about 20 MB of
@@ -2098,33 +2337,8 @@ mod tests {
     #[ignore = "downloads checksum lists"]
     async fn moving_sums_live() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path().join("data"), dir.path().join("run")).unwrap();
         for e in catalog().into_iter().filter(|e| e.moving) {
-            let (sums, sig, out) = (
-                dir.path().join(format!("{}.sums", e.id)),
-                dir.path().join(format!("{}.sig", e.id)),
-                dir.path().join(format!("{}.out", e.id)),
-            );
-            download(e.sums_url.as_deref().unwrap(), &sums, 1 << 20, false)
-                .await
-                .unwrap();
-            let sig = match e.sig_url.as_deref().unwrap() {
-                "" => None,
-                url => {
-                    download(url, &sig, 1 << 20, false).await.unwrap();
-                    Some(sig.as_path())
-                }
-            };
-            let keyring = keyring_path(&paths, e.keyring.as_deref().unwrap()).unwrap();
-            let (text, validsig) = signed_text(
-                &keyring,
-                e.signing_key.as_deref().unwrap(),
-                &sums,
-                sig,
-                &out,
-            )
-            .await
-            .unwrap();
+            let (text, validsig) = live_sums(&e, dir.path()).await;
             check_sig_age(&validsig, now_secs().unwrap(), MAX_SUMS_SIG_AGE_DAYS).unwrap();
             expected_sha256(&text, e.file(), e.sums_format.unwrap()).unwrap();
             eprintln!("{}: signed {}", e.id, sig_date(&validsig).unwrap());
@@ -2175,6 +2389,12 @@ mod tests {
         );
         assert!(!remove(&paths, "ubuntu-26.04").unwrap());
         assert!(remove(&paths, "../x").is_err());
+        // A cached ISO and its record.
+        let iso = "fedora-44-workstation";
+        fs::write(iso_path(&paths, iso), b"iso").unwrap();
+        fs::write(record_path(&paths, iso), b"sha256 = \"x\"\npulled_at = 1\n").unwrap();
+        assert!(remove(&paths, iso).unwrap());
+        assert!(!iso_path(&paths, iso).exists() && !record_path(&paths, iso).exists());
         // A planted symlink: refused, and its target stays.
         let target = dir.path().join("target");
         fs::write(&target, b"keep").unwrap();

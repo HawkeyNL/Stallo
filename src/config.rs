@@ -108,6 +108,11 @@ pub struct VmConfig {
     /// humans, from the next start. Never on TCP.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vnc: bool,
+    /// The installer ISO (catalog id) in the CD-ROM drive of a VM made from
+    /// an ISO. Such a VM has the drive and no seed; `None` leaves the drive
+    /// empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdrom: Option<String>,
 }
 
 /// One TCP port forward: `bind:host` on the host to `guest` in the guest.
@@ -155,6 +160,9 @@ impl VmConfig {
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
         validate_image_id(&self.image)?;
+        if let Some(iso) = &self.cdrom {
+            validate_image_id(iso)?;
+        }
         ensure!(is_uuid(&self.uuid), "invalid uuid {:?}", self.uuid);
         if let Some(source) = &self.throwaway_of {
             validate_name(source)?;
@@ -440,6 +448,7 @@ mod tests {
             throwaway_of: None,
             forwards: vec![],
             vnc: false,
+            cdrom: None,
         }
     }
 
@@ -454,6 +463,14 @@ mod tests {
         vm().save(&dir).unwrap();
         vm().save(&dir).unwrap();
         assert_eq!(VmConfig::load(&dir).unwrap(), vm());
+        // A VM from an ISO keeps it in its CD-ROM drive.
+        let iso = VmConfig {
+            cdrom: Some("fedora-44-workstation".into()),
+            ..vm()
+        };
+        iso.save(&dir).unwrap();
+        assert_eq!(VmConfig::load(&dir).unwrap(), iso);
+        vm().save(&dir).unwrap();
         let mode = fs::metadata(dir.join("vm.toml"))
             .unwrap()
             .permissions()
@@ -533,7 +550,13 @@ mod tests {
         ok.save(&dir).unwrap();
         assert_eq!(VmConfig::load(&dir).unwrap(), ok);
         // Offline VMs keep their vm.toml unchanged.
-        assert!(!toml::to_string(&vm()).unwrap().contains("forwards"));
+        let text = toml::to_string(&vm()).unwrap();
+        assert!(!text.contains("forwards") && !text.contains("cdrom"));
+        let bad_iso = VmConfig {
+            cdrom: Some("../x.iso".into()),
+            ..vm()
+        };
+        assert!(bad_iso.validate().is_err());
 
         let other = |bind: &str| PortForward {
             bind: bind.parse().unwrap(),

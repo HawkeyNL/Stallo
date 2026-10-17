@@ -107,7 +107,7 @@ impl Manager {
     /// The clone's files: an overlay on the source disk (`-u`: qemu-img
     /// never opens the source, which a compromised QEMU may have crafted),
     /// a copy of the firmware variables, a fresh state image, a hard link
-    /// to the seed, and `vm.toml` last.
+    /// to the seed (VMs from ISOs have none), and `vm.toml` last.
     async fn clone_files(&self, src: &VmConfig, name: &str) -> Result<()> {
         let (from, to) = (self.paths.vm_dir(&src.name), self.paths.vm_dir(name));
         run_tool(
@@ -122,7 +122,9 @@ impl Manager {
         .context("cannot create the clone's disk")?;
         fs::copy(from.join(qemu::VARS), to.join(qemu::VARS))?;
         crate::paths::ensure_private_dir(&to.join(qemu::STATES))?;
-        fs::hard_link(from.join(qemu::SEED), to.join(qemu::SEED))?;
+        if from.join(qemu::SEED).exists() {
+            fs::hard_link(from.join(qemu::SEED), to.join(qemu::SEED))?;
+        }
         VmConfig {
             name: name.to_owned(),
             uuid: new_uuid()?,
@@ -177,6 +179,7 @@ mod tests {
             throwaway_of: throwaway_of.map(Into::into),
             forwards: vec![],
             vnc: false,
+            cdrom: None,
         }
     }
 
@@ -260,7 +263,8 @@ mod tests {
     }
 
     /// `images rm` is refused while a VM uses the image: a stopped VM, a
-    /// run clone, or a directory without vm.toml whose disk backs onto it.
+    /// run clone, or a VM whose disk backs onto it; and while a VM
+    /// directory's vm.toml cannot be read (fail closed).
     #[tokio::test]
     async fn image_rm_refused_while_in_use() {
         let tmp = tempfile::tempdir().unwrap();
@@ -290,9 +294,13 @@ mod tests {
         for name in ["dev", "run-0a1b2c3d"] {
             fs::remove_dir_all(m.paths.vm_dir(name)).unwrap();
         }
-        // A half-made VM: only its disk says what it backs onto.
+        // A VM whose disk backs onto the image, whatever its vm.toml says.
         let half = m.paths.vm_dir("half");
         fs::create_dir(&half).unwrap();
+        vm("half", None).save(&half).unwrap();
+        let mut toml = fs::read_to_string(half.join("vm.toml")).unwrap();
+        toml = toml.replace("ubuntu-26.04", "ubuntu-24.04");
+        fs::write(half.join("vm.toml"), toml).unwrap();
         let ok = std::process::Command::new("qemu-img")
             .args(["create", "-q", "-f", "qcow2", "-u", "-F", "qcow2", "-b"])
             .arg(&base)
@@ -304,6 +312,20 @@ mod tests {
         assert!(ok);
         let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
         assert!(err.to_string().contains("in use by half"), "{err}");
+        // A VM directory without a readable vm.toml might use any image.
+        for toml in [None, Some("not toml")] {
+            match toml {
+                None => fs::remove_file(half.join("vm.toml")).unwrap(),
+                Some(t) => fs::write(half.join("vm.toml"), t).unwrap(),
+            }
+            let err = m.remove_image("ubuntu-26.04").await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot tell whether half uses image ubuntu-26.04; if a `stallo run` is in progress, try again when it ends, otherwise remove it first (stallo rm half) or move it out of the vms directory"),
+                "{err}"
+            );
+        }
+        assert!(base.exists());
         fs::remove_dir_all(&half).unwrap();
         m.remove_image("ubuntu-26.04").await.unwrap();
         assert!(!base.exists());
@@ -312,7 +334,145 @@ mod tests {
         assert!(m.remove_image("../x").await.is_err());
     }
 
-    /// A pull is refused before any download unless twice the image fits
+    /// VMs from installer ISOs: agents may not create one, even from a
+    /// pulled ISO; its blank disk backs onto nothing; a run clone of it
+    /// needs no seed; and `images rm` keeps an ISO that is in a drive.
+    #[tokio::test]
+    async fn iso_vms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        m.cleanup_leftovers().await.unwrap();
+        let id = "fedora-44-workstation";
+        crate::paths::ensure_private_dir(&m.paths.images_dir()).unwrap();
+        fs::write(crate::images::iso_path(&m.paths, id), b"iso").unwrap();
+        let new = crate::vm::NewVm {
+            name: "desk".into(),
+            image: id.into(),
+            vcpus: 2,
+            memory_mib: 4096,
+            disk_gib: 32,
+            net: NetProfile::Offline,
+            forwards: vec![],
+            agent_control: true,
+            may_pull: false,
+            vnc: false,
+        };
+        let err = m.create(&new).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "agents may not create VMs from installer ISOs"
+        );
+        assert!(!m.paths.vm_dir("desk").exists());
+
+        // The files `create` makes (but the firmware variables, which need
+        // OVMF on the host).
+        let dir = m.paths.vm_dir("desk");
+        fs::create_dir(&dir).unwrap();
+        qemu::create_disk(None, &dir.join(qemu::DISK), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::images::backing_file(&dir.join(qemu::DISK)).unwrap(),
+            None
+        );
+        fs::write(dir.join(qemu::VARS), b"vars").unwrap();
+        let cfg = VmConfig {
+            image: id.into(),
+            cdrom: Some(id.into()),
+            vnc: true,
+            ..vm("desk", None)
+        };
+        cfg.save(&dir).unwrap();
+
+        let clone = "run-0a1b2c3d";
+        fs::create_dir(m.paths.vm_dir(clone)).unwrap();
+        m.clone_files(&cfg, clone).await.unwrap();
+        assert_eq!(m.load(clone).unwrap().cdrom.as_deref(), Some(id));
+        assert!(!m.paths.vm_dir(clone).join(qemu::SEED).exists());
+
+        let err = m.remove_image(id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("in use by desk, run-0a1b2c3d"),
+            "{err}"
+        );
+        // The drive alone counts too (a VM made from another ISO).
+        fs::remove_dir_all(m.paths.vm_dir(clone)).unwrap();
+        VmConfig {
+            image: "ubuntu-26.04-desktop".into(),
+            ..cfg
+        }
+        .save(&dir)
+        .unwrap();
+        let err = m.remove_image(id).await.unwrap_err();
+        assert!(err.to_string().contains("in use by desk"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+        m.remove_image(id).await.unwrap();
+        assert!(!crate::images::iso_path(&m.paths, id).exists());
+    }
+
+    /// `set_cdrom`: only VMs made from an ISO (no run clones), only pulled
+    /// installer ISOs; saved in vm.toml, nothing else changes.
+    #[tokio::test]
+    async fn cdrom_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(&fs::canonicalize(tmp.path()).unwrap());
+        m.cleanup_leftovers().await.unwrap();
+        let id = "fedora-44-workstation";
+        crate::paths::ensure_private_dir(&m.paths.images_dir()).unwrap();
+        fs::write(crate::images::iso_path(&m.paths, id), b"iso").unwrap();
+        let desk = VmConfig {
+            image: id.into(),
+            cdrom: Some(id.into()),
+            vnc: true,
+            ..vm("desk", None)
+        };
+        let clone = VmConfig {
+            name: "run-0a1b2c3d".into(),
+            throwaway_of: Some("desk".into()),
+            ..desk.clone()
+        };
+        for cfg in [&desk, &clone, &vm("dev", None)] {
+            let dir = m.paths.vm_dir(&cfg.name);
+            fs::create_dir(&dir).unwrap();
+            cfg.save(&dir).unwrap();
+        }
+        let err = |r: Result<()>| r.unwrap_err().to_string();
+
+        m.set_cdrom("desk", None).await.unwrap();
+        let ejected = m.load("desk").unwrap();
+        assert_eq!(
+            ejected,
+            VmConfig {
+                cdrom: None,
+                ..desk.clone()
+            }
+        );
+        m.set_cdrom("desk", Some(id)).await.unwrap();
+        assert_eq!(m.load("desk").unwrap(), desk);
+
+        for (vm, iso, want) in [
+            ("desk", Some("ubuntu-26.04-desktop"), "not pulled"),
+            ("desk", Some("ubuntu-26.04"), "is not an installer ISO"),
+            ("desk", Some("nope"), "unknown image"),
+            ("desk", Some("../x"), "invalid"),
+            ("dev", None, "dev has no CD-ROM drive"),
+            ("dev", Some(id), "dev has no CD-ROM drive"),
+            ("run-0a1b2c3d", None, "clone"),
+            ("nope", None, "no VM named nope"),
+        ] {
+            let e = err(m.set_cdrom(vm, iso).await);
+            assert!(e.contains(want), "{vm} {iso:?}: {e}");
+        }
+        // A pull or removal holds the images lock: refused, not waited for.
+        let held = m.images.write().await;
+        let e = err(m.set_cdrom("desk", None).await);
+        assert!(e.contains("image pull or removal is in progress"), "{e}");
+        drop(held);
+        assert_eq!(m.load("desk").unwrap(), desk, "nothing saved");
+        assert_eq!(m.load("dev").unwrap(), vm("dev", None));
+    }
+
+    /// A pull is refused before any download unless its pull reserve fits
     /// above the disk floor; a cached image needs no space.
     #[tokio::test]
     async fn pull_needs_free_space() {
