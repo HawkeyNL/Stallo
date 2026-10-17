@@ -179,6 +179,30 @@ async fn script(ui: &Rc<Ui>, out: &Path, full: PathBuf, empty: PathBuf) -> anyho
     let windows = windows().ok_or_else(|| anyhow::anyhow!("no Windows image"))?;
     ActionRowExt::activate(&windows);
     shot("create-windows").await?;
+    // Advanced open, scrolled to the bottom.
+    let processors = ui
+        .window
+        .visible_dialog()
+        .and_then(|d| find_row(d.upcast_ref(), "Processors"))
+        .ok_or_else(|| anyhow::anyhow!("no Processors row"))?;
+    if let Some(advanced) = processors
+        .ancestor(adw::ExpanderRow::static_type())
+        .and_downcast::<adw::ExpanderRow>()
+    {
+        advanced.set_expanded(true);
+    }
+    // Again as the expander's animation grows the page.
+    if let Some(scroll) = processors
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+    {
+        for _ in 0..5 {
+            glib::timeout_future(Duration::from_millis(200)).await;
+            let a = scroll.vadjustment();
+            a.set_value(a.upper() - a.page_size());
+        }
+    }
+    shot("create-windows-advanced").await?;
     close_dialog(ui).await
 }
 

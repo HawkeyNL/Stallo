@@ -236,6 +236,8 @@ struct Form {
     /// Processors, memory and disk as last chosen, before any cap: a
     /// lower cap for one image is undone on switching back.
     wanted: [Cell<f64>; 3],
+    /// Internet Access as last chosen: kept while it is blocked.
+    internet_wanted: Cell<bool>,
     /// The values are being fitted to the caps, not chosen.
     fitting: Cell<bool>,
     /// The selected image's defaults: `wanted` starts from them.
@@ -322,7 +324,7 @@ impl Form {
         installer_group.add(&own_iso);
         installer_group.add(&import_row);
 
-        let suggested = model::suggest_vm_name(&images[selected].id, &taken);
+        let suggested = model::suggest_name_for(&images[selected], &taken);
         let name = adw::EntryRow::builder()
             .title("Name")
             .text(&suggested)
@@ -347,8 +349,13 @@ impl Form {
             .use_markup(false)
             .active(true)
             .build();
+        let internet = adw::SwitchRow::builder()
+            .title("Internet Access")
+            .use_markup(false)
+            .build();
         let screen_group = adw::PreferencesGroup::new();
         screen_group.add(&live_screen);
+        screen_group.add(&internet);
 
         let spin = |title: &str, value: u64| {
             let adjustment = gtk::Adjustment::new(value as f64, 1.0, value as f64, 1.0, 4.0, 0.0);
@@ -364,10 +371,6 @@ impl Form {
         let vcpus = spin("Processors", v0.into());
         let memory = spin("Memory (GiB)", m0);
         let disk = spin("Disk Size (GiB)", d0);
-        let internet = adw::SwitchRow::builder()
-            .title("Internet Access")
-            .use_markup(false)
-            .build();
         let advanced = adw::ExpanderRow::builder()
             .title("Advanced")
             .use_markup(false)
@@ -375,7 +378,6 @@ impl Form {
         for row in [&vcpus, &memory, &disk] {
             advanced.add_row(row);
         }
-        advanced.add_row(&internet);
         let advanced_group = adw::PreferencesGroup::new();
         advanced_group.add(&advanced);
 
@@ -421,6 +423,7 @@ impl Form {
                 Cell::new(m0 as f64),
                 Cell::new(d0 as f64),
             ],
+            internet_wanted: Cell::new(false),
             fitting: Cell::new(false),
             defaults: Cell::new(defaults),
         });
@@ -462,8 +465,11 @@ impl Form {
             });
         }
         let f = Rc::downgrade(&form);
-        form.internet.connect_active_notify(move |_| {
+        form.internet.connect_active_notify(move |row| {
             if let Some(f) = f.upgrade() {
+                if !f.fitting.get() {
+                    f.internet_wanted.set(row.is_active());
+                }
                 f.update();
             }
         });
@@ -517,8 +523,11 @@ impl Form {
             for (wanted, value) in self.wanted.iter().zip([f64::from(v), m as f64, d as f64]) {
                 wanted.set(value);
             }
+            // Off by default: Windows installs offline, where a local
+            // account is easy.
+            self.internet_wanted.set(false);
         }
-        let new = model::suggest_vm_name(&image.id, &self.taken);
+        let new = model::suggest_name_for(&image, &self.taken);
         let old = self.suggested.replace(new.clone());
         if self.name.text() == old {
             self.name.set_text(&new);
@@ -569,20 +578,19 @@ impl Form {
         self.live_screen
             .set_subtitle(lock.unwrap_or(LIVE_SCREEN_NOTE));
         let block = model::internet_block(&image, self.production);
-        if block.is_some() && self.internet.is_active() {
-            self.internet.set_active(false);
+        let on = block.is_none() && self.internet_wanted.get();
+        if self.internet.is_active() != on {
+            self.fitting.set(true);
+            self.internet.set_active(on);
+            self.fitting.set(false);
         }
         self.internet.set_sensitive(block.is_none());
         self.internet.set_subtitle(
             block.unwrap_or("Reaches the internet, not this computer or your local network."),
         );
         let (vcpus, memory, disk) = self.values();
-        self.advanced.set_subtitle(&model::advanced_summary(
-            vcpus,
-            memory,
-            disk,
-            self.internet.is_active(),
-        ));
+        self.advanced
+            .set_subtitle(&model::advanced_summary(vcpus, memory, disk));
         let full = limits.block(min);
         self.advanced_group
             .set_description(full.or(image.windows.then_some(model::WINDOWS_MINIMUMS)));
