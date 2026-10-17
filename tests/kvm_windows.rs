@@ -230,7 +230,8 @@ fn windows_setup_starts() {
     let socket = info.vnc_socket.expect("no VNC socket while running");
     let mut seen = Look::default();
     let setup = common::wait_for(Duration::from_secs(240), || {
-        seen = look(&socket);
+        // VNC not ready yet counts as "not Setup yet".
+        seen = look(&socket).unwrap_or_default();
         seen.setup() || {
             std::thread::sleep(Duration::from_secs(2));
             false
@@ -248,7 +249,7 @@ fn windows_setup_starts() {
         to_setup.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
-    let seen = look(&socket);
+    let seen = look(&socket).expect("no VNC frame");
     assert!(seen.setup(), "Setup went away: {seen:?}");
     if std::env::var_os("STALLO_WIN_SETUP_DEEP").is_some_and(|v| v == "1") {
         click_through_setup(&d, &socket);
@@ -285,24 +286,25 @@ impl Look {
     }
 }
 
-/// The current frame over VNC.
-fn frame(socket: &Path) -> rfb::Frame {
+/// The current frame over VNC, or `None` if VNC is not ready (no
+/// connection, no frame in 10 s).
+fn frame(socket: &Path) -> Option<rfb::Frame> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            let (_session, mut frames) = rfb::Session::connect(socket).await.unwrap();
+            let (_session, mut frames) = rfb::Session::connect(socket).await.ok()?;
             tokio::time::timeout(Duration::from_secs(10), frames.changed())
                 .await
-                .expect("no frame in 10 s")
-                .expect("the session ended");
-            frames.borrow_and_update().clone()
+                .ok()?
+                .ok()?;
+            Some(frames.borrow_and_update().clone())
         })
 }
 
-fn look(socket: &Path) -> Look {
-    let frame = frame(socket);
+fn look(socket: &Path) -> Option<Look> {
+    let frame = frame(socket)?;
     // B G R x.
     let px = frame.pixels.chunks_exact(4);
     let n = px.len().max(1);
@@ -316,11 +318,11 @@ fn look(socket: &Path) -> Look {
             *s += u64::from(c);
         }
     }
-    Look {
+    Some(Look {
         size: (frame.width, frame.height),
         lit_pct: lit * 100 / n,
         mean_rgb: sum.map(|s| s / n as u64),
-    }
+    })
 }
 
 /// More than 1% of the pixels differ (a new page, not a caret blink).
@@ -334,7 +336,7 @@ fn differs(a: &rfb::Frame, b: &rfb::Frame) -> bool {
 /// screens. Stops at the setup option screen, before anything that asks for
 /// a key, a licence or the disk.
 fn click_through_setup(d: &Daemon, socket: &Path) {
-    let mut last = frame(socket);
+    let mut last = frame(socket).expect("no VNC frame");
     for page in ["keyboard", "option"] {
         d.api(
             Via::Cli,
@@ -347,7 +349,7 @@ fn click_through_setup(d: &Daemon, socket: &Path) {
         let mut next = None;
         let turned = common::wait_for(Duration::from_secs(60), || {
             let (png, stable) = settled(d);
-            let now = frame(socket);
+            let now = frame(socket).expect("no VNC frame");
             let done = stable && differs(&last, &now);
             next = Some((png, now));
             done

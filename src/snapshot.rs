@@ -705,6 +705,7 @@ impl Manager {
         file: &Path,
         run: bool,
     ) -> Result<Option<Duration>> {
+        vm.stop_boot_keys();
         // No guest-agent operation may straddle the load.
         let mut agent = tokio::time::timeout(QGA_BUSY_WAIT, vm.qga.lock())
             .await

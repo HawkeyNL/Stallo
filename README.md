@@ -365,23 +365,27 @@ website and use your own licence.
 1. Import it with `stallo images import … --os windows` (above), or
    **Use My Own ISO…** in the desktop app's new-VM dialog.
 2. Create the VM. Windows VMs get Secure Boot, a TPM 2.0 (swtpm) and at
-   least 2 vCPUs, 4 GiB and a 64 GiB disk. On a production install, add
-   `--net internet`; offline also works:
+   least 2 vCPUs, 4 GiB and a 64 GiB disk. Windows VMs are offline for
+   now:
 
    ```sh
-   stallo new win --image local-win11-25h2-english-x64 --net internet
+   stallo new win --image local-win11-25h2-english-x64
    ```
 
 3. Open the screen. You need not catch "Press any key to boot from CD or
    DVD": while the ISO is in the drive, the daemon presses Enter for you
-   in the first seconds after each start.
+   in the first seconds after each start. If you miss the prompt and land
+   in the firmware menu, stop and start the VM.
 4. In Setup, choose the keyboard layout **US** (not US-International):
    the agents' `type_text` assumes it. Install on the unallocated space.
 5. Setup asks for a Microsoft account. For a local account, press
    Shift+F10 for a command prompt and run `start ms-cxh:localonly`. If
-   that does nothing, run `OOBE\BYPASSNRO`; the VM restarts, and Setup
-   then offers "I don't have internet". Microsoft keeps removing these
-   bypasses, so a newer build may not have them.
+   that does nothing, run
+   `reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f`,
+   then `shutdown /r /t 0`; after the restart Setup offers "I don't have
+   internet". Microsoft keeps removing these bypasses. Stallo was tested
+   up to Setup's first pages only (build 26100.1742, Enterprise
+   Evaluation), not yet through a full install.
 6. Eject the ISO when the install is done (`stallo set win --cdrom eject`),
    then stop and start the VM.
 
