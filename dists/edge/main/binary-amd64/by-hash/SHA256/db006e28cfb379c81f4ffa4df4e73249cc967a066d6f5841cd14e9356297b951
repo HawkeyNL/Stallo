@@ -1,0 +1,216 @@
+Package: stallo-gui
+Architecture: amd64
+Version: 0.1.0~git20261017001024.9e39ecb
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: stallo (= 0.1.0~git20261017001024.9e39ecb), libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.7), libglib2.0-0t64, libcairo2, libgraphene-1.0-0, libgcc-s1, libc6
+Filename: pool/edge/stallo-gui_0.1.0~git20261017001024.9e39ecb_amd64.deb
+Size: 827304
+MD5sum: ea859eb76313fa998ad055abcc891137
+SHA1: 73511f95d7f51a28d823f9d203930999b69c19bb
+SHA256: 476cd8e39fe3b3dbe9ae399c8117024a1e664c29fcbf5693de94e1db2ffb5d14
+SHA512: 62bb47c8d3d829bd46d1041d3768262976fa25ed4a23d7ce4e9e14182287e1b77755b1ba20cf233dc3558eb33b1d4a3cc48c70d7189c3ff561444263c63dea4b
+Description: Desktop app for Stallo (preview)
+ A GNOME app for the VMs that stallod runs. This early preview lists
+ the VMs, starts and stops them, shows their screens, takes and restores
+ snapshots, and helps set up access to stallod.
+
+Package: stallo-gui
+Architecture: amd64
+Version: 0.1.0~git20261017103455.b1052db
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: stallo (= 0.1.0~git20261017103455.b1052db), libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.7), libglib2.0-0t64, libcairo2, libgraphene-1.0-0, libgcc-s1, libc6
+Filename: pool/edge/stallo-gui_0.1.0~git20261017103455.b1052db_amd64.deb
+Size: 826752
+MD5sum: 96a1a86b6ecedd116fbc047cc7012057
+SHA1: a30f3c4f32365de834b73ea53ceb43b4e6b0fba0
+SHA256: c36506f6a8fcce2d5bc9d67d8263e3c60b7775aec05948bfc6369fae5f5024fd
+SHA512: 8f9cfeb8af2c4b37a234805f8fa4bf37a3fc20397380c8d9113b9f5713b8eabbee5d4f8a32223559cd9960d3eb3b4fa5b47847e341953f01095f600c2e587595
+Description: Desktop app for Stallo (preview)
+ A GNOME app for the VMs that stallod runs. This early preview lists
+ the VMs, starts and stops them, shows their screens, takes and restores
+ snapshots, and helps set up access to stallod.
+
+Package: stallo-gui
+Architecture: amd64
+Version: 0.1.0~git20261017135552.861d381
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: stallo (= 0.1.0~git20261017135552.861d381), libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.7), libglib2.0-0t64, libcairo2, libgraphene-1.0-0, libgcc-s1, libc6
+Filename: pool/edge/stallo-gui_0.1.0~git20261017135552.861d381_amd64.deb
+Size: 836512
+MD5sum: 36696a620011240e15c09dbce70afbd8
+SHA1: d45bfd0522efd81954c4f42cdf1e6d110a6fe58b
+SHA256: 0e8a761c1f876bf296ffbf3640611b889350f36f41e3cf7f222b4a0caa2ee163
+SHA512: 25f099b171a094b35e6b725376d9dfd42f7380126737573d0a319d54c03119d85796a8482697056e7009c88ef25863599052c0b4d1f0780e45db4f7c0ce8bc7a
+Description: Desktop app for Stallo (preview)
+ A GNOME app for the VMs that stallod runs. This early preview lists
+ the VMs, starts and stops them, shows their screens, takes and restores
+ snapshots, and helps set up access to stallod.
+
+Package: stallo-gui
+Architecture: amd64
+Version: 0.1.0~git20261017165253.ac19dce
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: stallo (= 0.1.0~git20261017165253.ac19dce), libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.7), libglib2.0-0t64, libcairo2, libgraphene-1.0-0, libgcc-s1, libc6
+Filename: pool/edge/stallo-gui_0.1.0~git20261017165253.ac19dce_amd64.deb
+Size: 882244
+MD5sum: 41e1d13c6bb1c8566710088ffcc4182d
+SHA1: ca00929453ec1e626e723b11e377aefb50b2be1e
+SHA256: 728399b51c3850edcde5d6f14a2196b8cdebff32c94154977e1434c6f74a15f2
+SHA512: 1714038789dcd6747e4a89ddacac7505b80c8b246231ed8b06a6db3806fc19528ea7f0e3040ff6fa51e10a2e39b17a72d7f708bb72449e3039de838b728ab3ad
+Description: Desktop app for Stallo (preview)
+ A GNOME app for the VMs that stallod runs. This early preview lists
+ the VMs, starts and stops them, shows their screens, takes and restores
+ snapshots, and helps set up access to stallod.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261015144941.25d6982
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring
+Filename: pool/edge/stallo_0.1.0~git20261015144941.25d6982_amd64.deb
+Size: 2541376
+MD5sum: 8dab651b8d14d7ee2eb35313ed3c6f1b
+SHA1: 2a21e5233c2470c0628a14d7b5e0e07043ac17d3
+SHA256: a29fb8c5c7442597ef881054da0503ff4ab7881bb8c1b814e9f0e5d8bfce8a9e
+SHA512: b09a727b5d5efbf05900300aad9a53ce748a0bdcaab1abd20daea0e33ee1707517caba6e5593f74abb7112fcf7fabaf9a4ab1f5c38fc5d63a05b1a34f41e652a
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261015150023.e3d68a9
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring
+Filename: pool/edge/stallo_0.1.0~git20261015150023.e3d68a9_amd64.deb
+Size: 2543420
+MD5sum: de0e211f72c814bbfd2770d61f7e171e
+SHA1: 20b6659134676be740e3df656254c8a52e2e2b63
+SHA256: 67b875be7086bcf6eb882f390af035dfdbabf68acc4f4568d8a9f7c77f1fb9f2
+SHA512: 932d5775eb7b423924d15f5ae72f0f39024915aa4be50761e4bf81e8d4717af7d667b2be9457385f3f706c559b316f3550a10be9d19bfba2f2a1edbb08653bda
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261015163911.eeceb65
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring
+Filename: pool/edge/stallo_0.1.0~git20261015163911.eeceb65_amd64.deb
+Size: 2544548
+MD5sum: fb8e391886f2ee205515900c45ab59e3
+SHA1: 52d968927e3b173283834e77253e5d9489e8f7b0
+SHA256: bbe7b44fef1d1ca90a5800408f82b0a631a991c025224d11a2c6ef1f2b713b69
+SHA512: bb081484563e4b3a6d7bc37de2f31ddd9b56a47b3565caa10e2c18b6e0f06e73856165952dd5eba5410dc71f72a232b5154df83efb7acf0e638b738a488d1294
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261015222340.6182a61
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring, ubuntu-keyring
+Filename: pool/edge/stallo_0.1.0~git20261015222340.6182a61_amd64.deb
+Size: 2654096
+MD5sum: d011409004c528767b8be41ad4b2944e
+SHA1: 2d48c19bb7a4a891e5b656d3aac050bfeb95fcf5
+SHA256: 69d09b3a214ba9ec57af6851d3df8133f89289dc2ba55df7400a35fa3aea6eae
+SHA512: 1fdf50251bfcc5d0ce4beae92decb59348e242b2f0ff3d82a92bd67920c30a9b92d0aa2381d736df6cf97ce43910c7800e5b5b156a0211c79164d9d6f65f2df7
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261017001024.9e39ecb
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring, ubuntu-keyring
+Filename: pool/edge/stallo_0.1.0~git20261017001024.9e39ecb_amd64.deb
+Size: 2659500
+MD5sum: 9c79a16894fa31703a33c2ba16d26224
+SHA1: 6e9e5b824224ba6e03961de8ea9d987f4661e351
+SHA256: 785792d25c4a6406f74704bc9ffbd37ede050c4bb2d3c3dccc719aa8ba3b08bc
+SHA512: c8f77178172d4c6f255f7329aa87f7a085ea646f7bff37bef5c8a31c5dfb0f01a26c003766c5cfc2cebc295f6588128e16d262c83e639a8e8cd288c544db5b9d
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261017103455.b1052db
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring, ubuntu-keyring
+Filename: pool/edge/stallo_0.1.0~git20261017103455.b1052db_amd64.deb
+Size: 2660468
+MD5sum: cecce29d02668f8f19912a29686f72ff
+SHA1: 400909e6d04402e6f4e45680fd346b8a9f0e7ffa
+SHA256: fae22cae6f3ca31206f20d7179bd1e9eebaa1441dc9952670d9a44d7d8bcfb1f
+SHA512: 8c0ef58c128559bd3f4b723fe2cd1a5e165ed2bb5400caa72b47e1467e194de8011bcb8fc90f89f91de4975e31ea96b4f5f180648d8091f72be6cf1787553702
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261017135552.861d381
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring, ubuntu-keyring
+Filename: pool/edge/stallo_0.1.0~git20261017135552.861d381_amd64.deb
+Size: 2721648
+MD5sum: 12d32f6ba4bcf7cdd9c5446c5d6ea1d2
+SHA1: 5b959709a4ef99ac79dc7ae5c2821aff096d3bf8
+SHA256: dd7eaed67fef18c0e800a5b89662027767de76cc49d6380d6290e4ac5f53497a
+SHA512: 6e5d7fbe394ae00de5fbf124fb8bc3c6e131740a6193ab7bb16db44e3c9ce96134ebaa21f73b007b7f7a123524056f426b2c1ab5d47fc805bb82a4e96ec8ab0f
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+
+Package: stallo
+Architecture: amd64
+Version: 0.1.0~git20261017165253.ac19dce
+Priority: optional
+Section: admin
+Maintainer: HawkeyNL <HawkeyNL@users.noreply.github.com>
+Depends: libc6, passwd, systemd (>= 257), apparmor (>= 4.0), nftables, passt, swtpm, qemu-system-x86 (>= 1:10.2), qemu-utils, ovmf, xorriso, curl, gpgv, ubuntu-cloudimage-keyring, ubuntu-keyring
+Filename: pool/edge/stallo_0.1.0~git20261017165253.ac19dce_amd64.deb
+Size: 2829624
+MD5sum: 696f743e65c95aa5230a880ae5711b77
+SHA1: ec09645829db8544aee6072bb5de04d5c9d4dfc0
+SHA256: e24204a2f5559de7b2dd053fed90024559c4131be79c970a8229fdc385c1ad6f
+SHA512: 99c6ca71816974e64e82ef357b480e10291f9bcb4d7b602d4441e16e86a84e230c1a473bc61b1df644426c6c7043113049e16212ba830d74aee7378812d3c4bf
+Description: Agent-first VM manager (QEMU/KVM)
+ stallod runs VMs as the system user stallo with per-VM cgroup limits;
+ stallo is its CLI and MCP server. The internet network profile is
+ isolated by the nftables table in /etc/stallo/stallo.nft.
+

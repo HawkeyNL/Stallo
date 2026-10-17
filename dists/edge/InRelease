@@ -1,0 +1,30 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Acquire-By-Hash: yes
+Architectures: amd64
+Codename: edge
+Components: main
+Date: Sat, 17 Oct 2026 16:57:09 +0000
+Label: Stallo
+Origin: Stallo
+Suite: edge
+MD5Sum:
+ 78b2fb0e216249aef0a3054ab0004898            11643 main/binary-amd64/Packages
+ e708d741b3b160e6e2a6e87f92922320             3062 main/binary-amd64/Packages.gz
+SHA1:
+ f1f168872e3aeda514cbb50ff88e628b6010276b            11643 main/binary-amd64/Packages
+ 6b6039148740ed69f36d9128bbb4fdbdc7c9943d             3062 main/binary-amd64/Packages.gz
+SHA256:
+ db006e28cfb379c81f4ffa4df4e73249cc967a066d6f5841cd14e9356297b951            11643 main/binary-amd64/Packages
+ 6143b8330bbb411f4f8b1876e4e9a7fdf2647ecc28040763c4d53db705ec51cd             3062 main/binary-amd64/Packages.gz
+SHA512:
+ 477c409d98fe494cf3344ad1c835b31a159449053cf9f47712158615f66b59e11b0fc34f11d190daa2bbde782553dedbed02acbf3d3288279043adfd23a2b4c7            11643 main/binary-amd64/Packages
+ 9a5fc04b5bf1d9c10eef55c8b42ff0170f71e94256d8f372c0983fdaa8ae501fb30ae72dd5791f4ca77e0453e80b57c352716cfdf01978e57db97869fc4d8447             3062 main/binary-amd64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQScdDQVf302oOm3ogAPOk/KyG9aIgUCatOo5QAKCRAPOk/KyG9a
+IqRdAP9pDMpe4FwDW10Zp5sFucseG90cP8ZWzHOWluTS91mEZQEAxicP199ojm5F
+dv9nbp6vCD9z2PSxHvTTmU04L+qQrQY=
+=oksl
+-----END PGP SIGNATURE-----
