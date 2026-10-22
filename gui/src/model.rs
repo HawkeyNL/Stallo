@@ -2202,8 +2202,9 @@ impl Mouse {
     }
 
     /// Wheel clicks for `delta` wheel steps (negative is up), each a press
-    /// and a release. Whole clicks only; the rest waits for the next event.
-    pub fn scroll(&mut self, x: u16, y: u16, delta: f64) -> Vec<Input> {
+    /// and a release where the pointer last was: GTK scroll events carry
+    /// no position. Whole clicks only; the rest waits for the next event.
+    pub fn scroll(&mut self, delta: f64) -> Vec<Input> {
         self.wheel += delta;
         let clicks = self.wheel.trunc().clamp(-MAX_CLICKS, MAX_CLICKS);
         // A fling is capped, and its rest dropped.
@@ -2213,10 +2214,10 @@ impl Mouse {
             self.wheel - clicks
         };
         let bit = if clicks < 0.0 { WHEEL_UP } else { WHEEL_DOWN };
-        let up = self.at(x, y);
+        let up = self.at(self.x, self.y);
         let down = Input::Pointer {
-            x,
-            y,
+            x: self.x,
+            y: self.y,
             buttons: self.buttons | bit,
         };
         (0..clicks.abs() as usize)
@@ -4621,16 +4622,17 @@ mod tests {
         assert_eq!(m.moved(0, 9, false), Some(at(0, 9, 1)));
         assert_eq!(m.button(0, 9, 4, true), Some(at(0, 9, 5)));
         assert_eq!(m.button(0, 9, 1, false), Some(at(0, 9, 4)));
-        // The wheel: a click is a press and a release, held buttons kept.
-        assert_eq!(m.scroll(1, 2, -1.0), [at(1, 2, 4 | 8), at(1, 2, 4)]);
-        assert_eq!(m.scroll(1, 2, 1.0), [at(1, 2, 4 | 16), at(1, 2, 4)]);
+        // The wheel: a click is a press and a release where the pointer
+        // last was, held buttons kept.
+        assert_eq!(m.scroll(-1.0), [at(0, 9, 4 | 8), at(0, 9, 4)]);
+        assert_eq!(m.scroll(1.0), [at(0, 9, 4 | 16), at(0, 9, 4)]);
         // A touchpad: fractions add up to a click.
-        assert!(m.scroll(1, 2, 0.4).is_empty());
-        assert!(m.scroll(1, 2, 0.4).is_empty());
-        assert_eq!(m.scroll(1, 2, 0.4).len(), 2);
+        assert!(m.scroll(0.4).is_empty());
+        assert!(m.scroll(0.4).is_empty());
+        assert_eq!(m.scroll(0.4).len(), 2);
         // A fling is capped, and its rest dropped.
-        assert_eq!(m.scroll(1, 2, -40.0).len(), 10);
-        assert!(m.scroll(1, 2, 0.9).is_empty());
+        assert_eq!(m.scroll(-40.0).len(), 10);
+        assert!(m.scroll(0.9).is_empty());
     }
 
     #[test]
@@ -4639,7 +4641,7 @@ mod tests {
         // View-only turns on mid-drag: the guest lets go where it was.
         m.button(7, 8, 1, true);
         m.moved(9, 10, false);
-        m.scroll(9, 10, 0.5);
+        m.scroll(0.5);
         assert_eq!(
             m.let_go(),
             Some(Input::Pointer {
@@ -4650,7 +4652,7 @@ mod tests {
         );
         // Nothing carries over: no held button, no half wheel click.
         assert_eq!(m.let_go(), None);
-        assert!(m.scroll(9, 10, 0.5).is_empty());
+        assert!(m.scroll(0.5).is_empty());
         assert_eq!(
             m.moved(1, 1, true),
             Some(Input::Pointer {
