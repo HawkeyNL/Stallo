@@ -772,11 +772,9 @@ impl Screen {
                     },
                     _ => 0.0,
                 };
-                if let Some((x, y, _)) = self.point(event) {
-                    let clicks = self.mouse.borrow_mut().scroll(x, y, delta);
-                    for input in clicks {
-                        self.send(input);
-                    }
+                let clicks = self.mouse.borrow_mut().scroll(delta);
+                for input in clicks {
+                    self.send(input);
                 }
                 glib::Propagation::Stop
             }
