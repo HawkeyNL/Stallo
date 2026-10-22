@@ -92,7 +92,14 @@ gate.
      - to `127.0.0.53:54`, to prove the DNS exception is narrow.
      - Loopback goes first, so without the table nothing leaves the host.
    - **Pass condition:** every send must fail with `EPERM`. Any other
-     result, including success, refuses the start.
+     result, including success, refuses the start. One exception: a
+     private range the host has no route to (no IPv6, no Tailscale) fails
+     with `ENETUNREACH`. The kernel looks up the route before the output
+     hook, so that datagram never left; passt traffic that is routed to
+     such a range still meets the table. The probe accepts it for the
+     private ranges only. The loopback targets and the canary still need
+     `EPERM`. Once a route appears, the next probe (at most 0.5 s later)
+     needs `EPERM` there again.
    - **Limit:** `EPERM` does not say which table dropped the packet. The
      canary ties the result to this table's version, but root can still
      edit its other rules unnoticed.
