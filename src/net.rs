@@ -61,11 +61,12 @@ pub const CANARY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 
 /// SYN would only time out). Anything else, including a datagram that was
 /// sent, fails the check. It takes microseconds.
 ///
-/// One exception: a private range the host has no route to (a laptop
-/// without IPv6 or Tailscale) fails `sendto` with `ENETUNREACH` before
-/// the output hook, so that datagram never left. passt traffic that is
-/// routed to such a range still meets the table. The loopback targets and
-/// the canary still need `EPERM`.
+/// One exception: an off-host target the host has no route to (a laptop
+/// without IPv6 or Tailscale, or with its Wi-Fi down) fails `sendto` with
+/// `ENETUNREACH` before the output hook, so that datagram never left.
+/// passt traffic that is routed to such a range still meets the table.
+/// The loopback targets are always routed and still need `EPERM`, so a
+/// missing table fails the probe even then.
 ///
 /// `EPERM` does not say which filter dropped a datagram; the canary is
 /// what ties the result to this table. Root can still edit the table's
@@ -99,8 +100,10 @@ fn targets(own4: SocketAddr, own6: SocketAddr) -> [(SocketAddr, Expect); 11] {
         (own4, Expect::Drop),
         (own6, Expect::Drop),
         // Before any off-host target: an older table stops here, and a
-        // canary that gets out goes to TEST-NET-1.
-        (CANARY, Expect::Drop),
+        // canary that gets out goes to TEST-NET-1. Without a route to it
+        // (e.g. the laptop's Wi-Fi is down) the version goes unchecked
+        // until a probe finds a route again.
+        (CANARY, Expect::DropOrNoRoute),
         // One per private range (port 9: discard).
         range(SocketAddr::from(([10, 255, 255, 1], 9))),
         range(SocketAddr::from(([172, 31, 255, 1], 9))),
