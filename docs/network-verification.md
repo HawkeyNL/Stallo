@@ -92,7 +92,28 @@ gate.
      - to `127.0.0.53:54`, to prove the DNS exception is narrow.
      - Loopback goes first, so without the table nothing leaves the host.
    - **Pass condition:** every send must fail with `EPERM`. Any other
-     result, including success, refuses the start.
+     result, including success, refuses the start. One exception: an
+     off-host target the host has no route to (no IPv6, no Tailscale, or
+     the laptop's Wi-Fi is down) fails with `ENETUNREACH`. The kernel
+     looks up the route before the output hook, so that datagram never
+     left; passt traffic that is routed to such a range still meets the
+     table. The probe accepts it for the canary and the private ranges
+     only. The loopback targets are always routed and still need `EPERM`,
+     so a missing table fails the probe even offline, and a Wi-Fi drop no
+     longer cuts the guests' network. Once a route appears, the next
+     probe (at most 0.5 s later) needs `EPERM` there again.
+   - **Offline limit:** without a route to `192.0.2.1` the canary is not
+     checked, so an older table version passes for as long as that lasts.
+     Usually that is a dropped Wi-Fi, and nothing leaves at all. But a
+     host with no default route and specific routes (a LAN-only link,
+     DHCP without a router, a split-tunnel VPN) can reach those routes
+     while an older table is loaded. The older table still drops loopback
+     and the ranges it had. The first probe that finds a route to the
+     canary (at most 0.5 s later) catches the version and cuts the
+     network. An upgrade reloads the table, but an older version stays
+     when you keep a locally edited `/etc/stallo/stallo.nft` at the
+     conffile prompt: merge the new file in, then
+     `sudo systemctl reload stallo-nft`.
    - **Limit:** `EPERM` does not say which table dropped the packet. The
      canary ties the result to this table's version, but root can still
      edit its other rules unnoticed.

@@ -61,6 +61,13 @@ pub const CANARY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 
 /// SYN would only time out). Anything else, including a datagram that was
 /// sent, fails the check. It takes microseconds.
 ///
+/// One exception: an off-host target the host has no route to (a laptop
+/// without IPv6 or Tailscale, or with its Wi-Fi down) fails `sendto` with
+/// `ENETUNREACH` before the output hook, so that datagram never left.
+/// passt traffic that is routed to such a range still meets the table.
+/// The loopback targets are always routed and still need `EPERM`, so a
+/// missing table fails the probe even then.
+///
 /// `EPERM` does not say which filter dropped a datagram; the canary is
 /// what ties the result to this table. Root can still edit the table's
 /// other rules unnoticed.
@@ -77,30 +84,49 @@ fn probe() -> Result<()> {
     let own4 = UdpSocket::bind("127.0.0.1:0").context("cannot bind a 127.0.0.1 probe socket")?;
     let own6 = UdpSocket::bind("[::1]:0")
         .context("cannot bind a ::1 probe socket (is IPv6 disabled? the internet profile needs it on loopback)")?;
-    let v6 = |s: &str, port| SocketAddr::new(IpAddr::V6(s.parse().unwrap()), port);
-    let targets = [
-        own4.local_addr()?,
-        own6.local_addr()?,
-        // Before any off-host target: an older table stops here, and a
-        // canary that gets out goes to TEST-NET-1.
-        CANARY,
-        // One per private range (port 9: discard).
-        SocketAddr::from(([10, 255, 255, 1], 9)),
-        SocketAddr::from(([172, 31, 255, 1], 9)),
-        SocketAddr::from(([192, 168, 255, 1], 9)),
-        SocketAddr::from(([100, 127, 255, 1], 9)),
-        SocketAddr::from(([169, 254, 255, 1], 9)),
-        v6("fd7a:115c:a1e0::1", 9),
-        v6("64:ff9b::a00:1", 9),
-        // The DNS exception is for port 53 only.
-        SocketAddr::from(([127, 0, 0, 53], 54)),
-    ];
     // One at a time, loopback first: without the table the probe stops
     // at the first datagram, before anything could leave the host.
-    for to in targets {
-        verdict(&[(to, send_one(to))])?;
+    for (to, expect) in targets(own4.local_addr()?, own6.local_addr()?) {
+        verdict(&[(to, expect, send_one(to))])?;
     }
     Ok(())
+}
+
+/// What the probe sends to, in order, and what each must run into.
+fn targets(own4: SocketAddr, own6: SocketAddr) -> [(SocketAddr, Expect); 11] {
+    let v6 = |s: &str, port| SocketAddr::new(IpAddr::V6(s.parse().unwrap()), port);
+    let range = |to| (to, Expect::DropOrNoRoute);
+    [
+        (own4, Expect::Drop),
+        (own6, Expect::Drop),
+        // Before any off-host target: an older table stops here, and a
+        // canary that gets out goes to TEST-NET-1. Without a route to it
+        // (e.g. the laptop's Wi-Fi is down) the version goes unchecked
+        // until a probe finds a route again.
+        (CANARY, Expect::DropOrNoRoute),
+        // One per private range (port 9: discard).
+        range(SocketAddr::from(([10, 255, 255, 1], 9))),
+        range(SocketAddr::from(([172, 31, 255, 1], 9))),
+        range(SocketAddr::from(([192, 168, 255, 1], 9))),
+        range(SocketAddr::from(([100, 127, 255, 1], 9))),
+        range(SocketAddr::from(([169, 254, 255, 1], 9))),
+        range(v6("fd7a:115c:a1e0::1", 9)),
+        range(v6("64:ff9b::a00:1", 9)),
+        // The DNS exception is for port 53 only.
+        (SocketAddr::from(([127, 0, 0, 53], 54)), Expect::Drop),
+    ]
+}
+
+/// What a probe datagram must run into.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    /// The table's drop (`EPERM`).
+    Drop,
+    /// The table's drop, or no route at all (`ENETUNREACH`): the kernel
+    /// looks up the route before the output hook, and without one nothing
+    /// leaves. Only for off-host targets; never for loopback, which is
+    /// always routed.
+    DropOrNoRoute,
 }
 
 fn send_one(to: SocketAddr) -> io::Result<()> {
@@ -114,15 +140,21 @@ fn send_one(to: SocketAddr) -> io::Result<()> {
         .map(drop)
 }
 
-/// Every probe must have failed with `EPERM`.
-fn verdict(results: &[(SocketAddr, io::Result<()>)]) -> Result<()> {
-    for (to, r) in results {
-        match r {
-            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
-            Ok(()) => {
+/// Every probe must have failed as it [`Expect`]s.
+fn verdict(results: &[(SocketAddr, Expect, io::Result<()>)]) -> Result<()> {
+    for (to, expect, r) in results {
+        match (r, expect) {
+            (Err(e), _) if e.raw_os_error() == Some(libc::EPERM) => {}
+            (Err(e), Expect::DropOrNoRoute) if e.raw_os_error() == Some(libc::ENETUNREACH) => {}
+            (Ok(()), _) => {
                 bail!("a probe datagram to {to} was sent; the stallo nftables table is not loaded")
             }
-            Err(e) => bail!("the probe to {to} failed with \"{e}\" instead of EPERM"),
+            (Err(e), Expect::Drop) => {
+                bail!("the probe to {to} failed with \"{e}\" instead of EPERM")
+            }
+            (Err(e), Expect::DropOrNoRoute) => {
+                bail!("the probe to {to} failed with \"{e}\" instead of EPERM or ENETUNREACH")
+            }
         }
     }
     Ok(())
@@ -362,23 +394,58 @@ mod tests {
     }
 
     #[test]
-    fn verdict_needs_eperm_everywhere() {
+    fn verdict_fails_closed() {
         let to: SocketAddr = ([10, 255, 255, 1], 9).into();
-        let eperm = || Err(io::Error::from_raw_os_error(libc::EPERM));
-        verdict(&[(to, eperm()), (to, eperm())]).unwrap();
-        let sent = verdict(&[(to, eperm()), (to, Ok(()))]).unwrap_err();
-        assert!(sent.to_string().contains("not loaded"), "{sent}");
-        // A timeout or "unreachable" proves nothing about the table.
-        for errno in [
-            libc::ENETUNREACH,
-            libc::EHOSTUNREACH,
-            libc::EACCES,
-            libc::EAGAIN,
-        ] {
-            let r = verdict(&[(to, Err(io::Error::from_raw_os_error(errno)))]);
-            assert!(r.is_err(), "{errno}");
+        let err = |errno| Err(io::Error::from_raw_os_error(errno));
+        for expect in [Expect::Drop, Expect::DropOrNoRoute] {
+            verdict(&[
+                (to, expect, err(libc::EPERM)),
+                (to, expect, err(libc::EPERM)),
+            ])
+            .unwrap();
+            let sent =
+                verdict(&[(to, expect, err(libc::EPERM)), (to, expect, Ok(()))]).unwrap_err();
+            assert!(sent.to_string().contains("not loaded"), "{sent}");
+            // A timeout or a refusal by a route or another filter proves
+            // nothing about the table.
+            for errno in [libc::EHOSTUNREACH, libc::EACCES, libc::EINVAL, libc::EAGAIN] {
+                assert!(
+                    verdict(&[(to, expect, err(errno))]).is_err(),
+                    "{errno} {expect:?}"
+                );
+            }
         }
         assert!(verdict(&[]).is_ok());
+    }
+
+    /// No route: nothing leaves for an off-host range, but loopback is
+    /// always routed, so there it means something else is wrong.
+    #[test]
+    fn no_route_passes_only_off_host() {
+        let to: SocketAddr = "[fd7a:115c:a1e0::1]:9".parse().unwrap();
+        let unreach = || Err(io::Error::from_raw_os_error(libc::ENETUNREACH));
+        verdict(&[(to, Expect::DropOrNoRoute, unreach())]).unwrap();
+        let r = verdict(&[(to, Expect::Drop, unreach())]).unwrap_err();
+        assert!(r.to_string().contains("instead of EPERM"), "{r}");
+    }
+
+    /// Loopback is always routed, so its targets must never accept "no
+    /// route": they are what fails the probe offline without the table.
+    #[test]
+    fn loopback_targets_need_the_drop() {
+        let own4 = "127.0.0.1:40000".parse().unwrap();
+        let own6 = "[::1]:40000".parse().unwrap();
+        let all = targets(own4, own6);
+        assert_eq!(all[0].0, own4, "loopback goes first");
+        for (to, expect) in all {
+            if to.ip().is_loopback() {
+                assert!(matches!(expect, Expect::Drop), "{to}");
+            }
+        }
+        assert_eq!(
+            all.iter().filter(|(to, _)| to.ip().is_loopback()).count(),
+            3
+        );
     }
 
     /// Without the table (as on a dev host or in CI), the probe fails.
@@ -387,7 +454,7 @@ mod tests {
     fn unfiltered_loopback_fails_the_probe() {
         let own = UdpSocket::bind("127.0.0.1:0").unwrap();
         let to = own.local_addr().unwrap();
-        assert!(verdict(&[(to, send_one(to))]).is_err());
+        assert!(verdict(&[(to, Expect::Drop, send_one(to))]).is_err());
     }
 
     /// The child sees the socket under the parent's number; nothing else
