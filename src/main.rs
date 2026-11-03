@@ -288,9 +288,19 @@ fn fail(e: &anyhow::Error, json: bool) -> ExitCode {
             serde_json::json!({"ok": false, "error": format!("{e:#}")})
         );
     } else {
-        eprintln!("stallo: {e:#}");
+        eprintln!("stallo: {}", terminal_text(&format!("{e:#}")));
     }
     ExitCode::from(STALLO_ERROR)
+}
+
+/// `s` without control or bidi characters, line by line: errors can
+/// carry text from a guest (QGA and QMP replies), which must not drive the
+/// terminal.
+fn terminal_text(s: &str) -> String {
+    s.lines()
+        .map(|l| stallo::printable(l, 4096))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
@@ -1516,5 +1526,13 @@ mod tests {
         assert!(matches!(c.command, Cmd::New { vnc: true, .. }));
         let c = Cli::try_parse_from(["stallo", "new", "dev"]).unwrap();
         assert!(matches!(c.command, Cmd::New { vnc: false, .. }));
+    }
+
+    #[test]
+    fn guest_text_cannot_drive_the_terminal() {
+        assert_eq!(
+            terminal_text("exec failed: \u{1b}]0;owned\u{7}bad\u{202e}txt\nsecond\rline"),
+            "exec failed: ]0;ownedbadtxt\nsecondline"
+        );
     }
 }
