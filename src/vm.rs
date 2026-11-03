@@ -1911,7 +1911,7 @@ impl Running {
     /// QEMU's run state, e.g. `running`, `paused` or `io-error`.
     pub async fn status(&self) -> Result<String> {
         let v: Value = self.qmp.execute("query-status", None).await?;
-        Ok(v["status"].as_str().unwrap_or("unknown").to_owned())
+        Ok(crate::qmp::run_state(&v))
     }
 }
 
