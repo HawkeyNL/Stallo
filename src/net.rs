@@ -40,6 +40,10 @@ pub const GUEST_DNS: &str = "169.254.1.53";
 /// its limit to the hard limit.
 pub const PASST_MAX_FILES: libc::rlim_t = 4096;
 
+/// Largest file passt may write (`RLIMIT_FSIZE`). Its only file is its
+/// log, so a guest cannot make it fill the disk.
+pub const PASST_MAX_FILE_BYTES: libc::rlim_t = 16 << 20;
+
 /// passt's share of the VM cgroup's memory (it used 18-21 MiB in the lab).
 pub const PASST_MEMORY_MIB: u64 = 64;
 
@@ -302,22 +306,38 @@ pub fn spawn_passt(
         .process_group(0);
     crate::cgroup::move_on_exec(&mut cmd, cgroup)?;
     inherit_on_exec(&mut cmd, fd);
-    // SAFETY: runs in the forked child before exec; one setrlimit syscall
-    // on a stack value, nothing else.
+    limit_on_exec(&mut cmd);
+    cmd.spawn().context("cannot start passt")
+}
+
+/// passt's limits: [`PASST_MAX_FILES`] and [`PASST_MAX_FILE_BYTES`]. A
+/// write past the size limit fails with EFBIG instead of killing passt
+/// (SIGXFSZ), so a long log never takes the guest's network down.
+fn limit_on_exec(cmd: &mut Command) {
+    // SAFETY: runs in the forked child before exec; two setrlimit and one
+    // signal syscall on stack values, nothing else. An ignored signal stays
+    // ignored across exec.
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(|| {
-            let lim = libc::rlimit {
-                rlim_cur: PASST_MAX_FILES,
-                rlim_max: PASST_MAX_FILES,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            for (res, max) in [
+                (libc::RLIMIT_NOFILE, PASST_MAX_FILES),
+                (libc::RLIMIT_FSIZE, PASST_MAX_FILE_BYTES),
+            ] {
+                let lim = libc::rlimit {
+                    rlim_cur: max,
+                    rlim_max: max,
+                };
+                if libc::setrlimit(res, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    cmd.spawn().context("cannot start passt")
 }
 
 #[cfg(test)]
@@ -475,5 +495,26 @@ mod tests {
         let out = String::from_utf8(out.stdout).unwrap();
         assert!(out.starts_with("socket:["), "{out}");
         assert!(out.ends_with("closed\n"), "{out}");
+    }
+
+    /// A write past the size limit fails; the child lives on.
+    #[tokio::test]
+    async fn passt_logs_stop_at_the_limit() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("passt.log");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "head -c {} /dev/zero >{}; echo alive",
+                PASST_MAX_FILE_BYTES + 1,
+                log.display()
+            ))
+            .stdout(Stdio::piped());
+        limit_on_exec(&mut cmd);
+        let out = cmd.output().await.unwrap();
+        assert_eq!(out.status.signal(), None);
+        assert_eq!(out.stdout, b"alive\n");
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), PASST_MAX_FILE_BYTES);
     }
 }
