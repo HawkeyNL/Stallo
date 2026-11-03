@@ -192,8 +192,10 @@ const REMOVEXATTRAT: libc::c_long = 466;
 
 /// Syscalls QEMU never needs that reach beyond Landlock: file modes and
 /// owners (other VMs' disks, the API socket, cgroup files), extended
-/// attributes, other processes' I/O priority, and the user's keyrings.
-const DENIED: [libc::c_long; 20] = {
+/// attributes, other processes' I/O priority, the user's keyrings, and
+/// SysV IPC and POSIX message queues (shared with every other VM and the
+/// daemon's user).
+const DENIED: [libc::c_long; 34] = {
     use libc::*;
     [
         SYS_chmod,
@@ -216,6 +218,20 @@ const DENIED: [libc::c_long; 20] = {
         SYS_add_key,
         SYS_request_key,
         SYS_keyctl,
+        SYS_shmget,
+        SYS_shmat,
+        SYS_shmdt,
+        SYS_shmctl,
+        SYS_semget,
+        SYS_semop,
+        SYS_semtimedop,
+        SYS_semctl,
+        SYS_msgget,
+        SYS_msgsnd,
+        SYS_msgrcv,
+        SYS_msgctl,
+        SYS_mq_open,
+        SYS_mq_unlink,
     ]
 };
 
@@ -726,7 +742,7 @@ mod tests {
     }
 
     /// The seccomp part: no `connect`, no sockets but Unix streams, no
-    /// io_uring. Probed with python3, which the confined process may run.
+    /// io_uring, no SysV IPC or message queues. Probed with python3, which the confined process may run.
     #[test]
     fn sockets_and_io_uring_are_denied() {
         let tmp = tempfile::tempdir().unwrap();
@@ -767,6 +783,8 @@ libc = ctypes.CDLL(None, use_errno=True)
 assert libc.syscall(425, 1, ctypes.create_string_buffer(120)) == -1, "io_uring"
 assert ctypes.get_errno() == 38
 assert libc.syscall(250, 0, 0) == -1 and ctypes.get_errno() == 1, "keyctl"
+for nr, name in [(29, "shmget"), (64, "semget"), (68, "msgget"), (240, "mq_open")]:
+    assert libc.syscall(nr, 0, 0, 0, 0) == -1 and ctypes.get_errno() == 1, name
 '"#,
             api = api.display(),
             rt = rt.display()

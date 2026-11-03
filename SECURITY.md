@@ -26,7 +26,8 @@ own runtime directory, the read-only base image and the system files and
 devices QEMU needs, with no TCP; a seccomp filter blocks `connect`, every
 socket other than a Unix stream socket, io_uring, changing file modes,
 owners or extended attributes, resource limits and I/O priority of other
-processes, and the user's keyrings. A guest that escapes
+processes, the user's keyrings, and SysV IPC and POSIX message queues
+shared with the other VMs. A guest that escapes
 into QEMU therefore cannot open other VMs' disks or sockets, the daemon's
 socket, cgroup files or the user's home. VMs do not start on kernels
 without Landlock ABI 6 (Linux 6.12).
