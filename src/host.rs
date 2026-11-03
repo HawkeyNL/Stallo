@@ -200,6 +200,7 @@ pub async fn watchdog(manager: Arc<Manager>) {
     loop {
         tick.tick().await;
         manager.check_confinement();
+        manager.cap_logs();
         let floor = manager.config.host.disk_floor_gib;
         let free = match disk_free(&manager.paths.data) {
             Ok(f) => f,
