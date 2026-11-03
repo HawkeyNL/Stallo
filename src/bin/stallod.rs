@@ -446,7 +446,9 @@ async fn dispatch(
             let client_gone = async move {
                 let _ = tokio::io::copy(&mut client, &mut tokio::io::sink()).await;
             };
-            let out = m.run(&name, &argv, admin, limit, client_gone).await?;
+            let out = m
+                .run(&name, &argv, admin, via == Via::Mcp, limit, client_gone)
+                .await?;
             json!(ExecResult {
                 exit_code: out.exit_code,
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -589,7 +591,9 @@ async fn dispatch(
             m.resume(&name).await?;
             Value::Null
         }
-        Request::Snapshot { name, tag } => json!(m.snapshot(&name, tag.as_deref()).await?),
+        Request::Snapshot { name, tag } => {
+            json!(m.snapshot(&name, tag.as_deref(), via == Via::Mcp).await?)
+        }
         Request::Snapshots { name } => json!(m.snapshots(&name).await?),
         Request::Restore { name, tag } => json!(m.restore(&name, tag.as_deref()).await?),
         Request::SnapshotDelete { name, tag } => {

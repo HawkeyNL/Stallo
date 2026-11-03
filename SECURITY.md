@@ -104,7 +104,10 @@ VM creation unless `agents_can_create = true` in `stallod.toml`, and
 never lets agents delete VMs, pull or delete images, resume VMs, change
 agent control, turn VNC on (also not through `new`) or change a VM's CPUs
 and memory: agent control of a small VM must not let an agent claim the
-host's CPU and memory budget. Nor may agents create VMs from installer
+host's CPU and memory budget. Nor its disk: an agent's snapshot, run or new
+VM is refused unless the data disk keeps its floor free with room for a
+full rewrite of that VM's disk and for everything the agent's other VMs
+may still write. Nor may agents create VMs from installer
 ISOs (or from images the daemon does not know as cloud images) or change
 what is in a VM's CD-ROM drive: those are installed by hand over VNC. Such
 a guest has no guest agent until its user installs one: until then,

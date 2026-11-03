@@ -522,8 +522,11 @@ impl Manager {
     /// Takes a snapshot named `tag` (default `snap<N>`). A running VM's
     /// snapshot holds its RAM; a stopped VM's holds disk and firmware
     /// variables only. Refused unless the data disk keeps its floor free,
-    /// with room for the guest RAM when it is saved.
-    pub async fn snapshot(&self, name: &str, tag: Option<&str>) -> Result<Taken> {
+    /// with room for the guest RAM when it is saved. For an `agent`, also
+    /// with room for a full rewrite of the disk (the snapshot keeps the old
+    /// blocks, and agents cannot delete snapshots) and for what its other
+    /// VMs may still write.
+    pub async fn snapshot(&self, name: &str, tag: Option<&str>, agent: bool) -> Result<Taken> {
         let started = Instant::now();
         self.check_exists(name)?;
         let _op = self.lock(name).await?;
@@ -535,11 +538,17 @@ impl Manager {
         };
         let tag = pick_new_name(&names, tag)?;
         let ram = vm.as_ref().map_or(0, |vm| vm.config.memory_mib << 20);
-        host::check_snapshot_space(
-            host::disk_free(&self.paths.data)?,
-            self.config.host.disk_floor_gib,
-            ram,
-        )?;
+        let free = host::disk_free(&self.paths.data)?;
+        host::check_snapshot_space(free, self.config.host.disk_floor_gib, ram)?;
+        if agent {
+            let disk = self.load(name)?.disk_gib << 30;
+            host::check_agent_space(
+                free,
+                self.config.host.disk_floor_gib,
+                ram.saturating_add(disk),
+                self.agent_disk_reserve(name)?,
+            )?;
+        }
         let pause = match &vm {
             Some(vm) => {
                 let file = state_file(&vm_dir, &tag);
@@ -1217,7 +1226,8 @@ mod tests {
             image: "local-win11".into(),
             vcpus: 2,
             memory_mib: 4096,
-            disk_gib: 64,
+            // Far more than any test machine has free.
+            disk_gib: 16384,
             net: crate::config::NetProfile::Offline,
             agent_control: false,
             throwaway_of: None,
@@ -1231,9 +1241,13 @@ mod tests {
         let state = dir.join("tpm/tpm2-00.permall");
         crate::paths::ensure_private_dir(&dir.join("tpm")).unwrap();
         std::fs::write(&state, b"d1").unwrap();
-        assert!(!m.snapshot("win", Some("d1")).await.unwrap().ram);
+        assert!(!m.snapshot("win", Some("d1"), false).await.unwrap().ram);
         std::fs::write(&state, b"d2").unwrap();
-        m.snapshot("win", Some("d2")).await.unwrap();
+        m.snapshot("win", Some("d2"), false).await.unwrap();
+        // An agent needs room for a full rewrite of the disk.
+        let err = m.snapshot("win", Some("d3"), true).await.unwrap_err();
+        assert!(err.to_string().contains("for an agent"), "{err:#}");
+        assert_eq!(m.snapshots("win").await.unwrap().len(), 2);
         std::fs::write(&state, b"now").unwrap();
 
         // d1 loses its tag on the variables: its restore fails in the images.

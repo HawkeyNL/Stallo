@@ -466,6 +466,14 @@ impl Manager {
         // Refuse early, before downloading or writing anything.
         self.check_net(&cfg)?;
         self.admit(&cfg, cfg.disk_gib << 30)?;
+        if new.agent_control {
+            host::check_agent_space(
+                host::disk_free(&self.paths.data)?,
+                self.config.host.disk_floor_gib,
+                cfg.disk_gib << 30,
+                self.agent_disk_reserve(&cfg.name)?,
+            )?;
+        }
         if new.may_pull && !images::is_local(&cfg.image) {
             self.pull(&cfg.image).await?;
         }
@@ -986,6 +994,17 @@ impl Manager {
             .map(|r| self.cgroups.unused_memory_bytes(&r.config.name) >> 20)
             .sum();
         host::snapshot(&self.paths.data, &self.config.host, &vms, unfaulted_mib)
+    }
+
+    /// What the VMs an agent controls and the clones of runs, other than
+    /// `except`, may still write: each disk's full virtual size, since after
+    /// a snapshot a full rewrite takes new space again.
+    pub(crate) fn agent_disk_reserve(&self, except: &str) -> Result<u64> {
+        Ok(self
+            .list()?
+            .iter()
+            .filter(|c| (c.agent_control || c.throwaway_of.is_some()) && c.name != except)
+            .fold(0u64, |sum, c| sum.saturating_add(c.disk_gib << 30)))
     }
 
     /// Whether `cfg` fits next to the running VMs, with `disk_bytes` of new

@@ -165,6 +165,30 @@ pub fn check_snapshot_space(free_bytes: u64, floor_gib: u64, need_bytes: u64) ->
     Ok(())
 }
 
+/// Agent requests only: `need_bytes` (what this request may take) and
+/// `reserve` (what the agent's other VMs may still write) must fit above
+/// the floor, so an agent cannot push the disk below it and pause every VM.
+pub fn check_agent_space(
+    free_bytes: u64,
+    floor_gib: u64,
+    need_bytes: u64,
+    reserve: u64,
+) -> Result<()> {
+    let need = floor_gib
+        .saturating_mul(GIB)
+        .saturating_add(need_bytes)
+        .saturating_add(reserve);
+    ensure!(
+        free_bytes >= need,
+        "not enough disk space for an agent: {:.1} GiB free, {:.1} GiB needed ({floor_gib} GiB floor + {:.1} GiB for this request + {:.1} GiB the agent's VMs may still write)",
+        free_bytes as f64 / GIB as f64,
+        need as f64 / GIB as f64,
+        need_bytes as f64 / GIB as f64,
+        reserve as f64 / GIB as f64
+    );
+    Ok(())
+}
+
 /// Whether an image download fits: what the pull may take
 /// (`images::pull_reserve`), less what a partial download already holds,
 /// must fit above the floor. Checked before every image download.
@@ -326,6 +350,19 @@ mod tests {
     fn floor() {
         assert!(below_floor(19 * GIB, 20));
         assert!(!below_floor(20 * GIB, 20));
+    }
+
+    #[test]
+    fn agent_space() {
+        assert!(check_agent_space(25 * GIB, 20, 2 * GIB, 3 * GIB).is_ok());
+        let err = check_agent_space(25 * GIB - 1, 20, 2 * GIB, 3 * GIB).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("+ 2.0 GiB for this request + 3.0 GiB the agent's VMs may still write"),
+            "{err}"
+        );
+        assert!(check_agent_space(u64::MAX, u64::MAX, u64::MAX, u64::MAX).is_ok());
+        assert!(check_agent_space(u64::MAX - 1, 0, u64::MAX, 0).is_err());
     }
 
     #[test]
