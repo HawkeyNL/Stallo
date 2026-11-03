@@ -217,7 +217,7 @@ own `swtpm` process (`src/tpm.rs`):
 - **State.** `/var/lib/stallo/vms/<vm>/tpm/` (0700), created at the first
   start; `stallo rm` removes it with the VM. No `swtpm_setup`, no EK
   certificates, no state encryption: Windows Setup only needs a TPM 2.0.
-  Its log is `swtpm.log` in the VM directory.
+  Its log is `swtpm.log` in the VM directory, at most 16 MiB.
 - **Confinement.** swtpm runs TPM commands from the guest (libtpms), so it
   is confined like QEMU: a Landlock ruleset with read-only `/usr`
   (executing only swtpm and the ELF loader) and its own `tpm/` only (no

@@ -44,6 +44,11 @@ ruleset limited to its own TPM state directory, and in production the
 AppArmor profile `stallo-swtpm`, checked like QEMU's
 (see `docs/production.md`).
 
+A guest may make QEMU, passt or swtpm write log lines, so no log can
+fill the disk: `passt.log` and `swtpm.log` stop at 16 MiB
+(`RLIMIT_FSIZE`), and the daemon empties a `qemu.log` larger than 16 MiB
+every 10 s (QEMU writes its own disks, so it gets no size limit).
+
 ## Remote MCP
 
 `stallo mcp --http <ip>:<port>` serves the agent tools over HTTP. It is a

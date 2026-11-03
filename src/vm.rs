@@ -151,6 +151,8 @@ pub struct Running {
     pub(crate) qga: tokio::sync::Mutex<Option<Qga>>,
     /// Paused by the disk watchdog.
     pub(crate) disk_full: AtomicBool,
+    /// The daemon's handle on QEMU's stderr, for [`Manager::cap_logs`].
+    qemu_log: fs::File,
     /// Set when passt is gone: cut because the host's isolation went
     /// away, or exited by itself. The guest stays up without network until
     /// it restarts.
@@ -779,6 +781,7 @@ impl Manager {
             }
             None => (None, None),
         };
+        let qemu_log = log.try_clone()?;
         let mut cmd = Command::new(qemu::QEMU);
         cmd.args(argv)
             .stdin(Stdio::null())
@@ -963,6 +966,7 @@ impl Manager {
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
+            qemu_log,
             net_down,
             cut_net,
             exited: rx,
@@ -1357,6 +1361,23 @@ impl Manager {
                 if let Err(e) = self.cgroups.kill_vm(&vm.config.name) {
                     tracing::error!("{}: {e:#}", vm.config.name);
                 }
+            }
+        }
+    }
+
+    /// Empties every running VM's qemu.log that has grown past
+    /// [`MAX_LOG_BYTES`]: QEMU writes its own disks, so unlike passt and
+    /// swtpm it cannot get `RLIMIT_FSIZE`.
+    pub fn cap_logs(&self) {
+        for vm in self.all_running() {
+            match cap_log(&vm.qemu_log) {
+                Ok(true) => tracing::warn!(
+                    "{}: qemu.log passed {} MiB; emptied it",
+                    vm.config.name,
+                    MAX_LOG_BYTES >> 20
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::error!("{}: cannot cap qemu.log: {e:#}", vm.config.name),
             }
         }
     }
@@ -2051,19 +2072,34 @@ fn file_status(out: &ExecOutput, what: &str, path: &str) -> Result<()> {
     bail!("cannot {what} {}: {reason}", path.escape_debug())
 }
 
+/// Largest qemu.log the watchdog leaves alone (checked every
+/// [`crate::host::WATCHDOG_INTERVAL`]), so a guest cannot make QEMU's
+/// messages fill the disk.
+const MAX_LOG_BYTES: u64 = 16 << 20;
+
 /// A fresh log file only the daemon user can read (mode 0600 even if it
-/// existed with other permissions).
+/// existed with other permissions). Append mode, so writes after
+/// [`cap_log`] empties it land at the new end instead of past a hole.
 fn private_log(path: &Path) -> Result<fs::File> {
     let log = fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
+    log.set_len(0)?;
     log.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(log)
+}
+
+/// Empties `log` if it is larger than [`MAX_LOG_BYTES`]; `true` if it did.
+fn cap_log(log: &fs::File) -> std::io::Result<bool> {
+    if log.metadata()?.len() <= MAX_LOG_BYTES {
+        return Ok(false);
+    }
+    log.set_len(0)?;
+    Ok(true)
 }
 
 /// QEMU's own memory on top of guest RAM: `max(minimum, memory / 16)`.
@@ -2249,6 +2285,32 @@ mod tests {
         assert!(take_capped(dir.path(), 3).is_err());
     }
 
+    #[test]
+    fn capped_logs() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qemu.log");
+        fs::write(&path, b"old run").unwrap();
+        let log = private_log(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0, "emptied at start");
+        let mut child = log.try_clone().unwrap();
+        child
+            .write_all(&vec![b'x'; MAX_LOG_BYTES as usize])
+            .unwrap();
+        assert!(!cap_log(&log).unwrap(), "at the cap: left alone");
+        child.write_all(b"x").unwrap();
+        assert!(cap_log(&log).unwrap());
+        child.write_all(b"next").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            4,
+            "the child's next write lands at the new end"
+        );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(private_log(&link).is_err());
+    }
+
     /// A fake QEMU that records commands, reports `status` and fails the
     /// `fail_at`th `input-send-event` (1-based).
     async fn fake_vm(
@@ -2322,6 +2384,7 @@ mod tests {
             screen_size: Mutex::new(qemu::SCREEN),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
+            qemu_log: private_log(&dir.path().join("qemu.log")).unwrap(),
             net_down: Arc::default(),
             cut_net: None,
             exited,
