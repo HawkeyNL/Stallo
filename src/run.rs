@@ -49,6 +49,7 @@ impl Manager {
         source: &str,
         argv: &[String],
         admin: bool,
+        agent: bool,
         limit: Duration,
         cancel: impl Future<Output = ()>,
     ) -> Result<ExecOutput> {
@@ -75,6 +76,15 @@ impl Manager {
             src.machine.is_linux(),
             "{source} is a Windows VM; `stallo run` is for Linux VMs"
         );
+        // The clone may grow to the source's full disk size.
+        if agent {
+            crate::host::check_agent_space(
+                crate::host::disk_free(&self.paths.data)?,
+                self.config.host.disk_floor_gib,
+                src.disk_gib << 30,
+                self.agent_disk_reserve(source)?,
+            )?;
+        }
 
         let name = format!("{RUN_PREFIX}{}", &new_uuid()?[..8]);
         let _clone_op = self.lock_for_run(&name)?;
@@ -262,11 +272,17 @@ mod tests {
         vm("dev", None).save(&dir).unwrap();
         let argv = ["true".to_owned()];
         let t = Duration::from_secs(5);
-        assert!(m.run("dev", &argv, false, t, async {}).await.is_err());
+        assert!(
+            m.run("dev", &argv, false, false, t, async {})
+                .await
+                .is_err()
+        );
         assert_eq!(fs::read_dir(m.paths.vms_dir()).unwrap().count(), 1);
         assert!(m.in_run.lock().unwrap().is_empty());
         assert!(m.lock_for_run("dev").is_ok(), "the source is free again");
-        let bad = m.run("dev", &argv, false, Duration::ZERO, async {}).await;
+        let bad = m
+            .run("dev", &argv, false, false, Duration::ZERO, async {})
+            .await;
         assert!(bad.unwrap_err().to_string().contains("timeout"));
     }
 
@@ -547,6 +563,67 @@ mod tests {
         assert!(!m.paths.images_dir().join(".partial-ubuntu-26.04").exists());
     }
 
+    /// Agents' snapshots, new VMs and runs need room above the floor for
+    /// every disk an agent may still write; humans' requests do not.
+    #[tokio::test]
+    async fn agents_keep_a_disk_reserve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let mut config = DaemonConfig::default();
+        // A test's temporary directory may be on a small tmpfs.
+        config.host.disk_floor_gib = 0;
+        let m = Manager::new(paths, config, Cgroups::at(root.join("cg")), Mode::Dev);
+        m.cleanup_leftovers().await.unwrap();
+        // Far more than any test machine has free.
+        let big = VmConfig {
+            disk_gib: 16384,
+            agent_control: true,
+            ..vm("big", None)
+        };
+        for cfg in [big, vm("human", None), vm("run-1234", Some("human"))] {
+            let dir = m.paths.vm_dir(&cfg.name);
+            fs::create_dir(&dir).unwrap();
+            cfg.save(&dir).unwrap();
+        }
+        assert_eq!(m.agent_disk_reserve("x").unwrap(), (16384 + 10) << 30);
+        assert_eq!(m.agent_disk_reserve("big").unwrap(), 10 << 30);
+
+        let agent_space = |e: anyhow::Error| e.to_string().contains("for an agent");
+        let argv = ["true".to_owned()];
+        let t = Duration::from_secs(5);
+        let err = m.run("human", &argv, false, true, t, async {}).await;
+        assert!(agent_space(err.unwrap_err()));
+        let err = m.run("human", &argv, false, false, t, async {}).await;
+        assert!(
+            !agent_space(err.unwrap_err()),
+            "a human's run is not budgeted"
+        );
+
+        let mut new = crate::vm::NewVm {
+            name: "agent".into(),
+            image: "ubuntu-26.04".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_gib: 1,
+            net: NetProfile::Offline,
+            forwards: vec![],
+            agent_control: true,
+            may_pull: false,
+            vnc: false,
+        };
+        assert!(agent_space(m.create(&new).await.unwrap_err()));
+        new.agent_control = false;
+        assert!(!agent_space(m.create(&new).await.unwrap_err()));
+        assert!(!m.paths.vm_dir("agent").exists());
+    }
+
     #[tokio::test]
     async fn clone_names_are_reserved() {
         let tmp = tempfile::tempdir().unwrap();
@@ -636,7 +713,7 @@ mod tests {
         win.save(&dir).unwrap();
         let argv = ["true".to_owned()];
         let err = m
-            .run("win", &argv, false, Duration::from_secs(5), async {})
+            .run("win", &argv, false, false, Duration::from_secs(5), async {})
             .await
             .unwrap_err();
         assert!(err.to_string().contains("is a Windows VM"), "{err}");
