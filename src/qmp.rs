@@ -245,6 +245,21 @@ async fn read_loop(
     pending.lock().unwrap().take();
 }
 
+/// The run state in a `query-status` reply, e.g. `running`. QEMU's names
+/// are lowercase words with dashes; anything else (from a QEMU a guest may
+/// control) is "unknown", so it never reaches a terminal or a client.
+pub fn run_state(reply: &Value) -> String {
+    match reply["status"].as_str() {
+        Some(s)
+            if (1..=32).contains(&s.len())
+                && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') =>
+        {
+            s.to_owned()
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +267,22 @@ mod tests {
     use tokio::net::UnixListener;
 
     const GREETING: &str = r#"{"QMP": {"version": {}, "capabilities": []}}"#;
+
+    #[test]
+    fn run_states_are_plain_names() {
+        assert_eq!(run_state(&json!({"status": "running"})), "running");
+        assert_eq!(run_state(&json!({"status": "io-error"})), "io-error");
+        for bad in [
+            json!({}),
+            json!({"status": 1}),
+            json!({"status": ""}),
+            json!({"status": "x\u{1b}]0;t\u{7}"}),
+            json!({"status": "Running"}),
+            json!({"status": "a".repeat(33)}),
+        ] {
+            assert_eq!(run_state(&bad), "unknown", "{bad}");
+        }
+    }
 
     /// Starts a fake QEMU that greets, accepts `qmp_capabilities` and then
     /// hands the connection to `script`.
