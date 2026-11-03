@@ -280,7 +280,7 @@ pub async fn delete(qmp: &Qmp, tag: &str) -> Result<()> {
 
 async fn status(qmp: &Qmp) -> Result<String> {
     let v = qmp.execute("query-status", None).await?;
-    Ok(v["status"].as_str().unwrap_or("unknown").to_owned())
+    Ok(crate::qmp::run_state(&v))
 }
 
 /// Resumes the guest unless it runs or `hold` (the disk watchdog paused it)
