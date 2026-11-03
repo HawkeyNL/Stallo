@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stallo APT repository</title>
+<h1>Stallo APT repository</h1>
+<p>Ubuntu 26.04, amd64. Channels: <code>stable</code> (releases) and
+<code>edge</code> (every change to main). Check the key's fingerprint
+against the one the owner published before you trust it.</p>
+<pre>
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/stallo.asc https://hawkeynl.github.io/Stallo/stallo.asc
+gpg --show-keys /etc/apt/keyrings/stallo.asc
+sudo tee /etc/apt/sources.list.d/stallo.sources &gt;/dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://hawkeynl.github.io/Stallo/
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/stallo.asc
+EOF
+sudo apt update &amp;&amp; sudo apt install stallo
+</pre>
+<p>Use <code>Suites: edge</code> for the edge channel. More:
+<a href="https://github.com/HawkeyNL/Stallo/blob/main/docs/apt-repo.md">docs/apt-repo.md</a>.</p>
+</html>
