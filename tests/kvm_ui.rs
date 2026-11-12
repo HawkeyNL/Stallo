@@ -36,10 +36,17 @@ fn ui_channel() {
     d.ok(&[
         "new", "ui", "--image", &d.image, "--cpus", "1", "--mem", "1G", "--disk", "10G",
     ]);
+    // Through `ok`, so a failed exec never passes for a missing port.
     let has_port = |d: &Daemon| {
-        d.stallo(&["exec", "ui", "--", "test", "-e", PORT])
-            .status
-            .success()
+        let out = d.ok(&[
+            "exec",
+            "ui",
+            "--",
+            "sh",
+            "-c",
+            &format!("test -e {PORT} && echo yes || echo no"),
+        ]);
+        out.trim() == "yes"
     };
     // Off for a VM from a cloud image; refused while running.
     assert!(!has_port(&d));
@@ -103,6 +110,10 @@ fn ui_channel() {
     // A RAM snapshot holds the port: it restores with it, and the port
     // cannot change while the snapshot exists.
     d.ok(&["snap", "ui", "s1"]);
+    d.ok(&["restore", "ui", "s1"]);
+    assert!(has_port(&d));
+    // Also from a stopped VM.
+    d.ok(&["stop", "ui"]);
     d.ok(&["restore", "ui", "s1"]);
     assert!(has_port(&d));
     d.ok(&["stop", "ui"]);
