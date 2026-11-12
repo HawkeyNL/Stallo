@@ -11,6 +11,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use common::Daemon;
+use stallo::api::{Request, Via};
+use stallo::ui::Action;
 
 const PORT: &str = "/dev/virtio-ports/org.stallo.ui.0";
 
@@ -132,13 +134,16 @@ fn ui_channel() {
 }
 
 /// A stand-in for the real helper: answers `hello` and `tree` with the
-/// `small.json` fixture, or in `hostile` mode answers `tree` with a 2 MiB
-/// line and junk but never a reply. Touches /root/<unit>.ready once it
+/// `small.json` fixture (`small-after.json` once /root/switch exists),
+/// `probe` with the node's bbox (every node hit but `a3`), and `focus` and
+/// `invoke` with ok. In `hostile` mode it answers `tree` with a 2 MiB line
+/// and junk but never a reply. Touches /root/<unit>.ready once it
 /// holds the port.
 const FAKE_HELPER: &str = r#"
 import json, os, sys, time
 mode = sys.argv[1]
 tree = json.load(open('/root/tree.json'))
+after = json.load(open('/root/after.json'))
 f = os.open('/dev/virtio-ports/org.stallo.ui.0', os.O_RDWR)
 open('/root/' + sys.argv[2] + '.ready', 'w').close()
 def send(b):
@@ -159,8 +164,14 @@ while True:
         elif mode == 'hostile':
             send(b'x' * (2 << 20) + b'\njunk\n')
             continue
+        elif req['op'] == 'tree':
+            t = after if os.path.exists('/root/switch') else tree
+            out = {'id': req['id'], 'ok': True, 'tree': t}
+        elif req['op'] == 'probe':
+            node = [n for n in tree['nodes'] if n['key'] == req['key']][0]
+            out = {'id': req['id'], 'ok': True, 'bbox': node.get('bbox'), 'hit': req['key'] != 'a3'}
         else:
-            out = {'id': req['id'], 'ok': True, 'tree': tree}
+            out = {'id': req['id'], 'ok': True}
         send((json.dumps(out) + '\n').encode())
 "#;
 
@@ -195,6 +206,11 @@ fn ui_tree_from_a_helper() {
     std::fs::write(&script, FAKE_HELPER).unwrap();
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ui/small.json");
     d.ok(&["cp", "--admin", fixture, "ui:/root/tree.json"]);
+    let after = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ui/small-after.json"
+    );
+    d.ok(&["cp", "--admin", after, "ui:/root/after.json"]);
     d.ok(&[
         "cp",
         "--admin",
@@ -258,6 +274,62 @@ fn ui_tree_from_a_helper() {
     assert_eq!(
         again.split_once('\n').unwrap().1,
         first.split_once('\n').unwrap().1
+    );
+
+    // Acting by id: a click reaches QMP only where the helper's hit test
+    // finds the control.
+    let act = |action, id: &str| {
+        let r = d.api(
+            Via::Cli,
+            Request::UiAct {
+                name: "ui".into(),
+                action,
+                id: Some(id.into()),
+                text: None,
+                keys: None,
+                dy: None,
+                settle_ms: Some(0),
+                until: None,
+            },
+        );
+        r.map(|v| v["text"].as_str().unwrap().to_owned())
+    };
+    let out = act(Action::Click, "e2").unwrap();
+    assert!(out.starts_with("clicked e2 at 26,56\n"), "{out}");
+    let e = act(Action::Click, "e3").unwrap_err().to_string();
+    assert!(e.contains("e3 is covered by something else"), "{e}");
+    assert!(
+        act(Action::Invoke, "e6")
+            .unwrap()
+            .starts_with("invoked e6\n")
+    );
+    // A dialog opens in the guest two seconds later.
+    d.ok(&[
+        "exec",
+        "ui",
+        "--admin",
+        "--",
+        "systemd-run",
+        "--on-active=2",
+        "touch",
+        "/root/switch",
+    ]);
+    let waited = d
+        .api(
+            Via::Cli,
+            Request::UiWait {
+                name: "ui".into(),
+                until: "Save As".into(),
+                gone: false,
+                timeout_ms: Some(20_000),
+            },
+        )
+        .unwrap();
+    let waited = waited["text"].as_str().unwrap();
+    assert!(waited.starts_with("matched after "), "{waited}");
+    assert!(
+        waited.contains(" window \"Save As\" (gedit) active"),
+        "{waited}"
     );
 
     // The guest went back: its ids start over.

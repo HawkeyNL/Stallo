@@ -133,6 +133,25 @@ pub fn describe(r: &Request) -> Described<'_> {
         Request::Info { name } => ("info", Some(name), vec![], None),
         Request::Reset { name } => ("reset", Some(name), vec![], None),
         Request::Screenshot { name } => ("screenshot", Some(name), vec![], None),
+        Request::UiAct {
+            name,
+            text,
+            keys,
+            until,
+            ..
+        } => (
+            "ui_act",
+            Some(name),
+            vec![
+                ("keys", keys.as_deref().map_or(0, len)),
+                ("text", text.as_deref().map_or(0, len)),
+                ("until", until.as_deref().map_or(0, len)),
+            ],
+            None,
+        ),
+        Request::UiWait { name, until, .. } => {
+            ("ui_wait", Some(name), vec![("until", len(until))], None)
+        }
         Request::UiTree {
             name, find, all, ..
         } => (
@@ -452,6 +471,22 @@ mod tests {
             all: false,
             max_chars: None,
         };
+        let act = Request::UiAct {
+            name: "dev".into(),
+            action: crate::ui::Action::Type,
+            id: Some("e4".into()),
+            text: Some("hunter2".into()),
+            keys: None,
+            dy: None,
+            settle_ms: None,
+            until: Some("Saved".into()),
+        };
+        let line = entry(&act);
+        assert!(
+            line.contains(r#""op":"ui_act","args":{"keys":0,"text":7,"until":5}"#),
+            "{line}"
+        );
+        assert!(!line.contains("hunter2") && !line.contains("Saved"));
         let line = entry(&tree);
         assert!(
             line.contains(r#""op":"ui_tree","args":{"all":0,"find":11}"#),
