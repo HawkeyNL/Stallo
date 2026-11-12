@@ -460,6 +460,7 @@ impl Manager {
             throwaway_of: None,
             forwards: new.forwards.clone(),
             vnc: new.vnc || iso,
+            ui: iso,
             cdrom: iso.then(|| new.image.clone()),
             machine: images::image_os(&self.paths, &new.image)?,
         };
@@ -1187,6 +1188,35 @@ impl Manager {
             "{name} has RAM snapshots ({}) that only restore with its current network; delete them first: stallo snap {name} --delete <name>",
             ram.join(", ")
         );
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok(cfg)
+    }
+
+    /// Adds or removes a stopped VM's UI channel (see [`VmConfig::ui`]).
+    /// Refused while the VM has RAM snapshots: their device state holds
+    /// the port (or its absence), so they only restore with it as it is.
+    pub async fn set_ui(&self, name: &str, on: bool) -> Result<VmConfig> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        ensure!(
+            self.running(name).is_none(),
+            "{name} is running; stop it first to change its UI channel: stallo stop {name}"
+        );
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        if cfg.ui == on {
+            return Ok(cfg);
+        }
+        let ram = self.ram_snapshots(name).await?;
+        ensure!(
+            ram.is_empty(),
+            "{name} has RAM snapshots ({}) that only restore with its current UI channel; delete them first: stallo snap {name} --delete <name>",
+            ram.join(", ")
+        );
+        cfg.ui = on;
         cfg.save(&self.paths.vm_dir(name))?;
         Ok(cfg)
     }
@@ -2370,6 +2400,7 @@ mod tests {
                 throwaway_of: None,
                 forwards: vec![],
                 vnc: false,
+                ui: false,
                 cdrom: None,
                 machine: images::Os::Linux,
             },
@@ -3071,6 +3102,87 @@ mod tests {
             }
         );
         assert_eq!(m.load("win").unwrap(), cfg, "vm.toml round-trip");
+    }
+
+    /// The UI channel: any VM but a clone, only while stopped and without
+    /// RAM snapshots; saved in vm.toml.
+    #[tokio::test]
+    async fn ui_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        m.cleanup_leftovers().await.unwrap();
+        let (_d, running, _) = fake_vm("running", None).await;
+        let dev = running.config.clone();
+        let clone = VmConfig {
+            name: "run-0a1b2c3d".into(),
+            throwaway_of: Some("dev".into()),
+            ..dev.clone()
+        };
+        for cfg in [&dev, &clone] {
+            let dir = m.paths.vm_dir(&cfg.name);
+            fs::create_dir(&dir).unwrap();
+            cfg.save(&dir).unwrap();
+        }
+        let err = |r: Result<VmConfig>| r.unwrap_err().to_string();
+
+        assert!(err(m.set_ui("nope", true).await).contains("nope"));
+        assert!(err(m.set_ui("run-0a1b2c3d", true).await).contains("clone"));
+        m.running
+            .lock()
+            .unwrap()
+            .insert("dev".into(), Arc::new(running));
+        let e = err(m.set_ui("dev", true).await);
+        assert!(e.contains("dev is running; stop it first"), "{e}");
+        m.running.lock().unwrap().clear();
+        assert_eq!(m.load("dev").unwrap(), dev, "nothing saved");
+        // Unchanged: nothing to check.
+        assert_eq!(m.set_ui("dev", false).await.unwrap(), dev);
+
+        // Below: snapshots are listed with a confined qemu-img.
+        if !confine::available() {
+            return;
+        }
+        let dir = m.paths.vm_dir("dev");
+        for (file, size) in [(qemu::DISK, "1G"), (qemu::VARS, "1M")] {
+            let ok = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2"])
+                .arg(dir.join(file))
+                .arg(size)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        crate::snapshot::create_offline(&dir, "s1").await.unwrap();
+        ensure_private_dir(&dir.join(qemu::STATES)).unwrap();
+        fs::write(crate::snapshot::state_file(&dir, "s1"), b"ram").unwrap();
+        let e = err(m.set_ui("dev", true).await);
+        assert!(e.contains("RAM snapshots (s1)"), "{e}");
+        assert_eq!(m.load("dev").unwrap(), dev, "nothing saved");
+        fs::remove_file(crate::snapshot::state_file(&dir, "s1")).unwrap();
+        let on = m.set_ui("dev", true).await.unwrap();
+        assert_eq!(
+            on,
+            VmConfig {
+                ui: true,
+                ..dev.clone()
+            }
+        );
+        assert_eq!(m.load("dev").unwrap(), on, "vm.toml round-trip");
+        assert!(!m.set_ui("dev", false).await.unwrap().ui);
     }
 
     /// An import is refused at once while a pull, removal, VM creation or

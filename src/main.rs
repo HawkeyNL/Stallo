@@ -157,6 +157,10 @@ enum Cmd {
         /// be stopped).
         #[arg(long, value_enum, group = "change")]
         net: Option<Net>,
+        /// The channel for the Stallo UI helper in the guest (the VM must
+        /// be stopped and have no RAM snapshots).
+        #[arg(long, value_enum, group = "change")]
+        ui: Option<OnOff>,
         /// Empty the CD-ROM drive of a VM made from an installer ISO
         /// (`eject`), or put a pulled ISO in it (its image id).
         #[arg(long, value_name = "eject|ISO", group = "change")]
@@ -525,6 +529,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cpus,
             mem,
             net,
+            ui,
             cdrom,
         } => {
             // First, so a running VM is refused before VNC changes.
@@ -562,6 +567,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 net_result = Some(v);
             }
+            let mut ui_result = None;
+            if let Some(ui) = ui {
+                let on = matches!(ui, OnOff::On);
+                let v = call(Request::SetUi {
+                    name: vm.clone(),
+                    on,
+                })
+                .await
+                .map_err(|e| match (&resources, &net_result) {
+                    (None, None) => e,
+                    _ => e.context(format!(
+                        "the other changes of {vm} were applied, the UI channel was not"
+                    )),
+                })?;
+                if !json {
+                    println!("{vm}  ui {}", if on { "on" } else { "off" });
+                }
+                ui_result = Some(v);
+            }
             let mut vnc_result = None;
             if let Some(vnc) = vnc {
                 let on = matches!(vnc, OnOff::On);
@@ -570,8 +594,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     on,
                 })
                 .await
-                .map_err(|e| match (&resources, &net_result) {
-                    (None, None) => e,
+                .map_err(|e| match (&resources, &net_result, &ui_result) {
+                    (None, None, None) => e,
                     _ => e.context(format!(
                         "the other changes of {vm} were applied, VNC was not"
                     )),
@@ -597,11 +621,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     iso: iso.clone(),
                 })
                 .await
-                .map_err(|e| match (&resources, &net_result, &vnc_result) {
-                    (None, None, None) => e,
-                    _ => e.context(format!(
-                        "the other changes of {vm} were applied, the CD-ROM change was not"
-                    )),
+                .map_err(|e| {
+                    match (&resources, &net_result, &ui_result, &vnc_result) {
+                        (None, None, None, None) => e,
+                        _ => e.context(format!(
+                            "the other changes of {vm} were applied, the CD-ROM change was not"
+                        )),
+                    }
                 })?;
                 if !json {
                     let when = if v["running"] == true {
@@ -620,6 +646,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&serde_json::json!({
                     "resources": resources,
                     "net": net_result,
+                    "ui": ui_result,
                     "vnc": vnc_result,
                     "cdrom": cdrom_result,
                 }));
@@ -1489,6 +1516,16 @@ mod tests {
                 ..
             }
         ));
+        let c = set(&["--ui", "on"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Cmd::Set {
+                ui: Some(OnOff::On),
+                vnc: None,
+                ..
+            }
+        ));
+        assert!(set(&["--ui", "maybe"]).is_err());
         let c = set(&["--vnc", "on"]).unwrap();
         assert!(matches!(
             c.command,

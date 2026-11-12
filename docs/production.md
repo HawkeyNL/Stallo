@@ -177,6 +177,11 @@ gate.
     stop that.
   - **No `stallo-qemu` denial** was logged during the whole gate, which
     includes VNC, port forwards and RAM snapshots.
+  - A VM's UI channel (`stallo set <vm> --ui on`, the socket
+    `/run/stallo/vms/<vm>/ui.sock`) needs the profile of the package that
+    added it. Under an older loaded profile QEMU cannot create the socket
+    and such a VM does not start (fail closed); VMs without the channel are
+    unaffected. Not measured in the lab yet.
   - Dev mode does not use the profile: its paths are under `$HOME`, and
     loading a profile needs root.
   - Removing the package unloads the profile; the conffile stays until

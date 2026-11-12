@@ -1233,6 +1233,7 @@ mod tests {
             throwaway_of: None,
             forwards: vec![],
             vnc: true,
+            ui: false,
             cdrom: None,
             machine: crate::images::Os::Windows,
         }

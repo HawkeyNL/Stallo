@@ -194,6 +194,11 @@ pub enum Request {
         name: String,
         on: bool,
     },
+    /// Adds or removes a stopped VM's UI channel (humans only).
+    SetUi {
+        name: String,
+        on: bool,
+    },
     /// Puts a pulled installer ISO into the CD-ROM drive of a VM made from
     /// an ISO, or empties the drive (`iso: None`), from the VM's next start
     /// (humans only).
@@ -275,6 +280,9 @@ pub struct VmInfo {
     pub agent_control: bool,
     #[serde(default)]
     pub vnc: bool,
+    /// The UI channel for a helper in the guest (`VmConfig::ui`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ui: bool,
     /// The image the VM was made from (an older stallod does not send it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -407,6 +415,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | Resume { .. }
         | SetAgent { .. }
         | SetVnc { .. }
+        // A guest-visible device that voids RAM snapshots, as SetNet.
+        | SetUi { .. }
         // What a VM boots from is a human's choice, as at `new`.
         | SetCdrom { .. }
         // Growing a VM takes host CPU and memory budget that a human sized;
@@ -600,13 +610,17 @@ mod tests {
         let net = r#"{"op":"set_net","name":"dev","net":"internet"}"#;
         let r: Request = serde_json::from_str(net).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), net);
+        let ui = r#"{"op":"set_ui","name":"dev","on":true}"#;
+        let r: Request = serde_json::from_str(ui).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), ui);
         let eject = r#"{"op":"set_cdrom","name":"dev","iso":null}"#;
         let r: Request = serde_json::from_str(eject).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), eject);
         // A VM from an older stallod has no image or CD-ROM drive.
         let old = r#"{"name":"dev","state":"stopped","vcpus":1,"memory_mib":512,"disk_gib":10,"net":"offline","agent_control":false}"#;
         let vm: VmInfo = serde_json::from_str(old).unwrap();
-        assert_eq!((vm.image, vm.cdrom), (None, None));
+        assert!(!serde_json::to_string(&vm).unwrap().contains(r#""ui""#));
+        assert_eq!((vm.image, vm.cdrom, vm.ui), (None, None, false));
         for bad in [
             r#"{"via":"cli","request":{"op":"stop","name":"dev","force":false,"x":1}}"#,
             r#"{"via":"root","request":{"op":"list"}}"#,
@@ -647,6 +661,13 @@ mod tests {
         // VNC bypasses agent control and the audit log: humans only.
         assert_eq!(
             agent_gate(&Request::SetVnc {
+                name: name(),
+                on: true
+            }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::SetUi {
                 name: name(),
                 on: true
             }),

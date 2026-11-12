@@ -38,6 +38,9 @@ pub const SEED: &str = "seed.iso";
 pub const STATES: &str = "states";
 pub const QMP_SOCK: &str = "qmp.sock";
 pub const QGA_SOCK: &str = "qga.sock";
+/// The UI helper's channel (`VmConfig::ui`): host socket and guest port.
+pub const UI_SOCK: &str = "ui.sock";
+pub const UI_PORT: &str = "org.stallo.ui.0";
 pub const VNC_SOCK: &str = "vnc.sock";
 /// Screendumps; created by the daemon, written by QEMU.
 pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
@@ -244,6 +247,17 @@ pub fn argv(
         "-device virtio-serial-pci".into(),
         "-device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0".into(),
     ];
+    let ui = if vm.ui {
+        vec![
+            format!(
+                "-chardev socket,id=ui0,path={},server=on,wait=off",
+                file(rt_dir, UI_SOCK)?
+            ),
+            format!("-device virtserialport,chardev=ui0,name={UI_PORT}"),
+        ]
+    } else {
+        vec![]
+    };
     // Values never contain spaces: names and uuids are validated and paths
     // are checked in `opt_path`.
     Ok(args
@@ -251,6 +265,7 @@ pub fn argv(
         .chain(&rtc)
         .chain(&media)
         .chain(&devices)
+        .chain(&ui)
         .chain(&tpm)
         .chain(&network)
         .chain(&time_sync)
@@ -335,6 +350,7 @@ mod tests {
             throwaway_of: None,
             forwards: vec![],
             vnc: false,
+            ui: false,
             cdrom: None,
             machine: Os::Linux,
         }
@@ -730,6 +746,38 @@ mod tests {
         )
         .unwrap();
         assert!(a.contains(&pre[pre.len() - 1]));
+    }
+
+    /// The UI port comes right after the guest agent's, only when asked
+    /// for; nothing else changes (Linux and Windows).
+    #[test]
+    fn ui_port() {
+        let (d, r) = (Path::new("/d/vms/dev"), Path::new("/r/vms/dev"));
+        let iso = Media::Cdrom(None);
+        for (vm, tpm) in [(vm(), None), (windows(), Some(8))] {
+            let get = |vm: &VmConfig| {
+                let vnc = vm.vnc.then(|| Path::new("/r/vnc/dev/vnc.sock"));
+                argv(vm, d, r, None, tpm, vnc, Agent::Manual, iso).unwrap()
+            };
+            let plain = get(&vm);
+            let mut want = plain.clone();
+            let at = plain
+                .iter()
+                .position(|a| a == "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0")
+                .unwrap()
+                + 1;
+            want.splice(
+                at..at,
+                [
+                    "-chardev",
+                    "socket,id=ui0,path=/r/vms/dev/ui.sock,server=on,wait=off",
+                    "-device",
+                    "virtserialport,chardev=ui0,name=org.stallo.ui.0",
+                ]
+                .map(String::from),
+            );
+            assert_eq!(get(&VmConfig { ui: true, ..vm }), want);
+        }
     }
 
     /// S4: VNC only on a Unix socket, only when the VM asks for it.

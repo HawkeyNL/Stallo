@@ -2917,6 +2917,7 @@ mod tests {
             forwards: vec![],
             agent_control: false,
             vnc: false,
+            ui: false,
             image: None,
             cdrom: None,
         }

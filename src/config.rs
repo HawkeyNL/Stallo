@@ -114,6 +114,12 @@ pub struct VmConfig {
     /// humans, from the next start. Never on TCP.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vnc: bool,
+    /// A second virtio-serial port (`org.stallo.ui.0`, host side
+    /// `<runtime>/ui.sock`) for the UI helper in the guest, from the next
+    /// start. It changes the guest's devices, so RAM snapshots taken
+    /// without it do not restore with it, and the other way round.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ui: bool,
     /// The installer ISO (catalog id) in the CD-ROM drive of a VM made from
     /// an ISO. Such a VM has the drive and no seed; `None` leaves the drive
     /// empty.
@@ -472,6 +478,7 @@ mod tests {
             throwaway_of: None,
             forwards: vec![],
             vnc: false,
+            ui: false,
             cdrom: None,
             machine: Os::Linux,
         }
@@ -495,7 +502,13 @@ mod tests {
         };
         iso.save(&dir).unwrap();
         assert_eq!(VmConfig::load(&dir).unwrap(), iso);
+        let ui = VmConfig { ui: true, ..vm() };
+        ui.save(&dir).unwrap();
+        assert_eq!(VmConfig::load(&dir).unwrap(), ui);
         vm().save(&dir).unwrap();
+        // Off is left out, so older files read as off.
+        let toml = fs::read_to_string(dir.join("vm.toml")).unwrap();
+        assert!(!toml.contains("\nui ="), "{toml}");
         let mode = fs::metadata(dir.join("vm.toml"))
             .unwrap()
             .permissions()
