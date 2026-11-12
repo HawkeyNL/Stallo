@@ -742,6 +742,17 @@ struct Reply {
     bbox: Option<[i32; 4]>,
     #[serde(default)]
     hit: Option<bool>,
+    #[serde(default)]
+    screen: Option<(u32, u32)>,
+}
+
+/// Where a control is now (see [`Conn::probe`]).
+pub struct Probe {
+    pub bbox: Option<Rect>,
+    /// The helper's own hit test at the centre finds the control.
+    pub hit: bool,
+    /// The desktop size now.
+    pub screen: (u32, u32),
 }
 
 impl Conn {
@@ -785,9 +796,9 @@ impl Conn {
         Tree::parse(reply.tree.context("the UI helper sent no tree")?)
     }
 
-    /// Where `key` is now, and whether it (or a child) is what a click at
-    /// its centre would hit, by the helper's own hit test.
-    pub async fn probe(&mut self, key: &str) -> Result<(Option<Rect>, bool)> {
+    /// Where `key` is now, whether it (or a child) is what a click at its
+    /// centre would hit by the helper's own hit test, and the desktop size.
+    pub async fn probe(&mut self, key: &str) -> Result<Probe> {
         let reply = self
             .call(json!({"op": "probe", "key": key}), ACT_TIMEOUT)
             .await?;
@@ -800,7 +811,16 @@ impl Conn {
             }
             None => None,
         };
-        Ok((bbox, reply.hit.unwrap_or(false)))
+        let size = 1..=MAX_SCREEN;
+        let screen = reply
+            .screen
+            .filter(|(w, h)| size.contains(w) && size.contains(h))
+            .context("the UI helper sent no valid screen size")?;
+        Ok(Probe {
+            bbox,
+            hit: reply.hit.unwrap_or(false),
+            screen,
+        })
     }
 
     /// Asks the app to focus `key` (no input events).

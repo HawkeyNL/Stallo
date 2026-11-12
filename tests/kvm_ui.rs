@@ -135,9 +135,9 @@ fn ui_channel() {
 
 /// A stand-in for the real helper: answers `hello` and `tree` with the
 /// `small.json` fixture (`small-after.json` once /root/switch exists),
-/// `probe` with the node's bbox (every node hit but `a3`), and `focus` and
-/// `invoke` with ok. In `hostile` mode it answers `tree` with a 2 MiB line
-/// and junk but never a reply. Touches /root/<unit>.ready once it
+/// `probe` with the node's bbox and the screen (every node hit but `a3`),
+/// and `focus` and `invoke` with ok. In `hostile` mode it answers `tree`
+/// with a 2 MiB line and junk but never a reply. Touches /root/<unit>.ready once it
 /// holds the port.
 const FAKE_HELPER: &str = r#"
 import json, os, sys, time
@@ -169,7 +169,8 @@ while True:
             out = {'id': req['id'], 'ok': True, 'tree': t}
         elif req['op'] == 'probe':
             node = [n for n in tree['nodes'] if n['key'] == req['key']][0]
-            out = {'id': req['id'], 'ok': True, 'bbox': node.get('bbox'), 'hit': req['key'] != 'a3'}
+            out = {'id': req['id'], 'ok': True, 'bbox': node.get('bbox'), 'hit': req['key'] != 'a3',
+                   'screen': tree['screen']}
         else:
             out = {'id': req['id'], 'ok': True}
         send((json.dumps(out) + '\n').encode())
