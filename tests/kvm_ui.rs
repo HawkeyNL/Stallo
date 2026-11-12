@@ -133,12 +133,14 @@ fn ui_channel() {
 
 /// A stand-in for the real helper: answers `hello` and `tree` with the
 /// `small.json` fixture, or in `hostile` mode answers `tree` with a 2 MiB
-/// line and junk but never a reply.
+/// line and junk but never a reply. Touches /root/<unit>.ready once it
+/// holds the port.
 const FAKE_HELPER: &str = r#"
 import json, os, sys, time
 mode = sys.argv[1]
 tree = json.load(open('/root/tree.json'))
 f = os.open('/dev/virtio-ports/org.stallo.ui.0', os.O_RDWR)
+open('/root/' + sys.argv[2] + '.ready', 'w').close()
 def send(b):
     while b:
         b = b[os.write(f, b):]
@@ -211,7 +213,15 @@ fn ui_tree_from_a_helper() {
             "-I",
             "/root/fakeui.py",
             mode,
+            unit,
         ]);
+        let ready = format!("/root/{unit}.ready");
+        let up = common::wait_for(Duration::from_secs(20), || {
+            d.stallo(&["exec", "ui", "--admin", "--", "test", "-e", &ready])
+                .status
+                .success()
+        });
+        assert!(up.is_ok(), "{unit} never opened the port");
     };
     let stop = |unit: &str| d.ok(&["exec", "ui", "--admin", "--", "systemctl", "stop", unit]);
 
@@ -234,8 +244,12 @@ fn ui_tree_from_a_helper() {
     // A hostile helper: an error, and the next helper works again.
     stop("fakeui1");
     helper("fakeui2", "hostile");
+    // Over the kept connection: the junk is skipped until the time limit.
     let out = ui(&[]);
-    assert!(stderr(&out).contains("did not answer"), "{out:?}");
+    assert!(
+        stderr(&out).contains("the UI helper did not answer within 5s"),
+        "{out:?}"
+    );
     stop("fakeui2");
     helper("fakeui3", "normal");
     let up = common::wait_for(Duration::from_secs(20), || ui(&[]).status.success());

@@ -629,11 +629,18 @@ struct Reply {
 }
 
 impl Conn {
-    /// Connects and checks the helper's protocol version.
-    pub async fn connect(path: &Path) -> Result<Self> {
+    /// Connects to `vm`'s helper and checks its protocol version.
+    pub async fn connect(path: &Path, vm: &str) -> Result<Self> {
+        let no_helper = || {
+            format!(
+                "no UI helper answered in {vm}; is someone logged in to its desktop, with the Stallo UI helper running?"
+            )
+        };
         let (r, w) = timeout(HELLO_TIMEOUT, UnixStream::connect(path))
             .await
-            .map_err(|_| anyhow!("the UI channel did not accept within {HELLO_TIMEOUT:?}"))??
+            .map_err(|_| anyhow!("the UI channel did not accept within {HELLO_TIMEOUT:?}"))
+            .and_then(|r| Ok(r?))
+            .with_context(no_helper)?
             .into_split();
         let mut conn = Conn {
             r: BufReader::new(r),
@@ -642,7 +649,12 @@ impl Conn {
             // Random per connection, below 2^53 for JSON.
             next: u64::from_ne_bytes(crate::random_bytes()?) >> 11,
         };
-        match conn.call("hello", HELLO_TIMEOUT).await?.v {
+        match conn
+            .call("hello", HELLO_TIMEOUT)
+            .await
+            .with_context(no_helper)?
+            .v
+        {
             Some(VERSION) => Ok(conn),
             v => bail!(
                 "the UI helper speaks protocol {}, this Stallo speaks {VERSION}",
@@ -674,8 +686,14 @@ impl Conn {
                 if !serde_json::from_slice::<Head>(&self.line).is_ok_and(|h| h.id == id) {
                     continue;
                 }
-                let reply: Reply = serde_json::from_slice(&self.line)
-                    .context("the UI helper sent a malformed reply")?;
+                // Not serde's message: it can quote the guest's text.
+                let reply: Reply = serde_json::from_slice(&self.line).map_err(|e| {
+                    anyhow!(
+                        "the UI helper sent a malformed reply (line {}, column {})",
+                        e.line(),
+                        e.column()
+                    )
+                })?;
                 if !reply.ok {
                     let e = reply.error.unwrap_or_default();
                     bail!("UI helper: {}", printable(&e, 200));
@@ -1329,16 +1347,19 @@ e8 window \"Terminal\" (gnome-terminal)
     }
 
     /// A fake helper on `path`: each request gets the lines `reply` returns
-    /// for its op and id.
+    /// for its op and id. Counts the connections it accepts.
     pub(crate) fn fake_helper(
         path: &Path,
         reply: impl Fn(&str, u64) -> Vec<String> + Send + Sync + 'static,
-    ) {
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         use tokio::io::AsyncBufReadExt;
         let listener = tokio::net::UnixListener::bind(path).unwrap();
         let reply = std::sync::Arc::new(reply);
+        let accepted: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
+        let count = std::sync::Arc::clone(&accepted);
         tokio::spawn(async move {
             while let Ok((s, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let reply = reply.clone();
                 tokio::spawn(async move {
                     let (r, mut w) = s.into_split();
@@ -1355,6 +1376,7 @@ e8 window \"Terminal\" (gnome-terminal)
                 });
             }
         });
+        accepted
     }
 
     pub(crate) fn hello(id: u64) -> String {
@@ -1378,7 +1400,7 @@ e8 window \"Terminal\" (gnome-terminal)
                 format!(r#"{{"id":{id},"ok":true,"tree":{SMALL}}}"#).replace('\n', ""),
             ],
         });
-        let mut conn = Conn::connect(&path).await.unwrap();
+        let mut conn = Conn::connect(&path, "dev").await.unwrap();
         for _ in 0..2 {
             assert_eq!(conn.tree().await.unwrap().windows.len(), 2);
         }
@@ -1391,7 +1413,7 @@ e8 window \"Terminal\" (gnome-terminal)
             let path = dir.path().join(name);
             fake_helper(&path, reply);
             async move {
-                match Conn::connect(&path).await {
+                match Conn::connect(&path, "dev").await {
                     Ok(mut conn) => format!("{:#}", conn.tree().await.err().unwrap()),
                     Err(e) => format!("{e:#}"),
                 }
@@ -1403,10 +1425,16 @@ e8 window \"Terminal\" (gnome-terminal)
             vec![json!({"id": id, "ok": true, "v": 2}).to_string()]
         })
         .await;
-        assert!(e.contains("speaks protocol 2"), "{e}");
-        let e = err("failed", |_, id| {
+        assert!(
+            e.contains("speaks protocol 2") && !e.contains("no UI helper"),
+            "{e}"
+        );
+        let e = err("failed", |op, id| {
             let msg = format!("\u{1b}[31mbad{}", "y".repeat(300));
-            vec![json!({"id": id, "ok": false, "error": msg}).to_string()]
+            match op {
+                "hello" => vec![hello(id)],
+                _ => vec![json!({"id": id, "ok": false, "error": msg}).to_string()],
+            }
         })
         .await;
         assert!(
@@ -1415,13 +1443,20 @@ e8 window \"Terminal\" (gnome-terminal)
         );
         assert!(e.len() < 230, "{e}");
         let e = err("silent", |_, _| vec![]).await;
+        assert!(e.starts_with("no UI helper answered in dev;"), "{e}");
         assert!(e.contains("did not answer within 2s"), "{e}");
         let e = err("malformed", |op, id| match op {
             "hello" => vec![hello(id)],
-            _ => vec![json!({"id": id, "ok": true, "tree": {"screen": "big"}}).to_string()],
+            // serde would quote the bad variant's text as is.
+            _ => {
+                let coords = format!("\u{1b}[31m{}", "y".repeat(5000));
+                let tree = json!({"screen": [1, 1], "coords": coords, "windows": [], "nodes": []});
+                vec![json!({"id": id, "ok": true, "tree": tree}).to_string()]
+            }
         })
         .await;
         assert!(e.contains("malformed reply"), "{e}");
+        assert!(!e.contains('\u{1b}') && e.len() < 120, "{e}");
         let e = err("hostile", |op, id| match op {
             "hello" => vec![hello(id)],
             _ => {

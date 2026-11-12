@@ -1910,20 +1910,15 @@ impl Running {
         let mut link = tokio::time::timeout(UI_BUSY_WAIT, self.ui.lock())
             .await
             .map_err(|_| anyhow::anyhow!("{name} is busy with another UI request"))?;
-        let link = &mut *link;
-        let conn = match &mut link.conn {
+        // Out of the lock while in use: a request cut off half way never
+        // leaves a connection that is out of step.
+        let mut conn = match link.conn.take() {
             Some(conn) => conn,
-            None => link.conn.insert(ui::Conn::connect(&self.ui_sock).await.with_context(
-                || {
-                    format!(
-                        "no UI helper answered in {name}; is someone logged in to its desktop, with the Stallo UI helper running?"
-                    )
-                },
-            )?),
+            None => ui::Conn::connect(&self.ui_sock, name).await?,
         };
-        let result = op(conn, &mut link.session).await;
-        if result.is_err() {
-            link.conn = None;
+        let result = op(&mut conn, &mut link.session).await;
+        if result.is_ok() {
+            link.conn = Some(conn);
         }
         result
     }
@@ -3196,7 +3191,7 @@ mod tests {
         vm.config.ui = true;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let n = calls.clone();
-        fake_helper(&vm.ui_sock, move |op, id| match op {
+        let accepted = fake_helper(&vm.ui_sock, move |op, id| match op {
             "hello" => vec![hello(id)],
             // The second tree request fails.
             _ if n.fetch_add(1, Ordering::SeqCst) == 1 => {
@@ -3229,6 +3224,8 @@ mod tests {
             again.split_once('\n').unwrap().1
         );
         assert!(again.contains("; seq 2;"), "{again}");
+        // The failure dropped the connection: a second one was made.
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     /// The UI channel: any VM but a clone, only while stopped and without
