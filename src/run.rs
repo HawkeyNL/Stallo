@@ -149,6 +149,7 @@ impl Manager {
             // A run only needs the guest agent, not the source's ports.
             forwards: vec![],
             vnc: false,
+            ui: false,
             ..src.clone()
         }
         .save(&to)
@@ -196,6 +197,7 @@ mod tests {
             throwaway_of: throwaway_of.map(Into::into),
             forwards: vec![],
             vnc: false,
+            ui: false,
             cdrom: None,
             machine: Os::Linux,
         }

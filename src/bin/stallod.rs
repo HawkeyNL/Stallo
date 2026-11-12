@@ -587,6 +587,10 @@ async fn dispatch(
             let cfg = m.set_net(&name, net).await?;
             json!(info(m, &cfg).await)
         }
+        Request::SetUi { name, on } => {
+            let cfg = m.set_ui(&name, on).await?;
+            json!(info(m, &cfg).await)
+        }
         Request::Resume { name } => {
             m.resume(&name).await?;
             Value::Null
@@ -691,6 +695,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         forwards: cfg.forwards.clone(),
         agent_control: cfg.agent_control,
         vnc: cfg.vnc,
+        ui: cfg.ui,
         image: Some(cfg.image.clone()),
         cdrom: cfg.cdrom.clone(),
     }

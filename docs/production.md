@@ -72,8 +72,8 @@ Ubuntu system, and the package is small enough to build by hand.
 ## API access
 
 - `/run/stallo` is `0750` and `api.sock` is `0660`, both group `stallo`.
-  The per-VM directories below stay `0700`, so QMP and QGA sockets remain
-  private to the daemon (S3).
+  The per-VM directories below stay `0700`, so the QMP, QGA and UI
+  sockets remain private to the daemon (S3).
 - The daemon accepts its own uid, root, and members of its group. It reads
   the peer's supplementary groups with `SO_PEERGROUPS` (S2).
 - **Every member of group `stallo` has the full API**, the same as the
@@ -177,6 +177,12 @@ gate.
     stop that.
   - **No `stallo-qemu` denial** was logged during the whole gate, which
     includes VNC, port forwards and RAM snapshots.
+  - A VM's UI channel (the socket `/run/stallo/vms/<vm>/ui.sock`) needs
+    the profile of the package that added it. New VMs from an installer
+    ISO have the channel by default, and `stallo set <vm> --ui on` adds it
+    to others. Under an older loaded profile QEMU cannot create the socket
+    and such a VM does not start (fail closed); VMs without the channel are
+    unaffected. Not measured in the lab yet.
   - Dev mode does not use the profile: its paths are under `$HOME`, and
     loading a profile needs root.
   - Removing the package unloads the profile; the conffile stays until

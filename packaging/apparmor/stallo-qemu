@@ -39,8 +39,8 @@ profile stallo-qemu flags=(enforce) {
   /var/lib/stallo/images/*.qcow2 rk,
   /var/lib/stallo/images/*.iso rk,
 
-  # QMP, QGA and VNC sockets; screendumps.
-  /run/stallo/vms/*/{qmp,qga}.sock rw,
+  # QMP, QGA, UI and VNC sockets; screendumps.
+  /run/stallo/vms/*/{qmp,qga,ui}.sock rw,
   /run/stallo/vms/*/screen.{png,ppm} rw,
   /run/stallo/vnc/*/vnc.sock rw,
   unix (create, bind, listen, accept, send, receive, getattr, getopt, setopt, shutdown) type=stream,

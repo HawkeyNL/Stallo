@@ -49,17 +49,19 @@ fn boots_installer_iso() {
     );
     d.assert_safe("desk");
 
-    // A blank disk and the ISO in the drive; no seed, no password, VNC on.
+    // A blank disk and the ISO in the drive; no seed, no password, VNC and
+    // the UI channel on.
     let cfg = VmConfig::load(&d.vm_dir("desk")).unwrap();
     assert_eq!(
         (
             cfg.cdrom.as_deref(),
             cfg.vnc,
+            cfg.ui,
             cfg.vcpus,
             cfg.memory_mib,
             cfg.disk_gib
         ),
-        (Some(ISO), true, 2, MEMORY_MIB, 32)
+        (Some(ISO), true, true, 2, MEMORY_MIB, 32)
     );
     for f in ["seed.iso", "seed", "secret"] {
         assert!(!d.vm_dir("desk").join(f).exists(), "{f}");

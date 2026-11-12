@@ -161,6 +161,7 @@ pub fn describe(r: &Request) -> Described<'_> {
         }
         Request::SetAgent { name, on } => ("agent", Some(name), vec![("on", u64::from(*on))], None),
         Request::SetVnc { name, on } => ("vnc", Some(name), vec![("on", u64::from(*on))], None),
+        Request::SetUi { name, on } => ("set_ui", Some(name), vec![("on", u64::from(*on))], None),
         // The ISO is in `image` (see [`image`]).
         Request::SetCdrom { name, iso } => (
             "set_cdrom",
@@ -428,6 +429,11 @@ mod tests {
             ("set_net", Some("dev"), vec![("internet", 1)], None)
         );
         assert!(entry(&net).contains(r#""op":"set_net","args":{"internet":1}"#));
+        let ui = Request::SetUi {
+            name: "dev".into(),
+            on: true,
+        };
+        assert!(entry(&ui).contains(r#""op":"set_ui","args":{"on":1}"#));
         let mut new = Request::New {
             name: "dev".into(),
             image: "arch".into(),
