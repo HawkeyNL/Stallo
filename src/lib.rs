@@ -22,6 +22,7 @@ pub mod run;
 pub mod seed;
 pub mod snapshot;
 pub mod tpm;
+pub mod ui;
 pub mod vm;
 
 use std::process::Stdio;
@@ -96,18 +97,24 @@ pub(crate) async fn run_prepared(cmd: &mut Command, limit: Duration) -> anyhow::
 }
 
 /// Text from an untrusted peer (guest, QEMU), made safe to show: at most
-/// `max` characters, without control characters or the Unicode format
-/// characters that reorder or hide text (bidi overrides, zero-width).
+/// `max` characters, without control characters, line separators or the
+/// Unicode format characters that reorder or hide text (bidi overrides,
+/// zero-width, invisible operators, tags and supplementary variation
+/// selectors).
 pub fn printable(s: &str, max: usize) -> String {
     s.chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(
                     c,
-                    '\u{200B}'..='\u{200F}'
-                        | '\u{202A}'..='\u{202E}'
-                        | '\u{2066}'..='\u{2069}'
+                    '\u{061C}'
+                        | '\u{180E}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{206F}'
                         | '\u{FEFF}'
+                        | '\u{FFF9}'..='\u{FFFB}'
+                        | '\u{E0000}'..='\u{E01EF}'
                 )
         })
         .take(max)
@@ -152,6 +159,8 @@ mod tests {
         use super::printable;
         let s = "a\nb\u{1b}[0m\u{202E}c\u{200B}d";
         assert_eq!(printable(s, 200), "ab[0mcd");
+        let hidden = "a\u{2028}b\u{2029}c\u{2060}d\u{2064}e\u{061C}f\u{180E}g\u{FFF9}h\u{E0041}\u{E007F}\u{E0100}\u{E01EF}i";
+        assert_eq!(printable(hidden, 200), "abcdefghi");
         assert_eq!(printable(&"é".repeat(300), 200).chars().count(), 200);
     }
 
