@@ -130,3 +130,142 @@ fn ui_channel() {
     d.ok(&["stop", "ui"]);
     d.ok(&["rm", "ui", "--yes"]);
 }
+
+/// A stand-in for the real helper: answers `hello` and `tree` with the
+/// `small.json` fixture, or in `hostile` mode answers `tree` with a 2 MiB
+/// line and junk but never a reply. Touches /root/<unit>.ready once it
+/// holds the port.
+const FAKE_HELPER: &str = r#"
+import json, os, sys, time
+mode = sys.argv[1]
+tree = json.load(open('/root/tree.json'))
+f = os.open('/dev/virtio-ports/org.stallo.ui.0', os.O_RDWR)
+open('/root/' + sys.argv[2] + '.ready', 'w').close()
+def send(b):
+    while b:
+        b = b[os.write(f, b):]
+buf = b''
+while True:
+    chunk = os.read(f, 65536)
+    if not chunk:
+        time.sleep(0.1)
+        continue
+    buf += chunk
+    while b'\n' in buf:
+        line, buf = buf.split(b'\n', 1)
+        req = json.loads(line)
+        if req['op'] == 'hello':
+            out = {'id': req['id'], 'ok': True, 'v': 1}
+        elif mode == 'hostile':
+            send(b'x' * (2 << 20) + b'\njunk\n')
+            continue
+        else:
+            out = {'id': req['id'], 'ok': True, 'tree': tree}
+        send((json.dumps(out) + '\n').encode())
+"#;
+
+/// `stallo ui` through the channel, against a fake helper in the guest: a
+/// missing or hostile helper is a clean error, and a restored RAM snapshot
+/// starts the ids over.
+#[test]
+#[ignore = "boots a VM; run with STALLO_IT=1"]
+fn ui_tree_from_a_helper() {
+    if !common::enabled() {
+        return;
+    }
+    let d = Daemon::start("uitree", "");
+    d.ok(&[
+        "new", "ui", "--image", &d.image, "--cpus", "1", "--mem", "1G", "--disk", "10G",
+    ]);
+    d.ok(&["stop", "ui"]);
+    d.ok(&["set", "ui", "--ui", "on"]);
+    d.ok(&["start", "ui"]);
+    d.assert_safe("ui");
+    let ui = |args: &[&str]| d.stallo(&[&["ui", "ui"], args].concat());
+    let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+
+    let out = ui(&[]);
+    assert!(
+        stderr(&out).contains("no UI helper answered in ui"),
+        "{out:?}"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("fakeui.py");
+    std::fs::write(&script, FAKE_HELPER).unwrap();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ui/small.json");
+    d.ok(&["cp", "--admin", fixture, "ui:/root/tree.json"]);
+    d.ok(&[
+        "cp",
+        "--admin",
+        script.to_str().unwrap(),
+        "ui:/root/fakeui.py",
+    ]);
+    let helper = |unit: &str, mode: &str| {
+        d.ok(&[
+            "exec",
+            "ui",
+            "--admin",
+            "--",
+            "systemd-run",
+            &format!("--unit={unit}"),
+            "python3",
+            "-I",
+            "/root/fakeui.py",
+            mode,
+            unit,
+        ]);
+        let ready = format!("/root/{unit}.ready");
+        let up = common::wait_for(Duration::from_secs(20), || {
+            d.stallo(&["exec", "ui", "--admin", "--", "test", "-e", &ready])
+                .status
+                .success()
+        });
+        assert!(up.is_ok(), "{unit} never opened the port");
+    };
+    let stop = |unit: &str| d.ok(&["exec", "ui", "--admin", "--", "systemctl", "stop", unit]);
+
+    helper("fakeui1", "normal");
+    let up = common::wait_for(Duration::from_secs(20), || ui(&[]).status.success());
+    assert!(up.is_ok(), "the fake helper never answered");
+    let t = std::time::Instant::now();
+    let first = d.ok(&["ui", "ui"]);
+    eprintln!(
+        "MEASURE stallo ui round trip: {} ms",
+        t.elapsed().as_millis()
+    );
+    assert!(
+        first.contains("\ne1 window \"Files — Home\" (nautilus) active\n"),
+        "{first}"
+    );
+    let found = d.ok(&["ui", "ui", "--find", "agent@"]);
+    assert!(found.contains("text \"agent@dev:~$\""), "{found}");
+
+    // A hostile helper: an error, and the next helper works again.
+    stop("fakeui1");
+    helper("fakeui2", "hostile");
+    // Over the kept connection: the junk is skipped until the time limit.
+    let out = ui(&[]);
+    assert!(
+        stderr(&out).contains("the UI helper did not answer within 5s"),
+        "{out:?}"
+    );
+    stop("fakeui2");
+    helper("fakeui3", "normal");
+    let up = common::wait_for(Duration::from_secs(20), || ui(&[]).status.success());
+    assert!(up.is_ok(), "no answer after the hostile helper");
+    let again = d.ok(&["ui", "ui"]);
+    assert_eq!(
+        again.split_once('\n').unwrap().1,
+        first.split_once('\n').unwrap().1
+    );
+
+    // The guest went back: its ids start over.
+    d.ok(&["snap", "ui", "s1"]);
+    d.ok(&["restore", "ui", "s1"]);
+    let restored = d.ok(&["ui", "ui"]);
+    assert!(restored.contains("; seq 1;"), "{restored}");
+    d.ok(&["stop", "ui"]);
+    d.ok(&["snap", "ui", "--delete", "s1", "--yes"]);
+    d.ok(&["rm", "ui", "--yes"]);
+}

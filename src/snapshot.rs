@@ -705,7 +705,8 @@ impl Manager {
     }
 
     /// Loads RAM snapshot `tag` (RAM in `file`) into the running QEMU of
-    /// `vm` and drops the kept guest-agent connection. Returns how long the
+    /// `vm` and drops the kept guest-agent and UI helper connections and the
+    /// UI ids. Returns how long the
     /// guest was paused.
     async fn load_into(
         &self,
@@ -721,8 +722,15 @@ impl Manager {
             .map_err(|_| {
                 anyhow::anyhow!("{} is busy with a guest command; try again", vm.config.name)
             })?;
+        // Nor a UI request; the guest's UI goes back, so its ids are void.
+        let mut ui = tokio::time::timeout(QGA_BUSY_WAIT, vm.ui.lock())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("{} is busy with a UI request; try again", vm.config.name)
+            })?;
         let loaded = load(&vm.qmp, tag, file, run, &vm.disk_full).await;
         *agent = None;
+        *ui = Default::default();
         let loaded =
             loaded.with_context(|| format!("cannot restore {tag}; the VM may be left paused"))?;
         tracing::debug!("{}: loaded {tag}: {loaded:?}", vm.config.name);

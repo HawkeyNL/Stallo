@@ -506,6 +506,15 @@ async fn dispatch(
             Value::Null
         }
         Request::Screenshot { name } => screen(m.screenshot(&name).await?, None),
+        Request::UiTree {
+            name,
+            find,
+            all,
+            max_chars,
+        } => {
+            let (view, max) = stallo::ui::view(find, all, max_chars)?;
+            json!({"text": m.ui_tree(&name, view, max).await?})
+        }
         Request::WaitForScreen {
             name,
             stable_ms,

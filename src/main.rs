@@ -81,6 +81,20 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Show the guest's windows and controls as text, from the Stallo UI
+    /// helper in the guest (needs `stallo set <vm> --ui on`).
+    Ui {
+        vm: String,
+        /// Only what contains this text.
+        #[arg(long, conflicts_with = "all")]
+        find: Option<String>,
+        /// Every window and all text.
+        #[arg(long)]
+        all: bool,
+        /// Longest output in characters (500-20000).
+        #[arg(long)]
+        max_chars: Option<u32>,
+    },
     /// Run a command in the guest; its exit code is passed through.
     Exec {
         vm: String,
@@ -496,6 +510,26 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 let t: Taken = serde_json::from_value(v)?;
                 println!("{vm}  {}", taken_line(&t));
+            }
+        }
+        Cmd::Ui {
+            vm,
+            find,
+            all,
+            max_chars,
+        } => {
+            let v = call(Request::UiTree {
+                name: vm,
+                find,
+                all,
+                max_chars,
+            })
+            .await?;
+            if json {
+                print_json(&v);
+            } else {
+                // Already cleaned by the daemon: no control characters.
+                println!("{}", v["text"].as_str().unwrap_or_default());
             }
         }
         Cmd::Snaps { vm } => {
@@ -1526,6 +1560,9 @@ mod tests {
             }
         ));
         assert!(set(&["--ui", "maybe"]).is_err());
+        let c = Cli::try_parse_from(["stallo", "ui", "dev", "--find", "Save"]).unwrap();
+        assert!(matches!(c.command, Cmd::Ui { find: Some(ref f), all: false, .. } if f == "Save"));
+        assert!(Cli::try_parse_from(["stallo", "ui", "dev", "--find", "x", "--all"]).is_err());
         let c = set(&["--vnc", "on"]).unwrap();
         assert!(matches!(
             c.command,
