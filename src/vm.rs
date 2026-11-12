@@ -1470,16 +1470,158 @@ impl Manager {
             .with_context(|| format!("{name} is not running; start it with `stallo start {name}`"))
     }
 
-    /// The guest's UI as text (see `ui.rs`).
-    pub async fn ui_tree(&self, name: &str, view: ui::View, max_chars: usize) -> Result<String> {
+    /// A running VM that was started with the UI channel.
+    fn ui_vm(&self, name: &str) -> Result<Arc<Running>> {
         let vm = self.running_vm(name)?;
         // The VM as started: the port exists only if it was on then.
         ensure!(
             vm.config.ui,
             "{name} has no UI channel; a human can run: stallo stop {name}; stallo set {name} --ui on"
         );
-        vm.with_ui(async |conn, session| Ok(session.show(&conn.tree().await?, &view, max_chars)))
+        Ok(vm)
+    }
+
+    /// The guest's UI as text (see `ui.rs`).
+    pub async fn ui_tree(&self, name: &str, view: ui::View, max_chars: usize) -> Result<String> {
+        self.ui_vm(name)?
+            .with_ui(async |conn, session| Ok(session.show(&conn.tree().await?, &view, max_chars)))
             .await
+    }
+
+    /// Acts on a control from `ui_tree`, waits `act.settle` (and for
+    /// `act.until`), and returns what was done and what changed.
+    pub async fn ui_act(&self, name: &str, act: ui::Act) -> Result<String> {
+        use ui::Action::*;
+        /// Where pointer input goes, from the helper.
+        enum Target {
+            None,
+            /// No screen coordinates: the click was an invoke.
+            Invoked,
+            /// A point of a desktop of this size.
+            At((u32, u32), (u32, u32)),
+        }
+        let vm = self.ui_vm(name)?;
+        // Checked before anything is sent.
+        let typed = act.text.as_deref().map(input::text_keys).transpose()?;
+        let chord = act.keys.as_deref().map(input::chord).transpose()?;
+        if let Some(dy) = act.dy {
+            check_dy(dy)?;
+        }
+        let id = act.id.as_deref().unwrap_or_default();
+        // The input lock before the UI lock, everywhere.
+        let input = vm.input().await?;
+        // The helper first; input after, so the UI lock is free while
+        // typing. Type and key without an id need no helper at all.
+        let target = match act.id {
+            None => Target::None,
+            Some(_) => {
+                vm.with_ui(async |conn, session| {
+                    let key = session.key(id)?.to_owned();
+                    match act.action {
+                        Focus | Type | Key => conn.focus(&key).await.map(|()| Target::None),
+                        Invoke => conn.invoke(&key).await.map(|()| Target::None),
+                        Click | Double | Right | Scroll => {
+                            let (coords, _) = session.last().context("call ui_tree first")?;
+                            if coords != ui::Coords::Screen {
+                                ensure!(
+                                    act.action == Click,
+                                    "this desktop gives no screen coordinates for {id}; use invoke or focus, or the screenshot tools"
+                                );
+                                conn.invoke(&key).await?;
+                                return Ok(Target::Invoked);
+                            }
+                            // Fresh place and desktop size, and never a
+                            // blind click: the helper's hit test must find
+                            // the control itself at its centre.
+                            let probe = conn.probe(&key).await?;
+                            let bbox = probe.bbox.with_context(|| {
+                                format!("{id} has no place on the screen now; call ui_tree, or use invoke")
+                            })?;
+                            ensure!(
+                                probe.hit,
+                                "{id} is covered by something else at its centre; call ui_tree, or use invoke"
+                            );
+                            let at = ui::centre(bbox, probe.screen).with_context(|| {
+                                format!("the centre of {id} is off the screen; scroll it into view, or use invoke")
+                            })?;
+                            Ok(Target::At(at, probe.screen))
+                        }
+                    }
+                })
+                .await?
+            }
+        };
+        let into = if id.is_empty() {
+            String::new()
+        } else {
+            format!(" into {id}")
+        };
+        let done = match (act.action, target) {
+            (Focus, _) => format!("focused {id}"),
+            (Invoke, _) => format!("invoked {id}"),
+            (_, Target::Invoked) => format!("invoked {id} (no screen coordinates to click)"),
+            (Type, _) => {
+                let keys = typed.unwrap_or_default();
+                for k in &keys {
+                    vm.send_key(k, KEY_HOLD).await?;
+                }
+                format!("typed {} keys{into}", keys.len())
+            }
+            (Key, _) => {
+                let chord = chord.unwrap_or_default();
+                vm.send_key(&chord, CHORD_HOLD).await?;
+                format!("pressed {}{into}", chord.join("+"))
+            }
+            (Scroll, Target::At(at, screen)) => {
+                let dy = act.dy.unwrap_or_default();
+                vm.wheel(at, screen, dy).await?;
+                format!("scrolled {dy} at {id} ({},{})", at.0, at.1)
+            }
+            (action, Target::At(at, screen)) => {
+                let (button, times) = match action {
+                    Double => ("left", 2),
+                    Right => ("right", 1),
+                    _ => ("left", 1),
+                };
+                vm.click_at(at, screen, button, times).await?;
+                format!("clicked {id} at {},{}", at.0, at.1)
+            }
+            (_, Target::None) => bail!("{id}: nothing to point at"),
+        };
+        drop(input);
+        tokio::time::sleep(act.settle).await;
+        let result = async {
+            let (waited, tree) = match &act.until {
+                Some(q) => vm.ui_poll(q, false, ui::ACT_UNTIL).await?,
+                None => (
+                    String::new(),
+                    vm.with_ui(async |conn, _| conn.tree().await).await?,
+                ),
+            };
+            Ok::<_, anyhow::Error>(format!("{waited}\n{}", vm.ui_show(&tree).await?))
+        };
+        // The input is sent: a failure from here on must not read as a
+        // failed action, or the agent repeats it.
+        Ok(match result.await {
+            Ok(view) => format!("{done}{view}"),
+            Err(e) => format!("{done}; could not read the result: {e:#}"),
+        })
+    }
+
+    /// Waits until `until` shows in the guest's UI (with `gone`: until it
+    /// no longer does), at most `limit`; returns that and what changed.
+    pub async fn ui_wait(
+        &self,
+        name: &str,
+        until: &str,
+        gone: bool,
+        limit: Duration,
+    ) -> Result<String> {
+        ui::check_query(until)?;
+        let vm = self.ui_vm(name)?;
+        let (waited, tree) = vm.ui_poll(until, gone, limit).await?;
+        let view = vm.ui_show(&tree).await?;
+        Ok(format!("{}\n{view}", waited.trim_start_matches("; ")))
     }
 
     /// The guest screen as PNG.
@@ -1763,16 +1905,39 @@ impl Running {
         result.and(released)
     }
 
-    async fn scroll(&self, (x, y): (u32, u32), dy: i32) -> Result<()> {
-        ensure!(
-            dy != 0 && dy.unsigned_abs() <= MAX_SCROLL,
-            "dy must be between -{MAX_SCROLL} and {MAX_SCROLL}, and not 0"
-        );
+    async fn scroll(&self, at: (u32, u32), dy: i32) -> Result<()> {
+        check_dy(dy)?;
         let _input = self.input().await?;
-        self.send_events(self.move_events(x, y)?).await?;
+        let size = *self.screen_size.lock().unwrap();
+        self.wheel(at, size, dy).await
+    }
+
+    /// Scrolls at `at` of a `size` desktop; the caller holds the input lock.
+    async fn wheel(&self, (x, y): (u32, u32), size: (u32, u32), dy: i32) -> Result<()> {
+        check_dy(dy)?;
+        self.send_events(pointer_events(x, y, size)?).await?;
         let wheel = if dy > 0 { "wheel-down" } else { "wheel-up" };
         for _ in 0..dy.unsigned_abs() {
             self.press_release(wheel).await?;
+        }
+        Ok(())
+    }
+
+    /// Clicks `button` `times` at `at` of a `size` desktop; the caller
+    /// holds the input lock.
+    async fn click_at(
+        &self,
+        (x, y): (u32, u32),
+        size: (u32, u32),
+        button: &str,
+        times: u32,
+    ) -> Result<()> {
+        self.send_events(pointer_events(x, y, size)?).await?;
+        for i in 0..times {
+            if i > 0 {
+                tokio::time::sleep(POINTER_STEP).await;
+            }
+            self.press_release(button).await?;
         }
         Ok(())
     }
@@ -1802,12 +1967,7 @@ impl Running {
 
     /// Absolute pointer events for pixel (`x`, `y`) of the last screenshot.
     fn move_events(&self, x: u32, y: u32) -> Result<Vec<Value>> {
-        let (w, h) = *self.screen_size.lock().unwrap();
-        let axis = |name: &str, v: u32| serde_json::json!({"type": "abs", "data": {"axis": name, "value": v}});
-        Ok(vec![
-            axis("x", input::abs_axis(x, w)?),
-            axis("y", input::abs_axis(y, h)?),
-        ])
+        pointer_events(x, y, *self.screen_size.lock().unwrap())
     }
 
     async fn send_events(&self, events: Vec<Value>) -> Result<()> {
@@ -1921,6 +2081,45 @@ impl Running {
             link.conn = Some(conn);
         }
         result
+    }
+
+    /// Polls the helper's tree every [`ui::POLL`] until `query` shows (or,
+    /// with `gone`, no longer shows), at most `limit`. Returns how that went
+    /// and the last tree. The UI lock is free between polls.
+    async fn ui_poll(
+        &self,
+        query: &str,
+        gone: bool,
+        limit: Duration,
+    ) -> Result<(String, ui::Tree)> {
+        let start = Instant::now();
+        loop {
+            // A failed poll (busy, slow helper) is tried again in time.
+            match self.with_ui(async |conn, _| conn.tree().await).await {
+                Ok(tree) => {
+                    let ms = start.elapsed().as_millis();
+                    if ui::matches(&tree, query) != gone {
+                        return Ok((format!("; matched after {ms} ms"), tree));
+                    }
+                    if start.elapsed() + ui::POLL > limit {
+                        return Ok((format!("; timed out after {ms} ms"), tree));
+                    }
+                }
+                Err(e) if start.elapsed() + ui::POLL > limit => return Err(e),
+                Err(_) => {}
+            }
+            tokio::time::sleep(ui::POLL).await;
+        }
+    }
+
+    /// The diff view of `tree` (see `ui.rs`).
+    async fn ui_show(&self, tree: &ui::Tree) -> Result<String> {
+        let mut link = tokio::time::timeout(UI_BUSY_WAIT, self.ui.lock())
+            .await
+            .map_err(|_| anyhow::anyhow!("{} is busy with another UI request", self.config.name))?;
+        Ok(link
+            .session
+            .show(tree, &ui::View::Diff, ui::MAX_CHARS_DEFAULT))
     }
 
     async fn addresses(&self) -> Result<Vec<(String, String)>> {
@@ -2080,6 +2279,24 @@ where
 fn lerp(a: u32, b: u32, step: u32, steps: u32) -> u32 {
     let (a, b) = (i64::from(a), i64::from(b));
     (a + (b - a) * i64::from(step) / i64::from(steps)) as u32
+}
+
+/// Absolute pointer events for pixel (`x`, `y`) of a `w`x`h` screen.
+fn pointer_events(x: u32, y: u32, (w, h): (u32, u32)) -> Result<Vec<Value>> {
+    let axis =
+        |name: &str, v: u32| serde_json::json!({"type": "abs", "data": {"axis": name, "value": v}});
+    Ok(vec![
+        axis("x", input::abs_axis(x, w)?),
+        axis("y", input::abs_axis(y, h)?),
+    ])
+}
+
+fn check_dy(dy: i32) -> Result<()> {
+    ensure!(
+        dy != 0 && dy.unsigned_abs() <= MAX_SCROLL,
+        "dy must be between -{MAX_SCROLL} and {MAX_SCROLL}, and not 0"
+    );
+    Ok(())
 }
 
 fn button_name(b: Button) -> &'static str {
@@ -3226,6 +3443,289 @@ mod tests {
         assert!(again.contains("; seq 2;"), "{again}");
         // The failure dropped the connection: a second one was made.
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    /// A manager with VM `dev` running, its UI channel on and a fake
+    /// helper answering with `reply`; returns the QMP input events log.
+    async fn ui_manager(
+        reply: impl Fn(&str, u64) -> Vec<String> + Send + Sync + 'static,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<Manager>,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        m.cleanup_leftovers().await.unwrap();
+        let (dir, mut vm, log) = fake_vm("running", None).await;
+        vm.config.ui = true;
+        let vm_dir = m.paths.vm_dir("dev");
+        fs::create_dir(&vm_dir).unwrap();
+        vm.config.save(&vm_dir).unwrap();
+        crate::ui::tests::fake_helper(&vm.ui_sock, reply);
+        m.running.lock().unwrap().insert("dev".into(), Arc::new(vm));
+        (tmp, dir, m, log)
+    }
+
+    fn tree_reply(id: u64, tree: &str) -> Vec<String> {
+        vec![format!(
+            r#"{{"id":{id},"ok":true,"tree":{}}}"#,
+            tree.replace('\n', "")
+        )]
+    }
+
+    fn act(action: ui::Action, id: Option<&str>) -> ui::Act {
+        ui::check_act(
+            action,
+            id.map(str::to_owned),
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// `ui_act`: a click lands at the control's centre, scaled to the
+    /// desktop size the helper reports now, only after the helper's hit
+    /// test; covered, unknown and off-screen controls send no input.
+    #[tokio::test]
+    async fn ui_act_clicks_only_what_it_hits() {
+        use crate::ui::tests::{SMALL, hello};
+        use ui::Action::*;
+        let probe = |id: u64, bbox: [i32; 4], hit: bool, screen: Option<[u32; 2]>| {
+            vec![serde_json::json!({"id": id, "ok": true, "bbox": bbox, "hit": hit, "screen": screen}).to_string()]
+        };
+        let failing = Arc::new(AtomicBool::new(false));
+        let fail = failing.clone();
+        let (_t, _d, m, log) = ui_manager(move |op, id| match op {
+            "hello" => vec![hello(id)],
+            "tree" if fail.load(Ordering::SeqCst) => {
+                vec![serde_json::json!({"id": id, "ok": false, "error": "gone"}).to_string()]
+            }
+            "tree" => tree_reply(id, SMALL),
+            "probe a2" => probe(id, [10, 40, 32, 32], true, Some([1280, 800])),
+            "probe a3" => probe(id, [44, 40, 32, 32], false, Some([1280, 800])),
+            "probe a5" => probe(id, [0, 100, 200, 300], true, None),
+            "probe a6" => probe(id, [5000, 100, 200, 30], true, Some([1280, 800])),
+            // The desktop grew since the last tree.
+            "probe w1" => probe(id, [0, 0, 2560, 1600], true, Some([2560, 1600])),
+            "focus a8" => {
+                vec![serde_json::json!({"id": id, "ok": false, "error": "no"}).to_string()]
+            }
+            _ => vec![serde_json::json!({"id": id, "ok": true}).to_string()],
+        })
+        .await;
+        let err = async |a: ui::Act| m.ui_act("dev", a).await.unwrap_err().to_string();
+        let take = || std::mem::take(&mut *log.lock().unwrap());
+        assert!(
+            err(act(Click, Some("e2")))
+                .await
+                .contains("unknown id e2; call ui_tree")
+        );
+        m.ui_tree("dev", ui::View::Default, 6000).await.unwrap();
+
+        let out = m.ui_act("dev", act(Click, Some("e2"))).await.unwrap();
+        assert!(out.starts_with("clicked e2 at 26,56\nguest UI"), "{out}");
+        assert!(out.ends_with("; changes since seq 1\nno changes"), "{out}");
+        let events = take();
+        // Move (x then y, scaled to the desktop), press, release.
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(
+            events[0][0]["data"]["value"],
+            input::abs_axis(26, 1280).unwrap()
+        );
+        assert_eq!(
+            events[0][1]["data"]["value"],
+            input::abs_axis(56, 800).unwrap()
+        );
+        assert_eq!(events[1][0]["data"]["down"], true);
+        assert_eq!(events[1][0]["data"]["button"], "left");
+
+        // Scaled to the size the helper reports now, not the last tree's.
+        let out = m.ui_act("dev", act(Right, Some("e1"))).await.unwrap();
+        assert!(out.starts_with("clicked e1 at 1280,800\n"), "{out}");
+        let events = take();
+        assert_eq!(
+            events[0][0]["data"]["value"],
+            input::abs_axis(1280, 2560).unwrap()
+        );
+        assert_eq!(events[1][0]["data"]["button"], "right");
+        m.ui_act("dev", act(Double, Some("e2"))).await.unwrap();
+        assert_eq!(take().len(), 5, "move and two press/release pairs");
+        let scroll = ui::check_act(
+            Scroll,
+            Some("e2".into()),
+            None,
+            None,
+            Some(-2),
+            Some(0),
+            None,
+        )
+        .unwrap();
+        let out = m.ui_act("dev", scroll).await.unwrap();
+        assert!(out.starts_with("scrolled -2 at e2 (26,56)\n"), "{out}");
+        assert_eq!(take()[1][0]["data"]["button"], "wheel-up");
+
+        for (a, want) in [
+            (act(Click, Some("e3")), "e3 is covered by something else"),
+            (act(Double, Some("e6")), "off the screen"),
+            (act(Click, Some("e5")), "no valid screen size"),
+            (act(Right, Some("e99")), "unknown id e99"),
+            (
+                ui::check_act(
+                    Type,
+                    Some("e7".into()),
+                    Some("x".into()),
+                    None,
+                    None,
+                    Some(0),
+                    None,
+                )
+                .unwrap(),
+                "UI helper: no",
+            ),
+        ] {
+            let e = err(a).await;
+            assert!(e.contains(want), "{e}");
+        }
+        assert!(
+            take().is_empty(),
+            "no input after a refusal or a failed focus"
+        );
+
+        let out = m.ui_act("dev", act(Invoke, Some("e6"))).await.unwrap();
+        assert!(out.starts_with("invoked e6\n"), "{out}");
+        let typed = ui::check_act(
+            Type,
+            Some("e4".into()),
+            Some("hi".into()),
+            None,
+            None,
+            Some(0),
+            None,
+        )
+        .unwrap();
+        let out = m.ui_act("dev", typed).await.unwrap();
+        assert!(out.starts_with("typed 2 keys into e4\n"), "{out}");
+        assert!(!take().is_empty());
+
+        // Once the input is sent, a failure to read the result is no error:
+        // the agent must not repeat the action.
+        failing.store(true, Ordering::SeqCst);
+        let key = ui::check_act(
+            Key,
+            None,
+            None,
+            Some(" ctrl + s ".into()),
+            None,
+            Some(0),
+            None,
+        )
+        .unwrap();
+        let out = m.ui_act("dev", key).await.unwrap();
+        assert!(
+            out.starts_with("pressed ctrl+s; could not read the result: UI helper: gone"),
+            "{out}"
+        );
+        assert!(!take().is_empty());
+    }
+
+    /// Without screen coordinates a click is an invoke; other pointer
+    /// actions are refused.
+    #[tokio::test]
+    async fn ui_act_without_coordinates() {
+        use crate::ui::tests::{SMALL, hello};
+        use ui::Action::*;
+        let window = SMALL.replace(r#""coords":"screen""#, r#""coords":"window""#);
+        let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = invoked.clone();
+        let (_t, _d, m, log) = ui_manager(move |op, id| match op {
+            "hello" => vec![hello(id)],
+            "tree" => tree_reply(id, &window),
+            "invoke a2" => {
+                n.fetch_add(1, Ordering::SeqCst);
+                vec![serde_json::json!({"id": id, "ok": true}).to_string()]
+            }
+            _ => vec![serde_json::json!({"id": id, "ok": false, "error": "no"}).to_string()],
+        })
+        .await;
+        m.ui_tree("dev", ui::View::Default, 6000).await.unwrap();
+        let out = m.ui_act("dev", act(Click, Some("e2"))).await.unwrap();
+        assert!(
+            out.starts_with("invoked e2 (no screen coordinates to click)"),
+            "{out}"
+        );
+        assert_eq!(invoked.load(Ordering::SeqCst), 1);
+        let e = m
+            .ui_act("dev", act(Double, Some("e2")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no screen coordinates"), "{e}");
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// `ui_wait` polls until the text shows (or is gone); `ui_tree` and
+    /// `ui_act` on the same VM never deadlock.
+    #[tokio::test]
+    async fn ui_wait_polls() {
+        use crate::ui::tests::{SMALL, SMALL_AFTER, hello};
+        let trees = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = trees.clone();
+        let (_t, _d, m, _log) = ui_manager(move |op, id| match op {
+            "hello" => vec![hello(id)],
+            // "Save As" opens with the third tree.
+            "tree" if n.fetch_add(1, Ordering::SeqCst) >= 2 => tree_reply(id, SMALL_AFTER),
+            "tree" => tree_reply(id, SMALL),
+            _ => vec![
+                serde_json::json!({"id": id, "ok": true, "bbox": [10, 40, 32, 32], "hit": true, "screen": [1280, 800]})
+                    .to_string(),
+            ],
+        })
+        .await;
+        m.ui_tree("dev", ui::View::Default, 6000).await.unwrap();
+        let out = m
+            .ui_wait("dev", "Save As", false, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(out.starts_with("matched after "), "{out}");
+        assert!(
+            out.contains("\n+ e10 window \"Save As\" (gedit) active"),
+            "{out}"
+        );
+        assert_eq!(trees.load(Ordering::SeqCst), 3);
+        let out = m
+            .ui_wait("dev", "Save As", true, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert!(out.starts_with("timed out after "), "{out}");
+        assert!(
+            m.ui_wait("dev", "", false, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+
+        let (a, b) = tokio::join!(
+            m.ui_act("dev", act(ui::Action::Click, Some("e2"))),
+            m.ui_tree("dev", ui::View::Default, 6000),
+        );
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
     }
 
     /// The UI channel: any VM but a clone, only while stopped and without

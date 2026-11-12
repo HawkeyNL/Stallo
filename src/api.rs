@@ -133,6 +133,33 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_chars: Option<u32>,
     },
+    /// Acts on a control from `ui_tree` (see `ui::check_act`).
+    UiAct {
+        name: String,
+        action: crate::ui::Action,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dy: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settle_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+    },
+    /// Waits until text shows in the guest's UI, or with `gone` until it
+    /// no longer does.
+    UiWait {
+        name: String,
+        until: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        gone: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
     WaitForScreen {
         name: String,
         stable_ms: Option<u64>,
@@ -445,6 +472,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | FileWrite { name, .. }
         | Screenshot { name }
         | UiTree { name, .. }
+        | UiAct { name, .. }
+        | UiWait { name, .. }
         | Info { name }
         | Reset { name }
         | WaitForScreen { name, .. }
@@ -636,6 +665,16 @@ mod tests {
                 ..
             }
         ));
+        let act = r#"{"op":"ui_act","name":"dev","action":"double","id":"e4","settle_ms":0}"#;
+        let r: Request = serde_json::from_str(act).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), act);
+        let wait = r#"{"op":"ui_wait","name":"dev","until":"Saved","gone":true}"#;
+        let r: Request = serde_json::from_str(wait).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), wait);
+        assert!(
+            serde_json::from_str::<Request>(r#"{"op":"ui_act","name":"dev","action":"drag"}"#)
+                .is_err()
+        );
         let ui = r#"{"op":"set_ui","name":"dev","on":true}"#;
         let r: Request = serde_json::from_str(ui).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), ui);

@@ -132,6 +132,17 @@ fn text_result(result: anyhow::Result<serde_json::Value>) -> CallToolResult {
     }
 }
 
+/// The daemon's `text` as is: it is made for reading, not JSON.
+fn raw_text(result: anyhow::Result<serde_json::Value>) -> CallToolResult {
+    match result {
+        Ok(v) => match v["text"].as_str() {
+            Some(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            None => error(anyhow::anyhow!("the daemon sent no text")),
+        },
+        Err(e) => error(e),
+    }
+}
+
 fn error(e: anyhow::Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))])
 }
@@ -180,6 +191,69 @@ struct UiTreeArgs {
     all: bool,
     /// Longest answer in characters (500-20000, default 6000).
     max_chars: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UiActArgs {
+    /// VM name.
+    vm: String,
+    action: ActionArg,
+    /// The control's id from ui_tree, e.g. "e12" (optional for type and key).
+    id: Option<String>,
+    /// For type: the text to type.
+    text: Option<String>,
+    /// For key: a chord such as "ctrl+s" or "ret".
+    keys: Option<String>,
+    /// For scroll: wheel clicks, positive is down (-50 to 50).
+    dy: Option<i32>,
+    /// Wait this long before looking at the result (0-10000, default 1000).
+    settle_ms: Option<u64>,
+    /// Then also wait (up to 30 s) until this text shows.
+    until: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ActionArg {
+    Click,
+    Double,
+    Right,
+    Focus,
+    Invoke,
+    Type,
+    Key,
+    Scroll,
+}
+
+impl From<ActionArg> for crate::ui::Action {
+    fn from(a: ActionArg) -> Self {
+        use crate::ui::Action;
+        match a {
+            ActionArg::Click => Action::Click,
+            ActionArg::Double => Action::Double,
+            ActionArg::Right => Action::Right,
+            ActionArg::Focus => Action::Focus,
+            ActionArg::Invoke => Action::Invoke,
+            ActionArg::Type => Action::Type,
+            ActionArg::Key => Action::Key,
+            ActionArg::Scroll => Action::Scroll,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UiWaitArgs {
+    /// VM name.
+    vm: String,
+    /// Text to wait for (at most 200 characters).
+    until: String,
+    /// Wait until the text is gone instead.
+    #[serde(default)]
+    gone: bool,
+    /// Longest wait (500-300000, default 30000).
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -564,14 +638,46 @@ impl Server {
             all: a.all,
             max_chars: a.max_chars,
         };
-        // The text as is: it is made for reading, not JSON.
-        Ok(match self.call(request, QUICK).await {
-            Ok(v) => match v["text"].as_str() {
-                Some(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-                None => error(anyhow::anyhow!("the daemon sent no text")),
-            },
-            Err(e) => error(e),
-        })
+        Ok(raw_text(self.call(request, QUICK).await))
+    }
+
+    #[tool(
+        description = "Act on a control from ui_tree by its id, then return what was done and what changed (a diff against the last view: + new, ~ changed, - gone). click, double, right and scroll use the real mouse at the control's centre, after the helper confirms nothing covers it; focus and invoke ask the app directly; type and key use the keyboard (US layout, like type_text), on the control if an id is given, else on whatever has focus."
+    )]
+    async fn ui_act(
+        &self,
+        Parameters(a): Parameters<UiActArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let request = Request::UiAct {
+            name: a.vm,
+            action: a.action.into(),
+            id: a.id,
+            text: a.text,
+            keys: a.keys,
+            dy: a.dy,
+            settle_ms: a.settle_ms,
+            until: a.until,
+        };
+        let limit = QUICK + crate::ui::SETTLE_MAX + crate::ui::ACT_UNTIL;
+        Ok(raw_text(self.call(request, limit).await))
+    }
+
+    #[tool(
+        description = "Wait until some text shows in the VM's UI (a window title, or a control's name or value), or with gone=true until it no longer does; polls the UI helper twice a second. Returns how long it took and what changed.",
+        annotations(read_only_hint = true)
+    )]
+    async fn ui_wait(
+        &self,
+        Parameters(a): Parameters<UiWaitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = Duration::from_millis(a.timeout_ms.unwrap_or(0)).max(crate::ui::WAIT_DEFAULT);
+        let request = Request::UiWait {
+            name: a.vm,
+            until: a.until,
+            gone: a.gone,
+            timeout_ms: a.timeout_ms,
+        };
+        Ok(raw_text(self.call(request, limit + QUICK).await))
     }
 
     #[tool(
@@ -863,7 +969,7 @@ mod tests {
                             "size": data.len(), "more": false}})
                     }
                     Request::FileWrite { .. } | Request::Key { .. } => json!({"ok": true}),
-                    Request::UiTree { .. } => {
+                    Request::UiTree { .. } | Request::UiAct { .. } | Request::UiWait { .. } => {
                         json!({"ok": true, "data": {"text": "guest UI\ne1 window \"Files\""}})
                     }
                     Request::Exec { .. } => json!({"ok": false,
@@ -931,6 +1037,8 @@ mod tests {
             "vm_reset",
             "screenshot",
             "ui_tree",
+            "ui_act",
+            "ui_wait",
             "wait_for_screen",
             "mouse_move",
             "click",
@@ -1004,6 +1112,25 @@ mod tests {
                 all: false,
                 max_chars: None
             }]
+        );
+
+        let (r, seen) = tool(
+            "ui_act",
+            json!({"vm": "dev", "action": "type", "id": "e4", "text": "hi"}),
+        )
+        .await;
+        assert_eq!(r["content"][0]["text"], "guest UI\ne1 window \"Files\"");
+        assert!(matches!(
+            &seen[..],
+            [Request::UiAct {
+                action: crate::ui::Action::Type,
+                ..
+            }]
+        ));
+        let (r, seen) = tool("ui_act", json!({"vm": "dev", "action": "drag", "id": "e4"})).await;
+        assert_eq!(
+            (r["error"].is_object() || r["isError"] == true, seen.len()),
+            (true, 0)
         );
 
         let (r, _) = tool("file_read", json!({"vm": "dev", "path": "/etc/x"})).await;

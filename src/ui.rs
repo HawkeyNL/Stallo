@@ -18,8 +18,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -55,6 +55,17 @@ pub const MAX_QUERY: usize = 200;
 const VERSION: u32 = 1;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const TREE_TIMEOUT: Duration = Duration::from_secs(5);
+/// probe, focus and invoke.
+const ACT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wait after an action before looking at the result.
+pub const SETTLE_DEFAULT: Duration = Duration::from_millis(1000);
+pub const SETTLE_MAX: Duration = Duration::from_secs(10);
+/// Polling interval for `until` and `ui_wait`; never faster.
+pub const POLL: Duration = Duration::from_millis(500);
+pub const WAIT_DEFAULT: Duration = Duration::from_secs(30);
+pub const WAIT_MAX: Duration = Duration::from_secs(300);
+/// How long `ui_act` waits for its `until`.
+pub const ACT_UNTIL: Duration = Duration::from_secs(30);
 /// Lines skipped while waiting for a reply: stale replies, junk.
 const MAX_SKIP: usize = 64;
 
@@ -420,6 +431,8 @@ pub struct Session {
     seq: u64,
     /// The last default view and its seq.
     base: Option<(u64, Vec<Line>)>,
+    /// What the last shown tree's bboxes are relative to, and its screen.
+    last: Option<(Coords, (u32, u32))>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -457,6 +470,7 @@ impl Session {
         if tree.coords != Coords::Screen {
             head += "; no screen coordinates (click works by invoke; double/right/scroll by id unavailable)";
         }
+        self.last = Some((tree.coords, tree.screen));
         let default = self.default_lines(tree);
         let base = self.base.replace((self.seq, default.clone()));
         let body = if tree.windows.is_empty() {
@@ -487,6 +501,11 @@ impl Session {
             }
         };
         fit(head, &body, max_chars)
+    }
+
+    /// The coordinates and screen of the last tree shown.
+    pub fn last(&self) -> Option<(Coords, (u32, u32))> {
+        self.last
     }
 
     /// The helper key behind an id such as `e12`.
@@ -602,6 +621,99 @@ pub fn view(find: Option<String>, all: bool, max_chars: Option<u32>) -> Result<(
     Ok((view, max))
 }
 
+/// What `ui_act` does with a control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Click,
+    Double,
+    Right,
+    Focus,
+    Invoke,
+    Type,
+    Key,
+    Scroll,
+}
+
+/// A checked `ui_act` request.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Act {
+    pub action: Action,
+    pub id: Option<String>,
+    pub text: Option<String>,
+    pub keys: Option<String>,
+    pub dy: Option<i32>,
+    pub settle: Duration,
+    pub until: Option<String>,
+}
+
+/// Checks which `ui_act` arguments go with `action`: an id for everything
+/// that targets one control (optional for type and key, which then go to
+/// whatever has focus), text only for type, keys only for key, dy only for
+/// scroll.
+pub fn check_act(
+    action: Action,
+    id: Option<String>,
+    text: Option<String>,
+    keys: Option<String>,
+    dy: Option<i32>,
+    settle_ms: Option<u64>,
+    until: Option<String>,
+) -> Result<Act> {
+    use Action::*;
+    if !matches!(action, Type | Key) && id.is_none() {
+        bail!("this action needs the id of a control from ui_tree");
+    }
+    if (action == Type) != text.is_some() {
+        bail!("text goes with action type, and type needs it");
+    }
+    if (action == Key) != keys.is_some() {
+        bail!("keys go with action key, and key needs them");
+    }
+    if (action == Scroll) != dy.is_some() {
+        bail!("dy goes with action scroll, and scroll needs it");
+    }
+    if let Some(q) = &until {
+        check_query(q)?;
+    }
+    let settle = settle_ms.map_or(SETTLE_DEFAULT, Duration::from_millis);
+    if settle > SETTLE_MAX {
+        bail!("settle_ms must be at most {}", SETTLE_MAX.as_millis());
+    }
+    Ok(Act {
+        action,
+        id,
+        text,
+        keys,
+        dy,
+        settle,
+        until,
+    })
+}
+
+/// A checked `ui_wait` time limit.
+pub fn wait_limit(timeout_ms: Option<u64>) -> Result<Duration> {
+    let limit = timeout_ms.map_or(WAIT_DEFAULT, Duration::from_millis);
+    if !(POLL..=WAIT_MAX).contains(&limit) {
+        bail!(
+            "timeout_ms must be {} to {}",
+            POLL.as_millis(),
+            WAIT_MAX.as_millis()
+        );
+    }
+    Ok(limit)
+}
+
+/// The pixel at the centre of `r`, if it is on a `screen`-sized desktop.
+pub fn centre(r: Rect, (w, h): (u32, u32)) -> Option<(u32, u32)> {
+    let x = i64::from(r.x) + i64::from(r.w / 2);
+    let y = i64::from(r.y) + i64::from(r.h / 2);
+    Some((
+        u32::try_from(x).ok().filter(|&x| x < w)?,
+        u32::try_from(y).ok().filter(|&y| y < h)?,
+    ))
+}
+
 /// A connection to the UI helper. A guest write blocks until a host side
 /// connects, so lines from an earlier, cut-off exchange can arrive first:
 /// every reply must carry its request's id, and others are skipped.
@@ -626,6 +738,21 @@ struct Reply {
     v: Option<u32>,
     #[serde(default)]
     tree: Option<RawTree>,
+    #[serde(default)]
+    bbox: Option<[i32; 4]>,
+    #[serde(default)]
+    hit: Option<bool>,
+    #[serde(default)]
+    screen: Option<(u32, u32)>,
+}
+
+/// Where a control is now (see [`Conn::probe`]).
+pub struct Probe {
+    pub bbox: Option<Rect>,
+    /// The helper's own hit test at the centre finds the control.
+    pub hit: bool,
+    /// The desktop size now.
+    pub screen: (u32, u32),
 }
 
 impl Conn {
@@ -650,7 +777,7 @@ impl Conn {
             next: u64::from_ne_bytes(crate::random_bytes()?) >> 11,
         };
         match conn
-            .call("hello", HELLO_TIMEOUT)
+            .call(json!({"op": "hello"}), HELLO_TIMEOUT)
             .await
             .with_context(no_helper)?
             .v
@@ -665,14 +792,56 @@ impl Conn {
 
     /// The current tree, checked.
     pub async fn tree(&mut self) -> Result<Tree> {
-        let reply = self.call("tree", TREE_TIMEOUT).await?;
+        let reply = self.call(json!({"op": "tree"}), TREE_TIMEOUT).await?;
         Tree::parse(reply.tree.context("the UI helper sent no tree")?)
     }
 
-    async fn call(&mut self, op: &str, limit: Duration) -> Result<Reply> {
+    /// Where `key` is now, whether it (or a child) is what a click at its
+    /// centre would hit by the helper's own hit test, and the desktop size.
+    pub async fn probe(&mut self, key: &str) -> Result<Probe> {
+        let reply = self
+            .call(json!({"op": "probe", "key": key}), ACT_TIMEOUT)
+            .await?;
+        let bbox = match reply.bbox {
+            Some([x, y, w, h]) => {
+                let (Ok(w), Ok(h)) = (u32::try_from(w), u32::try_from(h)) else {
+                    bail!("the UI helper sent a negative size");
+                };
+                Some(Rect { x, y, w, h })
+            }
+            None => None,
+        };
+        let size = 1..=MAX_SCREEN;
+        let screen = reply
+            .screen
+            .filter(|(w, h)| size.contains(w) && size.contains(h))
+            .context("the UI helper sent no valid screen size")?;
+        Ok(Probe {
+            bbox,
+            hit: reply.hit.unwrap_or(false),
+            screen,
+        })
+    }
+
+    /// Asks the app to focus `key` (no input events).
+    pub async fn focus(&mut self, key: &str) -> Result<()> {
+        self.call(json!({"op": "focus", "key": key}), ACT_TIMEOUT)
+            .await
+            .map(drop)
+    }
+
+    /// Asks the app to activate `key` (no input events).
+    pub async fn invoke(&mut self, key: &str) -> Result<()> {
+        self.call(json!({"op": "invoke", "key": key}), ACT_TIMEOUT)
+            .await
+            .map(drop)
+    }
+
+    async fn call(&mut self, mut request: Value, limit: Duration) -> Result<Reply> {
         self.next += 1;
         let id = self.next;
-        let request = format!("{}\n", json!({"id": id, "op": op}));
+        request["id"] = json!(id);
+        let request = format!("{request}\n");
         timeout(limit, async {
             self.w.write_all(request.as_bytes()).await?;
             for _ in 0..MAX_SKIP {
@@ -894,7 +1063,7 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
 
     pub(crate) const SMALL: &str = include_str!("../tests/fixtures/ui/small.json");
-    const SMALL_AFTER: &str = include_str!("../tests/fixtures/ui/small-after.json");
+    pub(crate) const SMALL_AFTER: &str = include_str!("../tests/fixtures/ui/small-after.json");
 
     fn parse(v: Value) -> Result<Tree> {
         Tree::parse(serde_json::from_value(v)?)
@@ -1323,6 +1492,61 @@ e8 window \"Terminal\" (gnome-terminal)
     }
 
     #[test]
+    fn act_arguments() {
+        use Action::*;
+        let id = || Some("e2".to_owned());
+        let s = |s: &str| Some(s.to_owned());
+        let ok = check_act(Click, id(), None, None, None, Some(0), s("Save")).unwrap();
+        assert_eq!(
+            (ok.settle, ok.until.as_deref()),
+            (Duration::ZERO, Some("Save"))
+        );
+        assert_eq!(
+            check_act(Type, None, s("hi"), None, None, None, None)
+                .unwrap()
+                .settle,
+            SETTLE_DEFAULT
+        );
+        assert!(check_act(Key, id(), None, s("ctrl+s"), None, None, None).is_ok());
+        assert!(check_act(Scroll, id(), None, None, Some(-3), None, None).is_ok());
+        for (action, id, text, keys, dy, settle, until) in [
+            (Click, None, None, None, None, None, None),
+            (Invoke, None, None, None, None, None, None),
+            (Click, id(), s("x"), None, None, None, None),
+            (Type, None, None, None, None, None, None),
+            (Key, None, s("x"), None, None, None, None),
+            (Key, None, None, None, None, None, None),
+            (Focus, id(), None, s("ret"), None, None, None),
+            (Scroll, id(), None, None, None, None, None),
+            (Click, id(), None, None, Some(1), None, None),
+            (Click, id(), None, None, None, Some(10_001), None),
+            (Click, id(), None, None, None, None, s("")),
+            (Click, id(), None, None, None, None, s("a\nb")),
+        ] {
+            assert!(
+                check_act(action, id, text, keys, dy, settle, until).is_err(),
+                "{action:?}"
+            );
+        }
+        assert_eq!(wait_limit(None).unwrap(), WAIT_DEFAULT);
+        assert!(wait_limit(Some(500)).is_ok() && wait_limit(Some(300_000)).is_ok());
+        assert!(wait_limit(Some(499)).is_err() && wait_limit(Some(300_001)).is_err());
+    }
+
+    #[test]
+    fn centres() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        assert_eq!(centre(r(10, 40, 32, 32), (1280, 800)), Some((26, 56)));
+        assert_eq!(centre(r(1270, 0, 30, 2), (1280, 800)), None);
+        assert_eq!(centre(r(-40, 10, 20, 20), (1280, 800)), None);
+        // No overflow from hostile sizes.
+        assert_eq!(
+            centre(r(i32::MAX, i32::MAX, u32::MAX, u32::MAX), (1280, 800)),
+            None
+        );
+    }
+
+    #[test]
     fn view_requests() {
         assert!(matches!(
             view(None, false, None),
@@ -1347,7 +1571,8 @@ e8 window \"Terminal\" (gnome-terminal)
     }
 
     /// A fake helper on `path`: each request gets the lines `reply` returns
-    /// for its op and id. Counts the connections it accepts.
+    /// for its op (`probe a3` with a key) and id. Counts the connections
+    /// it accepts.
     pub(crate) fn fake_helper(
         path: &Path,
         reply: impl Fn(&str, u64) -> Vec<String> + Send + Sync + 'static,
@@ -1366,8 +1591,11 @@ e8 window \"Terminal\" (gnome-terminal)
                     let mut lines = BufReader::new(r).lines();
                     while let Ok(Some(l)) = lines.next_line().await {
                         let v: Value = serde_json::from_str(&l).unwrap();
-                        let (op, id) = (v["op"].as_str().unwrap(), v["id"].as_u64().unwrap());
-                        for out in reply(op, id) {
+                        let op = match v["key"].as_str() {
+                            Some(key) => format!("{} {key}", v["op"].as_str().unwrap()),
+                            None => v["op"].as_str().unwrap().to_owned(),
+                        };
+                        for out in reply(&op, v["id"].as_u64().unwrap()) {
                             if w.write_all(format!("{out}\n").as_bytes()).await.is_err() {
                                 return;
                             }

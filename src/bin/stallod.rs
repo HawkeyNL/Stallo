@@ -515,6 +515,28 @@ async fn dispatch(
             let (view, max) = stallo::ui::view(find, all, max_chars)?;
             json!({"text": m.ui_tree(&name, view, max).await?})
         }
+        Request::UiAct {
+            name,
+            action,
+            id,
+            text,
+            keys,
+            dy,
+            settle_ms,
+            until,
+        } => {
+            let act = stallo::ui::check_act(action, id, text, keys, dy, settle_ms, until)?;
+            json!({"text": m.ui_act(&name, act).await?})
+        }
+        Request::UiWait {
+            name,
+            until,
+            gone,
+            timeout_ms,
+        } => {
+            let limit = stallo::ui::wait_limit(timeout_ms)?;
+            json!({"text": m.ui_wait(&name, &until, gone, limit).await?})
+        }
         Request::WaitForScreen {
             name,
             stable_ms,
