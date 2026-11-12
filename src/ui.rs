@@ -397,9 +397,9 @@ pub enum View {
 /// is restored: the ids no longer mean anything then.
 #[derive(Default)]
 pub struct Session {
-    ids: HashMap<String, u32>,
-    keys: HashMap<u32, String>,
-    next: u32,
+    ids: HashMap<String, u64>,
+    keys: HashMap<u64, String>,
+    next: u64,
     seq: u64,
     /// The last default view and its seq.
     base: Option<(u64, Vec<Line>)>,
@@ -407,7 +407,7 @@ pub struct Session {
 
 #[derive(Clone, PartialEq, Eq)]
 struct Line {
-    id: u32,
+    id: u64,
     depth: u8,
     text: String,
 }
@@ -420,6 +420,14 @@ impl Session {
     /// Renders `view` in at most `max_chars` characters and makes this
     /// tree's default view the next diff base.
     pub fn show(&mut self, tree: &Tree, view: &View, max_chars: usize) -> String {
+        // Start over between renders, never during one: a tree has fewer
+        // keys than MAX_IDS, so every id shown stays valid.
+        if self.ids.len() + tree.windows.len() + tree.nodes.len() > MAX_IDS {
+            self.ids.clear();
+            self.keys.clear();
+            self.base = None;
+        }
+        let max_chars = max_chars.clamp(*MAX_CHARS.start(), *MAX_CHARS.end());
         self.seq += 1;
         let (w, h) = tree.screen;
         let mut head = format!(
@@ -467,7 +475,7 @@ impl Session {
     /// The helper key behind an id such as `e12`.
     pub fn key(&self, id: &str) -> Result<&str> {
         id.strip_prefix('e')
-            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|n| !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|n| n.parse().ok())
             .and_then(|n| self.keys.get(&n))
             .map(String::as_str)
@@ -475,13 +483,9 @@ impl Session {
     }
 
     /// The id for `key`, assigned at first sight and never reused.
-    fn id(&mut self, key: &str) -> u32 {
+    fn id(&mut self, key: &str) -> u64 {
         if let Some(&id) = self.ids.get(key) {
             return id;
-        }
-        if self.ids.len() >= MAX_IDS {
-            self.ids.clear();
-            self.keys.clear();
         }
         self.next += 1;
         self.ids.insert(key.to_owned(), self.next);
@@ -549,11 +553,14 @@ impl Session {
     }
 }
 
-/// Whether any window title or element name or value contains `query`
-/// (case-insensitive). Password values are never in a tree.
+/// Whether a window title or a name or value that `ui_tree all` shows
+/// contains `query` (case-insensitive). Password values are never in a tree.
 pub fn matches(tree: &Tree, query: &str) -> bool {
     let q = query.to_lowercase();
-    tree.windows.iter().any(|w| has(&w.title, &q)) || tree.nodes.iter().any(|n| hit(n, &q))
+    tree.windows
+        .iter()
+        .enumerate()
+        .any(|(w, win)| has(&win.title, &q) || kept(tree, w, true).iter().any(|(n, _)| hit(n, &q)))
 }
 
 /// A `find` or `until` text: 1 to [`MAX_QUERY`] printable characters.
@@ -665,8 +672,8 @@ fn render(lines: &[Line]) -> Vec<String> {
 /// `+` new, `~` changed and one `-` line for removed ids, in the new view's
 /// order. `None` when it would be too long to help.
 fn diff(old: &[Line], new: &[Line]) -> Option<Vec<String>> {
-    let before: HashMap<u32, &Line> = old.iter().map(|l| (l.id, l)).collect();
-    let now: HashSet<u32> = new.iter().map(|l| l.id).collect();
+    let before: HashMap<u64, &Line> = old.iter().map(|l| (l.id, l)).collect();
+    let now: HashSet<u64> = new.iter().map(|l| l.id).collect();
     let mut out = Vec::new();
     for l in new {
         let mark = match before.get(&l.id) {
@@ -826,16 +833,29 @@ e8 window \"Terminal\" (gnome-terminal)
         let again = s.show(&tree(SMALL), &View::All, MAX_CHARS_DEFAULT);
         assert_eq!(body(&first), body(&again));
         assert_eq!(s.key("e6").unwrap(), "a6");
-        for bad in ["e99", "x1", "e", "e+6", "e6 "] {
+        for bad in ["e99", "x1", "e", "e+6", "e6 ", "e06", "e0"] {
             assert!(s.key(bad).is_err(), "{bad}");
         }
 
+        // The map starts over before a render that would overflow it, so
+        // every id that render shows still resolves.
         let old = s.next;
-        for i in 0..MAX_IDS {
+        for i in 0..MAX_IDS - 5 - s.ids.len() {
             s.id(&format!("k{i}"));
         }
+        let out = s.show(&tree(SMALL), &View::Default, MAX_CHARS_DEFAULT);
         assert!(s.key("e1").is_err());
-        assert!(s.id("w1") > old + MAX_IDS as u32);
+        assert!(s.ids["w1"] > old);
+        let ids: Vec<&str> = out
+            .split_whitespace()
+            .filter(|w| {
+                w.len() > 1 && w.starts_with('e') && w[1..].bytes().all(|b| b.is_ascii_digit())
+            })
+            .collect();
+        assert_eq!(ids.len(), 9);
+        for id in ids {
+            assert!(s.key(id).is_ok(), "{id}");
+        }
     }
 
     #[test]
@@ -973,6 +993,10 @@ e8 window \"Terminal\" (gnome-terminal)
         assert!(all.contains("text \"agent@dev:~$\""));
         let default = s.show(&t, &View::Default, MAX_CHARS_DEFAULT);
         assert!(!default.contains("agent@dev"));
+        let mut v = small();
+        v["nodes"][9]["role"] = json!("alert");
+        let out = Session::new().show(&parse(v).unwrap(), &View::Default, MAX_CHARS_DEFAULT);
+        assert!(out.contains("e9 alert \"agent@dev:~$\""), "{out}");
         assert!(!default.contains("toolbar") && !default.contains("group"));
 
         let mut v = small();
@@ -1030,6 +1054,8 @@ e8 window \"Terminal\" (gnome-terminal)
             "{out}"
         );
         assert!(matches(&t, "Places") && matches(&t, "terminal") && !matches(&t, "nope"));
+        // Only what a view can show matches: not the offscreen "Hidden".
+        assert!(!matches(&t, "Hidden"));
         assert!(check_query("Save").is_ok());
         for bad in [
             String::new(),
@@ -1064,6 +1090,19 @@ e8 window \"Terminal\" (gnome-terminal)
         assert_eq!(
             body(&s.show(&t, &View::Diff, MAX_CHARS_DEFAULT)),
             "no changes"
+        );
+
+        // Few changed lines but a long "-" line: the full view is shorter.
+        let mut s = Session::new();
+        s.show(
+            &parse(buttons(50)).unwrap(),
+            &View::Default,
+            MAX_CHARS_DEFAULT,
+        );
+        let out = s.show(&t, &View::Diff, MAX_CHARS_DEFAULT);
+        assert!(
+            out.lines().next().unwrap().ends_with("; full view"),
+            "{out}"
         );
 
         let mut v = small();
