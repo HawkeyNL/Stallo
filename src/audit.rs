@@ -133,6 +133,17 @@ pub fn describe(r: &Request) -> Described<'_> {
         Request::Info { name } => ("info", Some(name), vec![], None),
         Request::Reset { name } => ("reset", Some(name), vec![], None),
         Request::Screenshot { name } => ("screenshot", Some(name), vec![], None),
+        Request::UiTree {
+            name, find, all, ..
+        } => (
+            "ui_tree",
+            Some(name),
+            vec![
+                ("find", find.as_deref().map_or(0, len)),
+                ("all", u64::from(*all)),
+            ],
+            None,
+        ),
         Request::WaitForScreen { name, .. } => ("wait_for_screen", Some(name), vec![], None),
         Request::MouseMove { name, .. } => ("mouse_move", Some(name), vec![], None),
         Request::Click { name, .. } => ("click", Some(name), vec![], None),
@@ -434,6 +445,19 @@ mod tests {
             on: true,
         };
         assert!(entry(&ui).contains(r#""op":"set_ui","args":{"on":1}"#));
+        // What an agent looked for is content: only its size is kept.
+        let tree = Request::UiTree {
+            name: "dev".into(),
+            find: Some("secret plan".into()),
+            all: false,
+            max_chars: None,
+        };
+        let line = entry(&tree);
+        assert!(
+            line.contains(r#""op":"ui_tree","args":{"all":0,"find":11}"#),
+            "{line}"
+        );
+        assert!(!line.contains("secret"));
         let mut new = Request::New {
             name: "dev".into(),
             image: "arch".into(),

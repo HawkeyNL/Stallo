@@ -121,6 +121,18 @@ pub enum Request {
     Screenshot {
         name: String,
     },
+    /// The guest's UI as text, from the helper on the UI channel.
+    UiTree {
+        name: String,
+        /// Only what matches (names and values).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        find: Option<String>,
+        /// Every window and all text.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_chars: Option<u32>,
+    },
     WaitForScreen {
         name: String,
         stable_ms: Option<u64>,
@@ -432,6 +444,7 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | FileRead { name, .. }
         | FileWrite { name, .. }
         | Screenshot { name }
+        | UiTree { name, .. }
         | Info { name }
         | Reset { name }
         | WaitForScreen { name, .. }
@@ -610,6 +623,19 @@ mod tests {
         let net = r#"{"op":"set_net","name":"dev","net":"internet"}"#;
         let r: Request = serde_json::from_str(net).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), net);
+        let tree = r#"{"op":"ui_tree","name":"dev","find":"Save","max_chars":800}"#;
+        let r: Request = serde_json::from_str(tree).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), tree);
+        let r: Request = serde_json::from_str(r#"{"op":"ui_tree","name":"dev"}"#).unwrap();
+        assert!(matches!(
+            r,
+            Request::UiTree {
+                find: None,
+                all: false,
+                max_chars: None,
+                ..
+            }
+        ));
         let ui = r#"{"op":"set_ui","name":"dev","on":true}"#;
         let r: Request = serde_json::from_str(ui).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), ui);
@@ -705,6 +731,15 @@ mod tests {
             agent_gate(&Request::TypeText {
                 name: name(),
                 text: "x".into()
+            }),
+            Gate::Vm("dev")
+        );
+        assert_eq!(
+            agent_gate(&Request::UiTree {
+                name: name(),
+                find: None,
+                all: true,
+                max_chars: None
             }),
             Gate::Vm("dev")
         );

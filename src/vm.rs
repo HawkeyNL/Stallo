@@ -32,7 +32,7 @@ use crate::host::{self, Ask, HostInfo};
 use crate::paths::{Paths, ensure_private_dir, safe_remove};
 use crate::qga::{ExecOutput, Qga};
 use crate::qmp::Qmp;
-use crate::{confine, images, input, net, qemu, seed, tpm};
+use crate::{confine, images, input, net, qemu, seed, tpm, ui};
 
 /// passt's messages, in the VM directory.
 const PASST_LOG: &str = "passt.log";
@@ -77,6 +77,8 @@ const CHORD_HOLD: Duration = Duration::from_millis(50);
 const POINTER_STEP: Duration = Duration::from_millis(20);
 /// Time for the guest to draw the result of a click before the screenshot.
 const CLICK_SETTLE: Duration = Duration::from_millis(50);
+/// How long a UI request waits for the one before it on the same VM.
+const UI_BUSY_WAIT: Duration = Duration::from_secs(5);
 const DRAG_STEPS: u32 = 10;
 /// How long an input action waits for the one before it.
 const INPUT_BUSY_WAIT: Duration = Duration::from_secs(30);
@@ -149,6 +151,10 @@ pub struct Running {
     /// The guest-agent connection, kept between operations (the agent
     /// sleeps ~100 ms after every disconnect), one operation at a time.
     pub(crate) qga: tokio::sync::Mutex<Option<Qga>>,
+    ui_sock: PathBuf,
+    /// The UI helper's connection and the ids it handed out, one request
+    /// at a time.
+    pub(crate) ui: tokio::sync::Mutex<UiLink>,
     /// Paused by the disk watchdog.
     pub(crate) disk_full: AtomicBool,
     /// The daemon's handle on QEMU's stderr, for [`Manager::cap_logs`].
@@ -163,6 +169,13 @@ pub struct Running {
     exited: watch::Receiver<bool>,
     /// The Enter presses for Windows' CD boot prompt, while they run.
     boot_key_task: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+/// See [`Running::with_ui`].
+#[derive(Default)]
+pub(crate) struct UiLink {
+    conn: Option<ui::Conn>,
+    session: ui::Session,
 }
 
 impl Running {
@@ -960,6 +973,8 @@ impl Manager {
             tpm,
             qmp,
             qga_sock: rt_dir.join(qemu::QGA_SOCK),
+            ui_sock: rt_dir.join(qemu::UI_SOCK),
+            ui: tokio::sync::Mutex::default(),
             rt_dir: rt_dir.clone(),
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
@@ -1455,6 +1470,18 @@ impl Manager {
             .with_context(|| format!("{name} is not running; start it with `stallo start {name}`"))
     }
 
+    /// The guest's UI as text (see `ui.rs`).
+    pub async fn ui_tree(&self, name: &str, view: ui::View, max_chars: usize) -> Result<String> {
+        let vm = self.running_vm(name)?;
+        // The VM as started: the port exists only if it was on then.
+        ensure!(
+            vm.config.ui,
+            "{name} has no UI channel; a human can run: stallo stop {name}; stallo set {name} --ui on"
+        );
+        vm.with_ui(async |conn, session| Ok(session.show(&conn.tree().await?, &view, max_chars)))
+            .await
+    }
+
     /// The guest screen as PNG.
     pub async fn screenshot(&self, name: &str) -> Result<Screenshot> {
         self.running_vm(name)?.screenshot().await
@@ -1869,6 +1896,34 @@ impl Running {
         let result = op(q).await;
         if result.is_err() {
             *agent = None;
+        }
+        result
+    }
+
+    /// Runs `op` on the UI helper's connection, made first if needed. A
+    /// failed operation drops the connection; the ids stay.
+    async fn with_ui<T>(
+        &self,
+        op: impl AsyncFnOnce(&mut ui::Conn, &mut ui::Session) -> Result<T>,
+    ) -> Result<T> {
+        let name = &self.config.name;
+        let mut link = tokio::time::timeout(UI_BUSY_WAIT, self.ui.lock())
+            .await
+            .map_err(|_| anyhow::anyhow!("{name} is busy with another UI request"))?;
+        let link = &mut *link;
+        let conn = match &mut link.conn {
+            Some(conn) => conn,
+            None => link.conn.insert(ui::Conn::connect(&self.ui_sock).await.with_context(
+                || {
+                    format!(
+                        "no UI helper answered in {name}; is someone logged in to its desktop, with the Stallo UI helper running?"
+                    )
+                },
+            )?),
+        };
+        let result = op(conn, &mut link.session).await;
+        if result.is_err() {
+            link.conn = None;
         }
         result
     }
@@ -2408,6 +2463,8 @@ mod tests {
             tpm: None,
             qmp,
             qga_sock: dir.path().join("qga.sock"),
+            ui_sock: dir.path().join("ui.sock"),
+            ui: tokio::sync::Mutex::default(),
             rt_dir: "/nonexistent".into(),
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
@@ -3102,6 +3159,76 @@ mod tests {
             }
         );
         assert_eq!(m.load("win").unwrap(), cfg, "vm.toml round-trip");
+    }
+
+    /// `ui_tree`: only for a VM started with the UI channel; a helper
+    /// that fails once is reconnected and the ids stay.
+    #[tokio::test]
+    async fn ui_tree_through_the_helper() {
+        use crate::ui::tests::{SMALL, fake_helper, hello};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        for d in ["data", "run", "cg"] {
+            fs::create_dir(root.join(d)).unwrap();
+        }
+        let paths = Paths::new(root.join("data"), root.join("run"))
+            .unwrap()
+            .prepare()
+            .unwrap();
+        let m = Manager::new(
+            paths,
+            DaemonConfig::default(),
+            Cgroups::at(root.join("cg")),
+            Mode::Dev,
+        );
+        m.cleanup_leftovers().await.unwrap();
+        let (_d, mut vm, _) = fake_vm("running", None).await;
+        let dir = m.paths.vm_dir("dev");
+        fs::create_dir(&dir).unwrap();
+        vm.config.save(&dir).unwrap();
+        let err = async |m: &Manager| {
+            m.ui_tree("dev", ui::View::Default, 6000)
+                .await
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err(&m).await.contains("dev is not running"));
+        vm.config.ui = true;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        fake_helper(&vm.ui_sock, move |op, id| match op {
+            "hello" => vec![hello(id)],
+            // The second tree request fails.
+            _ if n.fetch_add(1, Ordering::SeqCst) == 1 => {
+                vec![serde_json::json!({"id": id, "ok": false, "error": "busy"}).to_string()]
+            }
+            _ => vec![format!(
+                r#"{{"id":{id},"ok":true,"tree":{}}}"#,
+                SMALL.replace('\n', "")
+            )],
+        });
+        let off = Running {
+            config: VmConfig {
+                ui: false,
+                ..vm.config.clone()
+            },
+            ..fake_vm("running", None).await.1
+        };
+        m.running
+            .lock()
+            .unwrap()
+            .insert("dev".into(), Arc::new(off));
+        assert!(err(&m).await.contains("dev has no UI channel"));
+        m.running.lock().unwrap().insert("dev".into(), Arc::new(vm));
+        let first = m.ui_tree("dev", ui::View::Default, 6000).await.unwrap();
+        assert!(first.contains("\ne1 window \"Files — Home\""), "{first}");
+        assert_eq!(err(&m).await, "UI helper: busy");
+        let again = m.ui_tree("dev", ui::View::Default, 6000).await.unwrap();
+        assert_eq!(
+            first.split_once('\n').unwrap().1,
+            again.split_once('\n').unwrap().1
+        );
+        assert!(again.contains("; seq 2;"), "{again}");
     }
 
     /// The UI channel: any VM but a clone, only while stopped and without

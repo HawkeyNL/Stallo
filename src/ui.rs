@@ -8,13 +8,24 @@
 //! Everything in a tree comes from the guest and is untrusted: any breach of
 //! a limit rejects the whole reply, roles and states map to a fixed host
 //! vocabulary, and every string is cleaned with [`printable`] and capped.
+//!
+//! The helper talks over the VM's UI channel (`VmConfig::ui`): one JSON
+//! request per line from the host, one reply per line with the request's
+//! id. It never speaks first.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use serde_json::json;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::time::timeout;
 
-use crate::printable;
+use crate::{printable, read_line};
 
 /// Longest reply line accepted from the helper.
 pub const MAX_LINE: usize = 1 << 20;
@@ -40,6 +51,12 @@ pub const MAX_CHARS_DEFAULT: usize = 6000;
 pub const MAX_CHARS: std::ops::RangeInclusive<usize> = 500..=20_000;
 /// Longest `find` or `until` text.
 pub const MAX_QUERY: usize = 200;
+/// The helper protocol this build speaks.
+const VERSION: u32 = 1;
+const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+const TREE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Lines skipped while waiting for a reply: stale replies, junk.
+const MAX_SKIP: usize = 64;
 
 const NO_WINDOWS: &str =
     "no windows visible to the UI helper (login, lock screen, UAC or installer?); use screenshot";
@@ -563,6 +580,115 @@ pub fn matches(tree: &Tree, query: &str) -> bool {
         .any(|(w, win)| has(&win.title, &q) || kept(tree, w, true).iter().any(|(n, _)| hit(n, &q)))
 }
 
+/// The view and size limit for a `ui_tree` request, checked.
+pub fn view(find: Option<String>, all: bool, max_chars: Option<u32>) -> Result<(View, usize)> {
+    let view = match (find, all) {
+        (Some(_), true) => bail!("give find or all, not both"),
+        (Some(q), false) => {
+            check_query(&q)?;
+            View::Find(q)
+        }
+        (None, true) => View::All,
+        (None, false) => View::Default,
+    };
+    let max = max_chars.map_or(MAX_CHARS_DEFAULT, |n| n as usize);
+    if !MAX_CHARS.contains(&max) {
+        bail!(
+            "max_chars must be {} to {}",
+            MAX_CHARS.start(),
+            MAX_CHARS.end()
+        );
+    }
+    Ok((view, max))
+}
+
+/// A connection to the UI helper. A guest write blocks until a host side
+/// connects, so lines from an earlier, cut-off exchange can arrive first:
+/// every reply must carry its request's id, and others are skipped.
+pub struct Conn {
+    r: BufReader<OwnedReadHalf>,
+    w: OwnedWriteHalf,
+    line: Vec<u8>,
+    next: u64,
+}
+
+#[derive(Deserialize)]
+struct Head {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct Reply {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    v: Option<u32>,
+    #[serde(default)]
+    tree: Option<RawTree>,
+}
+
+impl Conn {
+    /// Connects and checks the helper's protocol version.
+    pub async fn connect(path: &Path) -> Result<Self> {
+        let (r, w) = timeout(HELLO_TIMEOUT, UnixStream::connect(path))
+            .await
+            .map_err(|_| anyhow!("the UI channel did not accept within {HELLO_TIMEOUT:?}"))??
+            .into_split();
+        let mut conn = Conn {
+            r: BufReader::new(r),
+            w,
+            line: Vec::new(),
+            // Random per connection, below 2^53 for JSON.
+            next: u64::from_ne_bytes(crate::random_bytes()?) >> 11,
+        };
+        match conn.call("hello", HELLO_TIMEOUT).await?.v {
+            Some(VERSION) => Ok(conn),
+            v => bail!(
+                "the UI helper speaks protocol {}, this Stallo speaks {VERSION}",
+                v.map_or("?".to_owned(), |v| v.to_string())
+            ),
+        }
+    }
+
+    /// The current tree, checked.
+    pub async fn tree(&mut self) -> Result<Tree> {
+        let reply = self.call("tree", TREE_TIMEOUT).await?;
+        Tree::parse(reply.tree.context("the UI helper sent no tree")?)
+    }
+
+    async fn call(&mut self, op: &str, limit: Duration) -> Result<Reply> {
+        self.next += 1;
+        let id = self.next;
+        let request = format!("{}\n", json!({"id": id, "op": op}));
+        timeout(limit, async {
+            self.w.write_all(request.as_bytes()).await?;
+            for _ in 0..MAX_SKIP {
+                match read_line(&mut self.r, &mut self.line, MAX_LINE).await {
+                    Ok(true) => {}
+                    Ok(false) => bail!("the UI helper's channel closed"),
+                    // Too long: skip it (the rest arrives as more lines).
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+                    Err(e) => return Err(e.into()),
+                }
+                if !serde_json::from_slice::<Head>(&self.line).is_ok_and(|h| h.id == id) {
+                    continue;
+                }
+                let reply: Reply = serde_json::from_slice(&self.line)
+                    .context("the UI helper sent a malformed reply")?;
+                if !reply.ok {
+                    let e = reply.error.unwrap_or_default();
+                    bail!("UI helper: {}", printable(&e, 200));
+                }
+                return Ok(reply);
+            }
+            bail!("the UI helper did not answer request {id}")
+        })
+        .await
+        .map_err(|_| anyhow!("the UI helper did not answer within {limit:?}"))?
+    }
+}
+
 /// A `find` or `until` text: 1 to [`MAX_QUERY`] printable characters.
 pub fn check_query(q: &str) -> Result<()> {
     if q.is_empty() || q.chars().count() > MAX_QUERY || printable(q, MAX_QUERY) != q {
@@ -745,11 +871,11 @@ fn quote(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    const SMALL: &str = include_str!("../tests/fixtures/ui/small.json");
+    pub(crate) const SMALL: &str = include_str!("../tests/fixtures/ui/small.json");
     const SMALL_AFTER: &str = include_str!("../tests/fixtures/ui/small-after.json");
 
     fn parse(v: Value) -> Result<Tree> {
@@ -1176,6 +1302,136 @@ e8 window \"Terminal\" (gnome-terminal)
         assert!(
             out.contains("screen 2560x800\n") && out.contains("Back") && out.contains("Forward")
         );
+    }
+
+    #[test]
+    fn view_requests() {
+        assert!(matches!(
+            view(None, false, None),
+            Ok((View::Default, MAX_CHARS_DEFAULT))
+        ));
+        assert!(matches!(view(None, true, Some(500)), Ok((View::All, 500))));
+        assert!(
+            matches!(view(Some("Save".into()), false, Some(20_000)), Ok((View::Find(q), 20_000)) if q == "Save")
+        );
+        for (find, all, max) in [
+            (Some("x".to_owned()), true, None),
+            (Some(String::new()), false, None),
+            (Some("a\nb".to_owned()), false, None),
+            (None, false, Some(499)),
+            (None, false, Some(20_001)),
+        ] {
+            assert!(
+                view(find.clone(), all, max).is_err(),
+                "{find:?} {all} {max:?}"
+            );
+        }
+    }
+
+    /// A fake helper on `path`: each request gets the lines `reply` returns
+    /// for its op and id.
+    pub(crate) fn fake_helper(
+        path: &Path,
+        reply: impl Fn(&str, u64) -> Vec<String> + Send + Sync + 'static,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let reply = std::sync::Arc::new(reply);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        let v: Value = serde_json::from_str(&l).unwrap();
+                        let (op, id) = (v["op"].as_str().unwrap(), v["id"].as_u64().unwrap());
+                        for out in reply(op, id) {
+                            if w.write_all(format!("{out}\n").as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    pub(crate) fn hello(id: u64) -> String {
+        json!({"id": id, "ok": true, "v": 1}).to_string()
+    }
+
+    /// Stale replies, junk and over-long lines before the reply are skipped.
+    #[tokio::test]
+    async fn conn_matches_replies_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.sock");
+        fake_helper(&path, |op, id| match op {
+            "hello" => vec![
+                json!({"id": id - 1, "ok": true, "v": 1}).to_string(),
+                "garbage".into(),
+                "x".repeat(2 << 20),
+                hello(id),
+            ],
+            _ => vec![
+                json!({"id": id + 7, "ok": false, "error": "stale"}).to_string(),
+                format!(r#"{{"id":{id},"ok":true,"tree":{SMALL}}}"#).replace('\n', ""),
+            ],
+        });
+        let mut conn = Conn::connect(&path).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(conn.tree().await.unwrap().windows.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn conn_refuses_bad_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = |name: &str, reply: fn(&str, u64) -> Vec<String>| {
+            let path = dir.path().join(name);
+            fake_helper(&path, reply);
+            async move {
+                match Conn::connect(&path).await {
+                    Ok(mut conn) => format!("{:#}", conn.tree().await.err().unwrap()),
+                    Err(e) => format!("{e:#}"),
+                }
+            }
+        };
+        let e = err("junk", |_, _| vec!["junk".into(); 65]).await;
+        assert!(e.contains("did not answer request"), "{e}");
+        let e = err("version", |_, id| {
+            vec![json!({"id": id, "ok": true, "v": 2}).to_string()]
+        })
+        .await;
+        assert!(e.contains("speaks protocol 2"), "{e}");
+        let e = err("failed", |_, id| {
+            let msg = format!("\u{1b}[31mbad{}", "y".repeat(300));
+            vec![json!({"id": id, "ok": false, "error": msg}).to_string()]
+        })
+        .await;
+        assert!(
+            e.starts_with("UI helper: [31mbad") && !e.contains('\u{1b}'),
+            "{e}"
+        );
+        assert!(e.len() < 230, "{e}");
+        let e = err("silent", |_, _| vec![]).await;
+        assert!(e.contains("did not answer within 2s"), "{e}");
+        let e = err("malformed", |op, id| match op {
+            "hello" => vec![hello(id)],
+            _ => vec![json!({"id": id, "ok": true, "tree": {"screen": "big"}}).to_string()],
+        })
+        .await;
+        assert!(e.contains("malformed reply"), "{e}");
+        let e = err("hostile", |op, id| match op {
+            "hello" => vec![hello(id)],
+            _ => {
+                let mut tree: Value = serde_json::from_str(SMALL).unwrap();
+                tree["nodes"][0]["key"] = json!("w1");
+                vec![json!({"id": id, "ok": true, "tree": tree}).to_string()]
+            }
+        })
+        .await;
+        assert!(e.contains("repeated key"), "{e}");
     }
 
     #[test]
