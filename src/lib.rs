@@ -22,6 +22,7 @@ pub mod run;
 pub mod seed;
 pub mod snapshot;
 pub mod tpm;
+pub mod ui;
 pub mod vm;
 
 use std::process::Stdio;

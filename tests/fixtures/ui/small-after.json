@@ -1,0 +1,18 @@
+{"screen":[1280,800],"coords":"screen","windows":[
+ {"key":"w3","title":"Save As","app":"gedit","active":true},
+ {"key":"w1","title":"Files — Home","app":"nautilus"},
+ {"key":"w2","title":"Terminal","app":"gnome-terminal"}],
+ "nodes":[
+ {"key":"c1","win":0,"depth":0,"role":"textbox","name":"Name","value":"Untitled","states":["focused","editable"],"bbox":[300,300,400,32]},
+ {"key":"c2","win":0,"depth":0,"role":"button","name":"Cancel","bbox":[300,400,90,32]},
+ {"key":"c3","win":0,"depth":0,"role":"button","name":"Save","bbox":[600,400,90,32]},
+ {"key":"a1","win":1,"depth":0,"role":"toolbar","name":""},
+ {"key":"a2","win":1,"depth":1,"role":"button","name":"Back","bbox":[10,40,32,32]},
+ {"key":"a4","win":1,"depth":1,"role":"textbox","name":"Search","value":"notes","states":["editable"],"bbox":[400,40,300,32]},
+ {"key":"a5","win":1,"depth":0,"role":"list","name":"Places"},
+ {"key":"a6","win":1,"depth":1,"role":"item","name":"Home","states":["selected"],"actions":["activate"],"bbox":[0,100,200,30]},
+ {"key":"a7","win":1,"depth":1,"role":"item","name":"Hidden","states":["offscreen"]},
+ {"key":"a8","win":1,"depth":0,"role":"text","name":"3 items"},
+ {"key":"a9","win":1,"depth":0,"role":"group","name":""},
+ {"key":"b1","win":2,"depth":0,"role":"text","name":"agent@dev:~$"},
+ {"key":"b2","win":2,"depth":0,"role":"menuitem","name":"File"}]}

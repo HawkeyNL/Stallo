@@ -1,0 +1,15 @@
+{"screen":[1280,800],"coords":"screen","windows":[
+ {"key":"w1","title":"Files — Home","app":"nautilus","active":true},
+ {"key":"w2","title":"Terminal","app":"gnome-terminal"}],
+ "nodes":[
+ {"key":"a1","win":0,"depth":0,"role":"toolbar","name":""},
+ {"key":"a2","win":0,"depth":1,"role":"button","name":"Back","bbox":[10,40,32,32]},
+ {"key":"a3","win":0,"depth":1,"role":"button","name":"Forward","states":["disabled"],"bbox":[44,40,32,32]},
+ {"key":"a4","win":0,"depth":1,"role":"textbox","name":"Search","value":"","states":["focused","editable"],"bbox":[400,40,300,32]},
+ {"key":"a5","win":0,"depth":0,"role":"list","name":"Places"},
+ {"key":"a6","win":0,"depth":1,"role":"item","name":"Home","states":["selected"],"actions":["activate"],"bbox":[0,100,200,30]},
+ {"key":"a7","win":0,"depth":1,"role":"item","name":"Hidden","states":["offscreen"]},
+ {"key":"a8","win":0,"depth":0,"role":"text","name":"3 items"},
+ {"key":"a9","win":0,"depth":0,"role":"group","name":""},
+ {"key":"b1","win":1,"depth":0,"role":"text","name":"agent@dev:~$"},
+ {"key":"b2","win":1,"depth":0,"role":"menuitem","name":"File"}]}
