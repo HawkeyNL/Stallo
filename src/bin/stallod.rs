@@ -528,6 +528,7 @@ async fn dispatch(
             let act = stallo::ui::check_act(action, id, text, keys, dy, settle_ms, until)?;
             json!({"text": m.ui_act(&name, act).await?})
         }
+        Request::UiInstall { name } => json!({"text": m.ui_install(&name).await?}),
         Request::UiWait {
             name,
             until,

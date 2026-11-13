@@ -53,6 +53,34 @@ pub const MAX_CHARS: std::ops::RangeInclusive<usize> = 500..=20_000;
 pub const MAX_QUERY: usize = 200;
 /// The helper protocol this build speaks.
 const VERSION: u32 = 1;
+/// The Linux helper (AT-SPI), installed by `stallo ui <vm> --install`.
+pub const LINUX_HELPER: &str = include_str!("../guest/stallo-ui.py");
+/// Exits 0 when the guest's Python has GObject introspection for AT-SPI.
+pub const ATSPI_CHECK: &str =
+    "import gi; gi.require_version('Atspi', '2.0'); from gi.repository import Atspi";
+const AUTOSTART: &str = "[Desktop Entry]
+Type=Application
+Name=Stallo UI helper
+Comment=Lets Stallo read this desktop's windows and controls
+Exec=/usr/bin/python3 -I /usr/local/lib/stallo-ui/stallo-ui.py
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+";
+/// The logged-in user gets the port, nobody else.
+const UDEV_RULE: &str =
+    "SUBSYSTEM==\"virtio-ports\", ATTR{name}==\"org.stallo.ui.0\", TAG+=\"uaccess\"\n";
+/// Where the Linux helper lives in the guest.
+pub const LINUX_DIR: &str = "/usr/local/lib/stallo-ui";
+
+/// The files a Linux install writes (all root-owned and system-wide: it
+/// starts in whoever logs in to the desktop).
+pub fn linux_install() -> [(&'static str, &'static str); 3] {
+    [
+        ("/usr/local/lib/stallo-ui/stallo-ui.py", LINUX_HELPER),
+        ("/etc/xdg/autostart/stallo-ui.desktop", AUTOSTART),
+        ("/etc/udev/rules.d/70-stallo-ui.rules", UDEV_RULE),
+    ]
+}
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const TREE_TIMEOUT: Duration = Duration::from_secs(5);
 /// probe, focus and invoke.
@@ -1489,6 +1517,24 @@ e8 window \"Terminal\" (gnome-terminal)
         assert!(
             out.contains("screen 2560x800\n") && out.contains("Back") && out.contains("Forward")
         );
+    }
+
+    #[test]
+    fn linux_install_files() {
+        // The helper speaks this build's protocol.
+        assert!(LINUX_HELPER.contains(&format!("\nVERSION = {VERSION}\n")));
+        let files = linux_install();
+        for (path, content) in files {
+            assert!(path.starts_with('/') && !path.contains(".."), "{path}");
+            assert!(!content.contains("/home/") && !content.is_empty(), "{path}");
+        }
+        assert!(files[0].0.starts_with(LINUX_DIR) && files[0].1 == LINUX_HELPER);
+        assert!(
+            files[1]
+                .1
+                .contains("\nExec=/usr/bin/python3 -I /usr/local/lib/stallo-ui/stallo-ui.py\n")
+        );
+        assert!(files[2].1.contains(r#"ATTR{name}=="org.stallo.ui.0""#));
     }
 
     #[test]

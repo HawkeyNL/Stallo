@@ -195,6 +195,7 @@ fn ui_tree_from_a_helper() {
     d.assert_safe("ui");
     let ui = |args: &[&str]| d.stallo(&[&["ui", "ui"], args].concat());
     let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let tmp = tempfile::tempdir().unwrap();
 
     let out = ui(&[]);
     assert!(
@@ -202,7 +203,92 @@ fn ui_tree_from_a_helper() {
         "{out:?}"
     );
 
-    let tmp = tempfile::tempdir().unwrap();
+    // The install: refused without Python's AT-SPI bindings, before any
+    // file is written; with them (a stand-in `gi` here) all three files
+    // land and udev reloads.
+    let has = |path: &str| {
+        let out = d.ok(&[
+            "exec",
+            "ui",
+            "--",
+            "sh",
+            "-c",
+            &format!("test -e {path} && echo yes || echo no"),
+        ]);
+        out.trim() == "yes"
+    };
+    let out = ui(&["--install"]);
+    assert!(
+        stderr(&out).contains("lacks Python's AT-SPI bindings"),
+        "{out:?}"
+    );
+    assert!(!has("/usr/local/lib/stallo-ui"));
+    let site = d.ok(&[
+        "exec",
+        "ui",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        "import sys; print([p for p in sys.path if p.startswith('/usr/local/lib/python3')][0])",
+    ]);
+    let gi = format!("{}/gi", site.trim());
+    d.ok(&[
+        "exec",
+        "ui",
+        "--admin",
+        "--",
+        "mkdir",
+        "-p",
+        &format!("{gi}/repository"),
+    ]);
+    let fake = tmp.path().join("gi.py");
+    std::fs::write(&fake, "def require_version(name, version):\n    pass\n").unwrap();
+    d.ok(&[
+        "cp",
+        "--admin",
+        fake.to_str().unwrap(),
+        &format!("ui:{gi}/__init__.py"),
+    ]);
+    std::fs::write(&fake, "Atspi = None\n").unwrap();
+    d.ok(&[
+        "cp",
+        "--admin",
+        fake.to_str().unwrap(),
+        &format!("ui:{gi}/repository/__init__.py"),
+    ]);
+    let out = d.ok(&["ui", "ui", "--install"]);
+    assert!(out.contains("installed the UI helper in ui"), "{out}");
+    for path in [
+        "/usr/local/lib/stallo-ui/stallo-ui.py",
+        "/etc/xdg/autostart/stallo-ui.desktop",
+        "/etc/udev/rules.d/70-stallo-ui.rules",
+    ] {
+        assert!(has(path), "{path}");
+    }
+    let modes = d.ok(&[
+        "exec",
+        "ui",
+        "--",
+        "stat",
+        "-c",
+        "%a",
+        "/usr/local/lib/stallo-ui/stallo-ui.py",
+        "/etc/xdg/autostart/stallo-ui.desktop",
+        "/etc/udev/rules.d/70-stallo-ui.rules",
+    ]);
+    assert_eq!(modes, "644\n644\n644\n");
+    let helper = d.ok(&[
+        "exec",
+        "ui",
+        "--",
+        "python3",
+        "-I",
+        "/usr/local/lib/stallo-ui/stallo-ui.py",
+        "--self-test",
+    ]);
+    assert_eq!(helper, "ok\n");
+
     let script = tmp.path().join("fakeui.py");
     std::fs::write(&script, FAKE_HELPER).unwrap();
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ui/small.json");
