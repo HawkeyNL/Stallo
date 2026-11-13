@@ -449,7 +449,7 @@ def answer(desktop, req):
 
 def dump(obj):
     """Compact UTF-8 JSON, as sent."""
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
 
 
 def write_all(fd, data):
@@ -527,6 +527,7 @@ def self_test():
     for bad in ["junk", "[]", '{"id": "3", "op": "tree"}', '{"id": 3, "op": "exec"}',
                 '{"id": 3, "op": "probe", "key": 5}']:
         assert parse_request(bad) is None, bad
+    assert dump({"t": "a\ud800b"}) == b'{"t":"a?b"}'
     reply = answer(None, {"id": 9, "op": "hello"})
     assert reply == {"id": 9, "ok": True, "v": VERSION, "platform": "atspi"}
     reply = answer(None, {"id": 9, "op": "tree"})
