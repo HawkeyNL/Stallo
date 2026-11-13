@@ -149,6 +149,7 @@ pub fn describe(r: &Request) -> Described<'_> {
             ],
             None,
         ),
+        Request::UiInstall { name } => ("ui_install", Some(name), vec![], None),
         Request::UiWait { name, until, .. } => {
             ("ui_wait", Some(name), vec![("until", len(until))], None)
         }

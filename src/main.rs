@@ -94,6 +94,10 @@ enum Cmd {
         /// Longest output in characters (500-20000).
         #[arg(long)]
         max_chars: Option<u32>,
+        /// Install the helper in a Linux guest instead (needs its guest
+        /// agent, python3-gi and AT-SPI); it starts at the next login.
+        #[arg(long, conflicts_with_all = ["find", "all", "max_chars"])]
+        install: bool,
     },
     /// Run a command in the guest; its exit code is passed through.
     Exec {
@@ -517,12 +521,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             find,
             all,
             max_chars,
+            install,
         } => {
-            let v = call(Request::UiTree {
-                name: vm,
-                find,
-                all,
-                max_chars,
+            let v = call(if install {
+                Request::UiInstall { name: vm }
+            } else {
+                Request::UiTree {
+                    name: vm,
+                    find,
+                    all,
+                    max_chars,
+                }
             })
             .await?;
             if json {
@@ -1563,6 +1572,9 @@ mod tests {
         let c = Cli::try_parse_from(["stallo", "ui", "dev", "--find", "Save"]).unwrap();
         assert!(matches!(c.command, Cmd::Ui { find: Some(ref f), all: false, .. } if f == "Save"));
         assert!(Cli::try_parse_from(["stallo", "ui", "dev", "--find", "x", "--all"]).is_err());
+        let c = Cli::try_parse_from(["stallo", "ui", "dev", "--install"]).unwrap();
+        assert!(matches!(c.command, Cmd::Ui { install: true, .. }));
+        assert!(Cli::try_parse_from(["stallo", "ui", "dev", "--install", "--all"]).is_err());
         let c = set(&["--vnc", "on"]).unwrap();
         assert!(matches!(
             c.command,

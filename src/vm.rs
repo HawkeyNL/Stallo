@@ -1488,6 +1488,45 @@ impl Manager {
             .await
     }
 
+    /// Installs the UI helper in a Linux guest through its guest agent:
+    /// root-owned, system-wide files (see `ui::linux_install`), no account
+    /// needed. It starts at the next desktop login.
+    pub async fn ui_install(&self, name: &str) -> Result<String> {
+        let vm = self.ui_vm(name)?;
+        ensure!(
+            vm.config.machine == images::Os::Linux,
+            "{name} runs Windows; only Linux guests have an installable UI helper so far"
+        );
+        let run = async |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+            self.exec(name, &argv, true, Duration::from_secs(60), None)
+                .await
+        };
+        let check = run(&["python3", "-I", "-c", ui::ATSPI_CHECK])
+            .await
+            .context("the guest agent must answer; install qemu-guest-agent in the guest first")?;
+        ensure!(
+            check.exit_code == 0,
+            "{name} lacks Python's AT-SPI bindings; install python3-gi and gir1.2-atspi-2.0 (Ubuntu, Debian) or python3-gobject and at-spi2-core (Fedora) in the guest"
+        );
+        guest_ok(run(&["mkdir", "-p", ui::LINUX_DIR]).await?, "mkdir")?;
+        for (path, content) in ui::linux_install() {
+            self.file_write(name, path, content.as_bytes(), false, true)
+                .await?;
+        }
+        guest_ok(run(&["udevadm", "control", "--reload"]).await?, "udevadm")?;
+        let trigger = [
+            "udevadm",
+            "trigger",
+            "--action=change",
+            "--subsystem-match=virtio-ports",
+        ];
+        guest_ok(run(&trigger).await?, "udevadm")?;
+        Ok(format!(
+            "installed the UI helper in {name}; it starts at the next desktop login (log out and in, or restart the guest)"
+        ))
+    }
+
     /// Acts on a control from `ui_tree`, waits `act.settle` (and for
     /// `act.until`), and returns what was done and what changed.
     pub async fn ui_act(&self, name: &str, act: ui::Act) -> Result<String> {
@@ -2338,6 +2377,21 @@ fn file_read_argv(path: &str, offset: u64, max: usize) -> Result<Vec<String>> {
 }
 
 /// `dd` writes its stdin to `path`, truncating it unless `append`.
+/// A guest command that must have worked; its last stderr line otherwise
+/// (from the guest: cleaned and cut).
+fn guest_ok(out: ExecOutput, what: &str) -> Result<()> {
+    if out.exit_code != 0 {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        bail!(
+            "{what} failed in the guest ({}): {}",
+            out.exit_code,
+            crate::printable(last.unwrap_or("no output"), 200)
+        );
+    }
+    Ok(())
+}
+
 fn file_write_argv(path: &str, append: bool) -> Result<Vec<String>> {
     check_guest_path(path)?;
     let mut argv = vec!["dd".into(), format!("of={path}"), "bs=4M".into()];

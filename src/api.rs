@@ -133,6 +133,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_chars: Option<u32>,
     },
+    /// Installs the UI helper in a Linux guest (humans only).
+    UiInstall {
+        name: String,
+    },
     /// Acts on a control from `ui_tree` (see `ui::check_act`).
     UiAct {
         name: String,
@@ -456,6 +460,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | SetVnc { .. }
         // A guest-visible device that voids RAM snapshots, as SetNet.
         | SetUi { .. }
+        // Software that runs in the user's session: a human's choice.
+        | UiInstall { .. }
         // What a VM boots from is a human's choice, as at `new`.
         | SetCdrom { .. }
         // Growing a VM takes host CPU and memory budget that a human sized;
@@ -729,6 +735,10 @@ mod tests {
                 name: name(),
                 on: true
             }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::UiInstall { name: name() }),
             Gate::Closed
         );
         assert_eq!(
