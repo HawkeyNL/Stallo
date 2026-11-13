@@ -1509,17 +1509,26 @@ impl Manager {
             check.exit_code == 0,
             "{name} lacks Python's AT-SPI bindings; install python3-gi and gir1.2-atspi-2.0 (Ubuntu, Debian) or python3-gobject and at-spi2-core (Fedora) in the guest"
         );
-        guest_ok(run(&["mkdir", "-p", ui::LINUX_DIR]).await?, "mkdir")?;
-        for (path, content) in ui::linux_install() {
+        let files = ui::linux_install();
+        let dirs = files.map(|(path, _)| path.rsplit_once('/').map_or("/", |(dir, _)| dir));
+        guest_ok(run(&[&["mkdir", "-p"][..], &dirs].concat()).await?, "mkdir")?;
+        for (path, content) in files {
             self.file_write(name, path, content.as_bytes(), false, true)
                 .await?;
         }
+        // Readable by the desktop user whatever the guest agent's umask.
+        let paths = files.map(|(path, _)| path);
+        guest_ok(
+            run(&[&["chmod", "0644"][..], &paths].concat()).await?,
+            "chmod",
+        )?;
         guest_ok(run(&["udevadm", "control", "--reload"]).await?, "udevadm")?;
         let trigger = [
             "udevadm",
             "trigger",
             "--action=change",
             "--subsystem-match=virtio-ports",
+            "--attr-match=name=org.stallo.ui.0",
         ];
         guest_ok(run(&trigger).await?, "udevadm")?;
         Ok(format!(
@@ -2376,7 +2385,6 @@ fn file_read_argv(path: &str, offset: u64, max: usize) -> Result<Vec<String>> {
     ])
 }
 
-/// `dd` writes its stdin to `path`, truncating it unless `append`.
 /// A guest command that must have worked; its last stderr line otherwise
 /// (from the guest: cleaned and cut).
 fn guest_ok(out: ExecOutput, what: &str) -> Result<()> {
@@ -2392,6 +2400,7 @@ fn guest_ok(out: ExecOutput, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// `dd` writes its stdin to `path`, truncating it unless `append`.
 fn file_write_argv(path: &str, append: bool) -> Result<Vec<String>> {
     check_guest_path(path)?;
     let mut argv = vec!["dd".into(), format!("of={path}"), "bs=4M".into()];

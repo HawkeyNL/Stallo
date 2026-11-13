@@ -266,6 +266,18 @@ fn ui_tree_from_a_helper() {
     ] {
         assert!(has(path), "{path}");
     }
+    let modes = d.ok(&[
+        "exec",
+        "ui",
+        "--",
+        "stat",
+        "-c",
+        "%a",
+        "/usr/local/lib/stallo-ui/stallo-ui.py",
+        "/etc/xdg/autostart/stallo-ui.desktop",
+        "/etc/udev/rules.d/70-stallo-ui.rules",
+    ]);
+    assert_eq!(modes, "644\n644\n644\n");
     let helper = d.ok(&[
         "exec",
         "ui",

@@ -29,6 +29,16 @@ WALK_SECONDS = 2.0
 MAX_NODES = 5000
 MAX_DEPTH = 64
 MAX_TEXT = 200
+# The host's caps: one character more travels, so the host marks the cut.
+NAME_MAX = 80
+VALUE_MAX = 40
+APP_MAX = 40
+# A reply over the host's 1 MiB line limit would fail whole: stop the walk
+# (partial) before that.
+MAX_BYTES = 900_000
+# Children read from a node that manages its descendants (big lists and
+# tables: their rows are made on demand).
+MAX_MANAGED = 200
 WRITE_SECONDS = 5.0
 
 # AT-SPI role names (non-localized) to the host's vocabulary.
@@ -134,7 +144,7 @@ def parse_request(line):
     """A request dict, or None for junk."""
     try:
         req = json.loads(line)
-    except ValueError:
+    except Exception:  # also RecursionError
         return None
     if not isinstance(req, dict) or not isinstance(req.get("id"), int):
         return None
@@ -156,8 +166,18 @@ class Desktop:
             from gi.repository import Atspi as atspi
 
             atspi.init()
+            from gi.repository import GLib
+
+            self.context = GLib.MainContext.default()
+        else:
+            self.context = None
         self.atspi = atspi
-        self.nodes = {}  # key -> (accessible, window accessible), last walk
+        self.nodes = {}  # key -> (accessible, window accessible, pid), last walk
+
+    def idle(self):
+        """Handles pending bus messages, so nothing piles up while idle."""
+        while self.context is not None and self.context.pending():
+            self.context.iteration(False)
 
     def has(self, acc):
         try:
@@ -168,19 +188,29 @@ class Desktop:
             getattr(self.atspi.StateType, name.upper().replace(" ", "_"))
         )
 
-    def key(self, acc):
-        path = getattr(acc, "path", None) or ""
+    def pid(self, acc):
         try:
-            pid = acc.get_process_id()
+            return acc.get_process_id()
         except Exception:
-            pid = 0
+            return 0
+
+    def key(self, acc, pid):
+        path = getattr(acc, "path", None) or ""
         return make_key("%d:%s" % (pid, path or id(acc)))
 
-    def children(self, acc):
+    def children(self, acc, limit, deadline):
+        """At most `limit` children, read before `deadline`. Returns them
+        and whether some were left out."""
+        kids = []
         try:
-            return [acc.get_child_at_index(k) for k in range(acc.get_child_count())]
+            count = acc.get_child_count()
+            for k in range(min(count, limit)):
+                if time.monotonic() > deadline:
+                    return kids, True
+                kids.append(acc.get_child_at_index(k))
         except Exception:
-            return []
+            return kids, False
+        return kids, count > limit
 
     def extents(self, acc):
         try:
@@ -196,7 +226,7 @@ class Desktop:
             return None
         try:
             if editable and "Text" in ifaces:
-                n = min(acc.get_character_count(), MAX_TEXT)
+                n = min(acc.get_character_count(), VALUE_MAX + 1)
                 return acc.get_text(0, n)
             if "Value" in ifaces:
                 return str(acc.get_current_value())
@@ -220,56 +250,70 @@ class Desktop:
 
     def tree(self):
         start = time.monotonic()
+        deadline = start + WALK_SECONDS
         desktop = self.atspi.get_desktop(0)
         windows, nodes, bounds = [], [], []
         self.nodes = {}
         partial = False
+        size = 0
         for i in range(desktop.get_child_count()):
+            if time.monotonic() > deadline or len(windows) >= 64:
+                partial = True
+                break
             try:
                 app = desktop.get_child_at_index(i)
                 app.set_cache_mask(self.atspi.Cache.NONE)
-                app_name = (app.get_name() or "")[:MAX_TEXT]
-                tops = [app.get_child_at_index(j) for j in range(app.get_child_count())]
+                app_name = (app.get_name() or "")[:APP_MAX + 1]
+                pid = self.pid(app)
+                tops, _ = self.children(app, 64, deadline)
             except Exception:
                 continue
             for top in tops:
                 try:
                     if top.get_role_name() not in WINDOW_ROLES or not self.has(top)("showing"):
                         continue
+                    wkey = self.key(top, pid)
+                    if wkey in self.nodes:
+                        continue
                     if len(windows) >= 64:
                         partial = True
                         break
                     win = len(windows)
-                    wkey = self.key(top)
-                    if wkey in self.nodes:
-                        continue
                     windows.append({
                         "key": wkey,
-                        "title": (top.get_name() or "")[:MAX_TEXT],
+                        "title": (top.get_name() or "")[:NAME_MAX + 1],
                         "app": app_name,
                         "active": self.has(top)("active"),
                     })
                     bounds.append(self.extents(top))
-                    self.nodes[wkey] = (top, top)
+                    self.nodes[wkey] = (top, top, pid)
                 except Exception:
                     continue
                 # Pre-order: pop a node, then push its children reversed.
-                stack = [(c, 0) for c in reversed(self.children(top))]
+                kids, cut = self.children(top, MAX_NODES - len(nodes), deadline)
+                partial |= cut
+                stack = [(c, 0, False) for c in reversed(kids)]
                 while stack:
-                    if len(nodes) >= MAX_NODES or time.monotonic() - start > WALK_SECONDS:
+                    if len(nodes) >= MAX_NODES or time.monotonic() > deadline or size > MAX_BYTES:
                         partial = True
                         break
-                    acc, depth = stack.pop()
-                    node = self.node(acc, win, depth)
+                    acc, depth, secret = stack.pop()
+                    node, managed = self.node(acc, pid, win, depth, secret)
                     if node is None or node["key"] in self.nodes:
                         continue  # not showing (nor its subtree), or seen
                     nodes.append(node)
-                    self.nodes[node["key"]] = (acc, top)
-                    kids = self.children(acc)
-                    if depth + 1 < MAX_DEPTH:
-                        stack.extend((k, depth + 1) for k in reversed(kids))
-                    elif kids:
-                        partial = True
+                    size += len(dump(node)) + 1
+                    self.nodes[node["key"]] = (acc, top, pid)
+                    # Bounded memory: never more than 2 * MAX_NODES queued.
+                    room = min(MAX_NODES - len(nodes), 2 * MAX_NODES - len(stack))
+                    kids, cut = self.children(acc, min(room, MAX_MANAGED) if managed else room, deadline)
+                    partial |= cut
+                    if depth + 1 >= MAX_DEPTH:
+                        partial |= bool(kids)
+                        continue
+                    # Nothing below a password field shows its text.
+                    secret = secret or node["role"] == "password"
+                    stack.extend((k, depth + 1, secret) for k in reversed(kids))
         return {
             "screen": self.screen(bounds),
             "coords": "window" if os.environ.get("WAYLAND_DISPLAY") else "screen",
@@ -278,26 +322,28 @@ class Desktop:
             "nodes": nodes,
         }
 
-    def node(self, acc, win, depth):
+    def node(self, acc, pid, win, depth, secret):
+        """The node for `acc` and whether it manages its descendants, or
+        None for one that is not showing."""
         try:
             has = self.has(acc)
             if not has("showing"):
-                return None
+                return None, False
             role = role_word(acc.get_role_name(), has("editable"))
             node = {
-                "key": self.key(acc),
+                "key": self.key(acc, pid),
                 "win": win,
                 "depth": depth,
                 "role": role,
-                "name": (acc.get_name() or "")[:MAX_TEXT],
+                "name": (acc.get_name() or "")[:NAME_MAX + 1],
                 "states": state_words(has, role),
             }
         except Exception:
-            return None
-        if role != "password":
+            return None, False
+        if role != "password" and not secret:
             value = self.text(acc, has("editable"))
             if value:
-                node["value"] = value[:MAX_TEXT]
+                node["value"] = value[:VALUE_MAX + 1]
         bbox = self.extents(acc)
         if bbox:
             node["bbox"] = bbox
@@ -306,7 +352,7 @@ class Desktop:
                 node["actions"] = ["a"]
         except Exception:
             pass
-        return node
+        return node, has("manages descendants")
 
     def find(self, key):
         found = self.nodes.get(key)
@@ -315,16 +361,16 @@ class Desktop:
         return found
 
     def probe(self, key):
-        acc, window = self.find(key)
+        acc, window, pid = self.find(key)
         bbox = self.extents(acc)
         screen = self.screen([self.extents(window)])
         hit = False
         if bbox and bbox[2] > 0 and bbox[3] > 0:
             x, y = bbox[0] + bbox[2] // 2, bbox[1] + bbox[3] // 2
-            hit = self.at_point(window, x, y, key) and not self.covered(window, x, y)
+            hit = self.at_point(window, pid, x, y, key) and not self.covered(window, x, y)
         return {"bbox": bbox, "hit": hit, "screen": screen}
 
-    def at_point(self, window, x, y, key):
+    def at_point(self, window, pid, x, y, key):
         """Whether the deepest control at (x, y) in `window` is `key` or
         inside it."""
         cur = window
@@ -333,13 +379,13 @@ class Desktop:
                 child = cur.get_accessible_at_point(x, y, self.atspi.CoordType.SCREEN)
             except Exception:
                 child = None
-            if child is None or self.key(child) == self.key(cur):
+            if child is None or self.key(child, pid) == self.key(cur, pid):
                 break
             cur = child
         for _ in range(32):
             if cur is None:
                 return False
-            if self.key(cur) == key:
+            if self.key(cur, pid) == key:
                 return True
             try:
                 cur = cur.get_parent()
@@ -352,7 +398,7 @@ class Desktop:
         stacking order; the active window is taken to be on top."""
         if self.has(window)("active"):
             return False
-        for acc, top in self.nodes.values():
+        for acc, top, _ in self.nodes.values():
             if acc is top and acc is not window and self.has(acc)("active"):
                 b = self.extents(acc)
                 if b and b[0] <= x < b[0] + b[2] and b[1] <= y < b[1] + b[3]:
@@ -360,12 +406,19 @@ class Desktop:
         return False
 
     def focus(self, key):
-        acc, _ = self.find(key)
+        """Focuses `key`, and checks keys would reach it: on Wayland a
+        control in an inactive window can take focus while typed keys go
+        to the active window."""
+        acc, window, _ = self.find(key)
         if not acc.grab_focus():
+            raise RuntimeError("the control did not take focus")
+        if not self.has(window)("active"):
+            raise RuntimeError("its window is not active; click or invoke something in it first")
+        if not self.has(acc)("focused"):
             raise RuntimeError("the control did not take focus")
 
     def invoke(self, key):
-        acc, _ = self.find(key)
+        acc, _, _ = self.find(key)
         n = acc.get_n_actions()
         if n <= 0:
             raise RuntimeError("the control has no action")
@@ -392,6 +445,11 @@ def answer(desktop, req):
         return {"id": rid, "ok": True}
     except Exception as e:
         return {"id": rid, "ok": False, "error": str(e)[:MAX_TEXT]}
+
+
+def dump(obj):
+    """Compact UTF-8 JSON, as sent."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def write_all(fd, data):
@@ -422,6 +480,7 @@ def serve(desktop):
         try:
             while True:
                 readable, _, _ = select.select([fd], [], [], 1.0)
+                desktop.idle()
                 if not readable:
                     continue
                 chunk = os.read(fd, 65536)
@@ -435,8 +494,7 @@ def serve(desktop):
                     req = parse_request(line) if len(line) <= MAX_REQUEST else None
                     if req is None:
                         continue
-                    reply = json.dumps(answer(desktop, req), ensure_ascii=True) + "\n"
-                    if not write_all(fd, reply.encode()):
+                    if not write_all(fd, dump(answer(desktop, req)) + b"\n"):
                         raise OSError("the host stopped reading")
                 if len(buf) > MAX_REQUEST:
                     buf = b""
@@ -536,6 +594,10 @@ class FakeAcc:
     def get_action_name(self, i):
         return self.actions[i]
 
+    def grab_focus(self):
+        self.states.add("FOCUSED")
+        return True
+
     def do_action(self, i):
         self.done.append(self.actions[i])
         return True
@@ -596,6 +658,30 @@ def fake_desktop_test():
         raise AssertionError("unknown key accepted")
     except LookupError:
         pass
+    # Focus counts only in the active window, where keys arrive.
+    d.focus("42:/name")
+    dialog.states.discard("ACTIVE")
+    try:
+        d.focus("42:/name")
+        raise AssertionError("focus in an inactive window accepted")
+    except RuntimeError as e:
+        assert "not active" in str(e)
+
+    # Nothing under a password field shows text; a list that manages its
+    # rows gives at most MAX_MANAGED; a huge tree stops (partial) under the
+    # host's line limit.
+    inner = FakeAcc("/pw/inner", "text", "", states=["EDITABLE"], box=(10, 10, 90, 20), text="hunter2")
+    secret = FakeAcc("/pw2", "password text", "PIN", box=(10, 10, 100, 20), kids=[inner])
+    rows = [FakeAcc("/row%d" % i, "list item", "Row %d" % i) for i in range(MAX_MANAGED + 50)]
+    table = FakeAcc("/rows", "list", "Rows", states=["MANAGES_DESCENDANTS"], kids=rows)
+    big = [FakeAcc("/b%d" % i, "push button", "名" * 100) for i in range(MAX_NODES)]
+    frame = FakeAcc("/f", "frame", "Big", states=["ACTIVE"], kids=[secret, table] + big)
+    d = Desktop(FakeAtspi(FakeAcc("/", "desktop frame", kids=[FakeAcc("/a", "application", "x", kids=[frame])])))
+    tree = d.tree()
+    assert "hunter2" not in json.dumps(tree)
+    assert sum(1 for n in tree["nodes"] if n["name"].startswith("Row ")) == MAX_MANAGED
+    assert tree["partial"] and len(dump(tree)) < (1 << 20) - 100
+    assert all(len(n["name"]) <= NAME_MAX + 1 for n in tree["nodes"])
 
 
 if __name__ == "__main__":
