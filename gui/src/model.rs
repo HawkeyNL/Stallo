@@ -2374,13 +2374,13 @@ pub fn files_status(vm: &VmInfo, copying: bool) -> Option<ScreenStatus> {
     })
 }
 
-/// Where a path typed for the VM starts: the home of the guest user, or
-/// root's.
-pub fn guest_home(admin: bool) -> String {
+/// Where a path typed for the VM starts: the home of the guest user
+/// (`user`, or the default), or root's.
+pub fn guest_home(admin: bool, user: Option<&str>) -> String {
     if admin {
         "/root/".to_owned()
     } else {
-        format!("/home/{}/", stallo::seed::GUEST_USER)
+        format!("/home/{}/", user.unwrap_or(stallo::seed::GUEST_USER))
     }
 }
 
@@ -2937,6 +2937,7 @@ mod tests {
             vnc: false,
             ui: false,
             guest_agent: None,
+            guest_user: None,
             image: None,
             cdrom: None,
         }
@@ -4874,8 +4875,9 @@ mod tests {
 
     #[test]
     fn guest_paths() {
-        assert_eq!(guest_home(false), "/home/agent/");
-        assert_eq!(guest_home(true), "/root/");
+        assert_eq!(guest_home(false, None), "/home/agent/");
+        assert_eq!(guest_home(false, Some("gus-ai")), "/home/gus-ai/");
+        assert_eq!(guest_home(true, Some("gus-ai")), "/root/");
         assert_eq!(file_name("/home/agent/notes.txt"), Some("notes.txt"));
         for none in ["/", "/home/agent/", "/tmp/..", "/tmp/.", ""] {
             assert_eq!(file_name(none), None, "{none}");

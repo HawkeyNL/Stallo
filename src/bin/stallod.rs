@@ -733,6 +733,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         vnc: cfg.vnc,
         ui: cfg.ui,
         guest_agent,
+        guest_user: cfg.guest_user.clone(),
         image: Some(cfg.image.clone()),
         cdrom: cfg.cdrom.clone(),
     }

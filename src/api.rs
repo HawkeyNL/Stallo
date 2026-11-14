@@ -336,6 +336,9 @@ pub struct VmInfo {
     /// QEMU does not say, or from an older stallod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_agent: Option<bool>,
+    /// The guest account for calls without `admin`, if not `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_user: Option<String>,
     /// The image the VM was made from (an older stallod does not send it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,

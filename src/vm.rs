@@ -1815,7 +1815,7 @@ impl Manager {
             .await?;
         if let Some(user) = &user {
             ensure!(
-                !no_such_user(&out),
+                !no_such_user(&out, user),
                 "the guest user {user:?} does not exist in {name} (or has no group of that name); name another with `stallo set {name} --guest-user NAME`, or run as root with --admin"
             );
         }
@@ -2558,7 +2558,10 @@ fn guest_command(argv: &[String], user: Option<&str>, limit: Duration) -> (Strin
     args.push(format!("RuntimeMaxSec={}ms", limit.as_millis()));
     args.push("--".to_owned());
     if let Some(user) = user {
+        // English errors from setpriv (`--reset-env` drops LC_ALL again).
         args.extend([
+            "env".to_owned(),
+            "LC_ALL=C".to_owned(),
             "setpriv".to_owned(),
             format!("--reuid={user}"),
             format!("--regid={user}"),
@@ -2572,8 +2575,12 @@ fn guest_command(argv: &[String], user: Option<&str>, limit: Duration) -> (Strin
 }
 
 /// Whether `setpriv` refused the guest user (or its group) as unknown.
-fn no_such_user(out: &ExecOutput) -> bool {
-    out.exit_code == 1 && out.stderr.starts_with(b"setpriv: failed to parse")
+fn no_such_user(out: &ExecOutput, user: &str) -> bool {
+    out.exit_code == 1
+        && out.stdout.is_empty()
+        && ["reuid", "regid"]
+            .iter()
+            .any(|id| out.stderr == format!("setpriv: failed to parse {id}: '{user}'\n").as_bytes())
 }
 
 /// Whether a start presses Enter for the CD boot prompt: Windows VMs with
@@ -3177,7 +3184,7 @@ mod tests {
         assert_eq!(
             args.join(" "),
             "--scope --quiet --collect --expand-environment=no -p KillSignal=SIGKILL -p RuntimeMaxSec=1500ms -- \
-             setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
+             env LC_ALL=C setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
         );
     }
 
@@ -3189,19 +3196,27 @@ mod tests {
             stderr: err.into(),
             truncated: false,
         };
-        assert!(no_such_user(&out(
-            1,
-            "setpriv: failed to parse reuid: 'agent'\n"
-        )));
-        assert!(no_such_user(&out(
-            1,
-            "setpriv: failed to parse regid: 'gus'\n"
-        )));
-        assert!(!no_such_user(&out(1, "ls: cannot access 'x'\n")));
-        assert!(!no_such_user(&out(
-            0,
-            "setpriv: failed to parse reuid: 'agent'\n"
-        )));
+        let reuid = "setpriv: failed to parse reuid: 'agent'\n";
+        assert!(no_such_user(&out(1, reuid), "agent"));
+        assert!(!no_such_user(&out(1, reuid), "gus"));
+        assert!(!no_such_user(&out(0, reuid), "agent"));
+        let regid = "setpriv: failed to parse regid: 'gus'\n";
+        assert!(no_such_user(&out(1, regid), "gus"));
+        assert!(!no_such_user(&out(1, "ls: cannot access 'x'\n"), "agent"));
+    }
+
+    #[tokio::test]
+    async fn guest_user_setting() {
+        let (_t, _d, m, _) = ui_manager(|_, _| vec![]).await;
+        let user = |m: &Manager| m.load("dev").unwrap().guest_user;
+        m.set_guest_user("dev", Some("gus-ai")).await.unwrap();
+        assert_eq!(user(&m).as_deref(), Some("gus-ai"));
+        assert!(m.set_guest_user("dev", Some("root")).await.is_err());
+        assert!(m.set_guest_user("dev", Some("a b")).await.is_err());
+        assert_eq!(user(&m).as_deref(), Some("gus-ai"), "unchanged");
+        // The default is stored as no setting.
+        m.set_guest_user("dev", Some("agent")).await.unwrap();
+        assert_eq!(user(&m), None);
     }
 
     /// `images rm` keeps an ISO that a running VM started with, even after

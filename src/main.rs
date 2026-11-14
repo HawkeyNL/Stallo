@@ -184,7 +184,7 @@ enum Cmd {
         #[arg(long, value_name = "eject|ISO", group = "change")]
         cdrom: Option<String>,
         /// The guest account that exec and cp run as without --admin
-        /// (default: agent); applies to the next call.
+        /// (default: agent; `agent` restores it); applies to the next call.
         #[arg(long, value_name = "USER", group = "change")]
         guest_user: Option<String>,
     },

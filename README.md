@@ -320,7 +320,8 @@ agent in the guest, which Stallo does not install:
   name, the default on Ubuntu and Fedora), create `agent` with a locked
   password (`sudo useradd -m -s /bin/bash agent && sudo passwd -l
   agent`; it shows on the login screen, but nobody can log in to it), or
-  use `--admin` (root) for every call. Agents act as that user too.
+  use `--admin` (root) for every call. Agents act as that user too;
+  `--guest-user agent` goes back to the default.
 - Fedora: SELinux confines the guest agent (`virt_qemu_ga_t`) and refuses
   what `exec` needs. Make only that domain permissive, as Stallo does for
   its Fedora cloud image:

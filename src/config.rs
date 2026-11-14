@@ -38,9 +38,6 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks a snapshot tag: `^[A-Za-z][A-Za-z0-9._-]{0,63}$`. The leading
-/// letter rules out `.`/`..`, option-like `-x` and all-digit tags, which QEMU
-/// would also match against snapshot ids.
 /// A guest account name for `setpriv`: a portable user name, not root
 /// (`--admin` is how a call runs as root).
 pub fn validate_guest_user(user: &str) -> Result<()> {
@@ -57,6 +54,9 @@ pub fn validate_guest_user(user: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks a snapshot tag: `^[A-Za-z][A-Za-z0-9._-]{0,63}$`. The leading
+/// letter rules out `.`/`..`, option-like `-x` and all-digit tags, which QEMU
+/// would also match against snapshot ids.
 pub fn validate_tag(tag: &str) -> Result<()> {
     let ok = (1..=64).contains(&tag.len())
         && tag.as_bytes()[0].is_ascii_alphabetic()

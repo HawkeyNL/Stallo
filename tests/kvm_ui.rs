@@ -52,6 +52,15 @@ fn ui_channel() {
     };
     // Off for a VM from a cloud image; refused while running.
     assert!(!has_port(&d));
+    // A guest user that does not exist gets a clear error; `agent` is back.
+    d.ok(&["set", "ui", "--guest-user", "nobody-here"]);
+    let out = d.stallo(&["exec", "ui", "--", "true"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains(r#"the guest user "nobody-here" does not exist in ui"#),
+        "{out:?}"
+    );
+    d.ok(&["set", "ui", "--guest-user", "agent"]);
     let out = d.stallo(&["set", "ui", "--ui", "on"]);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("stop it first"),

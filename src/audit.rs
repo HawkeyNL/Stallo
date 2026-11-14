@@ -196,7 +196,14 @@ pub fn describe(r: &Request) -> Described<'_> {
         Request::SetGuestUser { name, user } => (
             "set_guest_user",
             Some(name),
-            vec![("user", u64::from(user.is_some()))],
+            // Whether a user other than the default was set, not who.
+            vec![(
+                "user",
+                u64::from(
+                    user.as_deref()
+                        .is_some_and(|u| u != crate::seed::GUEST_USER),
+                ),
+            )],
             None,
         ),
         // The ISO is in `image` (see [`image`]).
