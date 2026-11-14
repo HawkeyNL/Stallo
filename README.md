@@ -306,9 +306,11 @@ The screen, keyboard and mouse work without anything in the guest. File
 copies (`stallo cp`) and commands (`stallo exec`) need the QEMU guest
 agent in the guest, which Stallo does not install:
 
-- Check `systemctl status qemu-guest-agent`; if it is missing, install the
-  `qemu-guest-agent` package, then
-  `sudo systemctl enable --now qemu-guest-agent`. Without
+- Check `systemctl status qemu-guest-agent`; if it is missing, install
+  it (Debian/Ubuntu: `sudo apt install qemu-guest-agent`, Fedora:
+  `sudo dnf install qemu-guest-agent`), then
+  `sudo systemctl enable --now qemu-guest-agent`. `stallo ls` shows `GA
+  up` once it runs, and `none` while no agent has its port open. Without
   `--net internet` (production mode) the VM is offline: if neither the
   installed system nor its ISO holds the package, it cannot be installed.
 - Without `--admin`, Stallo runs commands and file copies as the guest
@@ -320,6 +322,12 @@ agent in the guest, which Stallo does not install:
   what `exec` needs. Make only that domain permissive, as Stallo does for
   its Fedora cloud image:
   `sudo sh -c "echo '(typepermissive virt_qemu_ga_t)' > /root/qga.cil && semodule -i /root/qga.cil"`.
+- Agents can read the desktop's windows and controls as text (`ui_tree`,
+  `ui_act`, `ui_wait`) once the UI helper runs in the guest. VMs made from
+  an ISO have the UI channel on. With the guest agent running, install
+  the helper with `stallo ui desk --install`, then log out and in. It
+  needs `python3-gi` and `gir1.2-atspi-2.0` (Debian/Ubuntu) or
+  `python3-gobject` and `at-spi2-core` (Fedora).
 
 Stallo does not wait for a guest agent in a VM made from an ISO: not at
 `new`, `start` or snapshot restore, even after you install one. Agents
@@ -453,8 +461,9 @@ stallo mcp --http 100.101.102.103:8765 --token-file ~/.config/stallo/mcp-token
 Tools: `vm_list`, `vm_info`, `vm_create` (only with `agents_can_create =
 true` in `stallod.toml`), `vm_start`, `vm_stop`, `vm_reset`, `screenshot`,
 `wait_for_screen`, `mouse_move`, `click`, `drag`, `scroll`, `type_text`,
-`key`, `exec`, `file_read`, `file_write`, `image_list`. There is no
-delete tool. Every call is logged in `<data>/audit/`; see SECURITY.md.
+`key`, `exec`, `file_read`, `file_write`, `image_list`,
+`snapshot_create`, `snapshot_list`, `snapshot_restore`, `ui_tree`,
+`ui_act`, `ui_wait`. There is no delete tool. Every call is logged in `<data>/audit/`; see SECURITY.md.
 
 ## Licence
 
