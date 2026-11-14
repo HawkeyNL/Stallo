@@ -1739,6 +1739,39 @@ pub fn screen_socket(vm: &VmInfo, details: Option<&VmDetails>) -> Option<PathBuf
     running_details(vm, details)?.vnc_socket.clone()
 }
 
+/// The VNC sockets of screens 2 and up, while the VM runs with VNC.
+pub fn more_screen_sockets(vm: &VmInfo, details: Option<&VmDetails>) -> Vec<PathBuf> {
+    running_details(vm, details)
+        .map(|d| d.vnc_sockets.iter().skip(1).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Pixel (`x`, `y`) of screen `head` as a pixel of screen 1's VNC server,
+/// which takes the pointer for every screen. The guest's one tablet
+/// spans the desktop (screens left to right, top-aligned), and QEMU
+/// scales screen 1's pixels to it: so the desktop point, scaled to screen
+/// 1's size. Exact with one screen; within a few pixels with more.
+pub fn pointer_on_first(sizes: &[(u16, u16)], head: usize, x: u16, y: u16) -> (u16, u16) {
+    let Some(&(w0, h0)) = sizes.first() else {
+        return (x, y);
+    };
+    let offset: u32 = sizes[..head.min(sizes.len())]
+        .iter()
+        .map(|s| u32::from(s.0))
+        .sum();
+    let desktop_w: u32 = sizes.iter().map(|s| u32::from(s.0)).sum();
+    let desktop_h = sizes.iter().map(|s| u32::from(s.1)).max().unwrap_or(1);
+    let scale = |v: u32, from: u32, to: u16| {
+        // At most to - 1: u16 always holds it.
+        (u64::from(v) * u64::from(to) / u64::from(from.max(1))).min(u64::from(to.saturating_sub(1)))
+            as u16
+    };
+    (
+        scale(offset + u32::from(x), desktop_w, w0),
+        scale(u32::from(y), desktop_h, h0),
+    )
+}
+
 pub fn screen_page(vm: &VmInfo, details: Option<&VmDetails>, link: &Link) -> ScreenPage {
     let k = kind(&vm.state);
     if k == Kind::Stopped {
@@ -4996,6 +5029,22 @@ mod tests {
         assert_eq!(d.progress(), "3.0 GiB so far");
         assert_eq!(d.done_text("dev"), "syslog copied from dev");
         assert_eq!(d.cancelled(), "Download cancelled");
+    }
+
+    #[test]
+    fn pointer_across_screens() {
+        // One screen: unchanged.
+        assert_eq!(pointer_on_first(&[(1280, 800)], 0, 640, 400), (640, 400));
+        assert_eq!(pointer_on_first(&[], 0, 7, 9), (7, 9));
+        // Two equal screens: the desktop is 2560 wide, sent at half scale.
+        let two = [(1280, 800), (1280, 800)];
+        assert_eq!(pointer_on_first(&two, 0, 760, 558), (380, 558));
+        assert_eq!(pointer_on_first(&two, 1, 0, 0), (640, 0));
+        assert_eq!(pointer_on_first(&two, 1, 1279, 799), (1279, 799));
+        // Unequal: a shorter first screen and a taller second one.
+        let mixed = [(1280, 800), (1920, 1080)];
+        assert_eq!(pointer_on_first(&mixed, 1, 1919, 1079), (1279, 799));
+        assert_eq!(pointer_on_first(&mixed, 0, 0, 540), (0, 400));
     }
 
     #[test]

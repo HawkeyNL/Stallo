@@ -2232,6 +2232,13 @@ impl Running {
             let (w, h) = input::png_size(&png)?;
             shots.push((png, w, h));
         }
+        // Base64 in one response: stay well under the client's limit.
+        let bytes: usize = shots.iter().map(|s| s.0.len()).sum();
+        ensure!(
+            bytes <= crate::api::MAX_RESPONSE / 2,
+            "the screens are too large for one screenshot ({} MiB of PNG)",
+            bytes >> 20
+        );
         let desktop = shots.iter().fold((0, 0), |(w, h), s| (w + s.1, h.max(s.2)));
         *self.screen_size.lock().unwrap() = desktop;
         let mut shots = shots.into_iter();

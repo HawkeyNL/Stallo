@@ -29,6 +29,15 @@ impl AsRef<[u8]> for Pixels {
     }
 }
 
+/// A screen after the first (VMs with several): drawn from its own VNC
+/// session; its pointer goes through the first screen's session.
+struct Head {
+    picture: gtk::Picture,
+    session: Option<Session>,
+    texture: Option<gdk::Texture>,
+    shown: Option<(u64, u16, u16)>,
+}
+
 pub struct Screen {
     name: String,
     vms: Weak<Vms>,
@@ -47,7 +56,10 @@ pub struct Screen {
     holder: adw::Bin,
     frame: adw::Bin,
     scroller: gtk::ScrolledWindow,
+    /// Every screen's picture, side by side.
+    pictures: gtk::Box,
     picture: gtk::Picture,
+    heads: RefCell<Vec<Head>>,
     hint: gtk::Label,
     ctrl_alt_del: gtk::Button,
     paste: gtk::Button,
@@ -121,20 +133,13 @@ impl Screen {
         content.append(&details_list);
         let status = adw::StatusPage::builder().child(&content).build();
 
-        let picture = gtk::Picture::builder()
-            .can_shrink(true)
-            .content_fit(gtk::ContentFit::Contain)
-            .focusable(true)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        picture.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Screen of {title}"
-        ))]);
+        let picture = new_picture(&format!("Screen of {title}"));
+        let pictures = gtk::Box::builder().spacing(6).homogeneous(true).build();
+        pictures.append(&picture);
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::External)
             .vscrollbar_policy(gtk::PolicyType::External)
-            .child(&picture)
+            .child(&pictures)
             .build();
 
         let strip_hint = gtk::Label::builder()
@@ -239,7 +244,9 @@ impl Screen {
             holder,
             frame,
             scroller,
+            pictures,
             picture,
+            heads: RefCell::default(),
             hint,
             ctrl_alt_del,
             paste,
@@ -366,23 +373,7 @@ impl Screen {
             }
         });
 
-        let input = gtk::EventControllerLegacy::new();
-        let s = weak();
-        input.connect_event(move |_, event| match s.upgrade() {
-            Some(s) => s.input(event),
-            None => glib::Propagation::Proceed,
-        });
-        self.picture.add_controller(input);
-        // A click or fullscreen hands the guest the keyboard; focus
-        // elsewhere takes it back.
-        let focus = gtk::EventControllerFocus::new();
-        let s = weak();
-        focus.connect_leave(move |_| {
-            if let Some(s) = s.upgrade() {
-                s.ungrab();
-            }
-        });
-        self.picture.add_controller(focus);
+        self.watch(&self.picture, 0);
 
         // F11 while the focus is in this tab (local scope) and the screen
         // shows; never under a dialog.
@@ -414,6 +405,27 @@ impl Screen {
         self.root.add_controller(shortcuts);
     }
 
+    /// Input on screen `head`'s picture goes to the guest. A click or
+    /// fullscreen hands the guest the keyboard; focus elsewhere takes it
+    /// back.
+    fn watch(self: &Rc<Self>, picture: &gtk::Picture, head: usize) {
+        let input = gtk::EventControllerLegacy::new();
+        let s = Rc::downgrade(self);
+        input.connect_event(move |c, event| match s.upgrade() {
+            Some(s) => s.input(event, head, c.widget().as_ref()),
+            None => glib::Propagation::Proceed,
+        });
+        picture.add_controller(input);
+        let focus = gtk::EventControllerFocus::new();
+        let s = Rc::downgrade(self);
+        focus.connect_leave(move |_| {
+            if let Some(s) = s.upgrade() {
+                s.ungrab();
+            }
+        });
+        picture.add_controller(focus);
+    }
+
     /// The VM as it is now. `blocked`: no actions now.
     pub fn update(self: &Rc<Self>, vm: &VmInfo, details: Option<&VmDetails>, blocked: bool) {
         let before = self.agent.replace(Some(vm.agent_control));
@@ -442,7 +454,13 @@ impl Screen {
         match socket {
             Some(socket) if self.wanted.get() => {
                 if *self.link.borrow() == Link::Idle {
+                    let more = self.vm.borrow().as_ref().map_or_else(Vec::new, |vm| {
+                        model::more_screen_sockets(vm, self.details.borrow().as_ref())
+                    });
                     self.connect(socket);
+                    for (i, socket) in more.into_iter().enumerate() {
+                        self.connect_head(i, socket);
+                    }
                 }
             }
             _ => self.disconnect(),
@@ -453,7 +471,60 @@ impl Screen {
     fn disconnect(&self) {
         self.generation.set(self.generation.get() + 1);
         self.session.take();
+        self.drop_heads();
         *self.link.borrow_mut() = Link::Idle;
+    }
+
+    /// Screens 2 and up go, with their sessions.
+    fn drop_heads(&self) {
+        for head in self.heads.take() {
+            self.pictures.remove(&head.picture);
+        }
+    }
+
+    /// Shows screen `i + 2` from `socket`, until the next connect or
+    /// disconnect. A screen that fails stays blank; screen 1 decides
+    /// whether the screen is live.
+    fn connect_head(self: &Rc<Self>, i: usize, socket: PathBuf) {
+        let generation = self.generation.get();
+        let title = stallo::printable(&self.name, 64);
+        let picture = new_picture(&format!("Screen {} of {title}", i + 2));
+        self.set_fit(&picture, self.actual_size.is_active());
+        self.pictures.append(&picture);
+        self.watch(&picture, i + 1);
+        self.heads.borrow_mut().push(Head {
+            picture,
+            session: None,
+            texture: None,
+            shown: None,
+        });
+        let s = Rc::downgrade(self);
+        let current = move || s.upgrade().filter(|s| s.generation.get() == generation);
+        glib::spawn_future_local(async move {
+            let got = client::spawn(async move { Session::connect(&socket).await }).await;
+            let Some(screen) = current() else {
+                return;
+            };
+            let Ok(Ok((session, mut frames))) = got else {
+                return;
+            };
+            if let Some(head) = screen.heads.borrow_mut().get_mut(i) {
+                head.session = Some(session);
+            }
+            drop(screen);
+            while frames.changed().await.is_ok() {
+                let Some(screen) = current() else {
+                    return;
+                };
+                let frame = frames.borrow_and_update().clone();
+                if let Some(head) = screen.heads.borrow_mut().get_mut(i) {
+                    let (texture, shown) =
+                        paint(&head.picture, head.texture.take(), head.shown, frame);
+                    head.texture = Some(texture);
+                    head.shown = Some(shown);
+                }
+            }
+        });
     }
 
     fn connect(self: &Rc<Self>, socket: PathBuf) {
@@ -506,6 +577,7 @@ impl Screen {
     fn end(&self, why: &str) {
         self.generation.set(self.generation.get() + 1);
         self.session.take();
+        self.drop_heads();
         *self.link.borrow_mut() = Link::Ended(why.to_owned());
         self.show();
         // Often the VM stopped: ask now rather than show this until the
@@ -516,32 +588,10 @@ impl Screen {
     }
 
     fn draw(&self, frame: Frame) {
-        let (w, h) = (frame.width, frame.height);
-        let partial = model::partial_redraw(self.shown.get(), frame.serial, (w, h));
-        let bytes = glib::Bytes::from_owned(Pixels(frame.pixels));
-        let mut builder = gdk::MemoryTextureBuilder::new()
-            .set_bytes(Some(&bytes))
-            .set_width(w.into())
-            .set_height(h.into())
-            .set_stride(usize::from(w) * 4)
-            .set_format(gdk::MemoryFormat::B8g8r8x8);
-        let old = self.texture.borrow().clone();
-        if let (true, Some(old)) = (partial, old) {
-            let rects: Vec<_> = frame
-                .damage
-                .iter()
-                .map(|r| {
-                    gtk::cairo::RectangleInt::new(r.x.into(), r.y.into(), r.w.into(), r.h.into())
-                })
-                .collect();
-            builder = builder
-                .set_update_texture(Some(&old))
-                .set_update_region(Some(&gtk::cairo::Region::create_rectangles(&rects)));
-        }
-        let texture = builder.build();
-        self.picture.set_paintable(Some(&texture));
+        let old = self.texture.take();
+        let (texture, shown) = paint(&self.picture, old, self.shown.get(), frame);
         *self.texture.borrow_mut() = Some(texture);
-        self.shown.set(Some((frame.serial, w, h)));
+        self.shown.set(Some(shown));
         if *self.link.borrow() == Link::Connecting {
             *self.link.borrow_mut() = Link::Live;
             self.show();
@@ -736,7 +786,12 @@ impl Screen {
     }
 
     /// Keys while grabbed, the pointer and the wheel, for the guest.
-    fn input(&self, event: &gdk::Event) -> glib::Propagation {
+    fn input(
+        &self,
+        event: &gdk::Event,
+        head: usize,
+        picture: Option<&gtk::Widget>,
+    ) -> glib::Propagation {
         use gdk::EventType as T;
         if !self.input_allowed() {
             return glib::Propagation::Proceed;
@@ -780,13 +835,15 @@ impl Screen {
                 let bit = event
                     .downcast_ref::<gdk::ButtonEvent>()
                     .and_then(|b| model::button_bit(b.button()));
-                let (Some(bit), Some((x, y, inside))) = (bit, self.point(event)) else {
+                let (Some(bit), Some((x, y, inside))) = (bit, self.point(event, head)) else {
                     return glib::Propagation::Proceed;
                 };
                 let press = kind == T::ButtonPress;
                 if press {
                     self.grab(Some(event));
-                    self.picture.grab_focus();
+                    if let Some(picture) = picture {
+                        picture.grab_focus();
+                    }
                     // A click on the letterbox only focuses.
                     if !inside {
                         return glib::Propagation::Stop;
@@ -799,7 +856,7 @@ impl Screen {
                 glib::Propagation::Stop
             }
             T::MotionNotify => {
-                if let Some((x, y, inside)) = self.point(event) {
+                if let Some((x, y, inside)) = self.point(event, head) {
                     let input = self.mouse.borrow_mut().moved(x, y, inside);
                     if let Some(input) = input {
                         self.send(input);
@@ -830,34 +887,48 @@ impl Screen {
         }
     }
 
-    /// The framebuffer pixel under a pointer event, and whether it is on
-    /// the screen rather than the letterbox.
-    fn point(&self, event: &gdk::Event) -> Option<(u16, u16, bool)> {
+    /// The pixel of screen 1's framebuffer to send for a pointer event on
+    /// screen `head`, and whether it is on a screen rather than the
+    /// letterbox.
+    fn point(&self, event: &gdk::Event, head: usize) -> Option<(u16, u16, bool)> {
+        let first = self.shown.get()?;
+        let heads = self.heads.borrow();
+        // A screen not drawn yet counts as screen 1's size.
+        let sizes: Vec<(u16, u16)> = std::iter::once((first.1, first.2))
+            .chain(
+                heads
+                    .iter()
+                    .map(|h| h.shown.map_or((first.1, first.2), |s| (s.1, s.2))),
+            )
+            .collect();
+        let (picture, (_, w, h)) = match head {
+            0 => (&self.picture, first),
+            n => {
+                let h = heads.get(n - 1)?;
+                (&h.picture, h.shown?)
+            }
+        };
         // Events carry surface coordinates.
         let (ex, ey) = event.position()?;
-        let native = self.picture.native()?;
+        let native = picture.native()?;
         let (sx, sy) = native.surface_transform();
         let p = native.compute_point(
-            &self.picture,
+            picture,
             &gtk::graphene::Point::new((ex - sx) as f32, (ey - sy) as f32),
         )?;
-        let (_, w, h) = self.shown.get()?;
-        let widget = (
-            f64::from(self.picture.width()),
-            f64::from(self.picture.height()),
-        );
+        let widget = (f64::from(picture.width()), f64::from(picture.height()));
         let place = model::placement(widget, (w, h), !self.actual_size.is_active());
-        Some(model::to_guest(place, (w, h), p.x().into(), p.y().into()))
+        let (x, y, inside) = model::to_guest(place, (w, h), p.x().into(), p.y().into());
+        let (x, y) = model::pointer_on_first(&sizes, head, x, y);
+        Some((x, y, inside))
     }
 
     /// Fit (the default) or 1:1, with scrollbars when it does not fit.
     fn set_actual_size(&self, on: bool) {
-        self.picture.set_can_shrink(!on);
-        self.picture.set_content_fit(if on {
-            gtk::ContentFit::ScaleDown
-        } else {
-            gtk::ContentFit::Contain
-        });
+        self.set_fit(&self.picture, on);
+        for head in self.heads.borrow().iter() {
+            self.set_fit(&head.picture, on);
+        }
         let policy = if on {
             gtk::PolicyType::Automatic
         } else {
@@ -915,6 +986,15 @@ impl Screen {
         self.grab(None);
     }
 
+    fn set_fit(&self, picture: &gtk::Picture, actual: bool) {
+        picture.set_can_shrink(!actual);
+        picture.set_content_fit(if actual {
+            gtk::ContentFit::ScaleDown
+        } else {
+            gtk::ContentFit::Contain
+        });
+    }
+
     fn leave_fullscreen(&self) {
         let window = self.full.borrow().clone();
         if let Some(w) = window {
@@ -933,6 +1013,51 @@ impl Screen {
         window.set_content(None::<&gtk::Widget>);
         self.holder.set_child(Some(&self.frame));
     }
+}
+
+/// A focusable picture for one guest screen, named for screen readers.
+fn new_picture(label: &str) -> gtk::Picture {
+    let picture = gtk::Picture::builder()
+        .can_shrink(true)
+        .content_fit(gtk::ContentFit::Contain)
+        .focusable(true)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    picture.update_property(&[gtk::accessible::Property::Label(label)]);
+    picture
+}
+
+/// Draws `frame` on `picture`, updating only its damage on `old` when it
+/// can. Returns the texture and the serial and size shown.
+fn paint(
+    picture: &gtk::Picture,
+    old: Option<gdk::Texture>,
+    shown: Option<(u64, u16, u16)>,
+    frame: Frame,
+) -> (gdk::Texture, (u64, u16, u16)) {
+    let (w, h) = (frame.width, frame.height);
+    let partial = model::partial_redraw(shown, frame.serial, (w, h));
+    let bytes = glib::Bytes::from_owned(Pixels(frame.pixels));
+    let mut builder = gdk::MemoryTextureBuilder::new()
+        .set_bytes(Some(&bytes))
+        .set_width(w.into())
+        .set_height(h.into())
+        .set_stride(usize::from(w) * 4)
+        .set_format(gdk::MemoryFormat::B8g8r8x8);
+    if let (true, Some(old)) = (partial, old) {
+        let rects: Vec<_> = frame
+            .damage
+            .iter()
+            .map(|r| gtk::cairo::RectangleInt::new(r.x.into(), r.y.into(), r.w.into(), r.h.into()))
+            .collect();
+        builder = builder
+            .set_update_texture(Some(&old))
+            .set_update_region(Some(&gtk::cairo::Region::create_rectangles(&rects)));
+    }
+    let texture = builder.build();
+    picture.set_paintable(Some(&texture));
+    (texture, (frame.serial, w, h))
 }
 
 impl Drop for Screen {
