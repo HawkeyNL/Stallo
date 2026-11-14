@@ -1,0 +1,20 @@
+Acquire-By-Hash: yes
+Architectures: amd64
+Codename: edge
+Components: main
+Date: Sat, 14 Nov 2026 15:55:43 +0000
+Label: Stallo
+Origin: Stallo
+Suite: edge
+MD5Sum:
+ d2e643ab7a79c365b0e63a885c6e30e3            19460 main/binary-amd64/Packages
+ 37405a064c165c39ba0e2b215026d5e7             4608 main/binary-amd64/Packages.gz
+SHA1:
+ 20848c4d6a497917871c27df5d5f5bd5ee40ece1            19460 main/binary-amd64/Packages
+ 3e443a516c4dfdcf68a5dfd4365176060ba69592             4608 main/binary-amd64/Packages.gz
+SHA256:
+ b686e1a54ac3232ffa2c0f175bd810f1d49379e1db14253b6af28ca901418219            19460 main/binary-amd64/Packages
+ 3acff93035e5acf2c8a87040f18d3db1cf687d08176fd70b7928225c9a36eaa1             4608 main/binary-amd64/Packages.gz
+SHA512:
+ 9329274c5b4b449ebde6712581a8d88072f22c7d7cee6f4bad2272c58feaf7012eb78d35570834a40e2a952069f1733b7de1f3ea5e8c724600aed6314b56f37e            19460 main/binary-amd64/Packages
+ acbef8841ed2aceec51a918e0ad37fbe1bef843c2f19056cb4de8125d7712206a6ddffe1962e82daed24afb0df608b825bb5eb15a606b58d68cc51c40a2d21b9             4608 main/binary-amd64/Packages.gz
