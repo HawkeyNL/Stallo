@@ -302,8 +302,14 @@ impl Screen {
             let s = s.clone();
             let clipboard = b.clipboard();
             glib::spawn_future_local(async move {
-                // Read only on a click, never kept or logged.
-                let text = clipboard.read_text_future().await.ok().flatten();
+                // Read only on a click, never kept or logged. A clipboard
+                // owner that hangs counts as no text.
+                let read = clipboard.read_text_future();
+                let text = glib::future_with_timeout(std::time::Duration::from_secs(5), read)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten();
                 let Some(screen) = s.upgrade() else {
                     return;
                 };
