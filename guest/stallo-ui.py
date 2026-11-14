@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import select
+import signal
 import sys
 import time
 
@@ -163,7 +164,7 @@ def parse_request(line):
 class Desktop:
     """The accessibility tree, through AT-SPI (imported here, not at start)."""
 
-    def __init__(self, atspi=None):
+    def __init__(self, atspi=None, state_dir=None):
         if atspi is None:
             import gi
 
@@ -178,14 +179,65 @@ class Desktop:
             from gi.repository import GLib
 
             self.context = GLib.MainContext.default()
+            # Apps send these events only to a registered listener; with
+            # them libatspi keeps its cache current (handled in idle()).
+            self.listener = atspi.EventListener.new(lambda *_: None)
+            for event in (
+                "object:state-changed",
+                "object:property-change:accessible-name",
+                "object:children-changed",
+            ):
+                try:
+                    self.listener.register(event)
+                except Exception:
+                    pass  # the bus not up yet: an older cache, not no helper
         else:
             self.context = None
         self.atspi = atspi
         self.nodes = {}  # key -> (accessible, window accessible, pid), last walk
+        # The app being read is noted in a file: after the watchdog ended
+        # a helper on it, the next one skips that app instead of hanging
+        # again. Kept for the login session (the runtime dir is tmpfs).
+        state_dir = state_dir or os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+        self.current = os.path.join(state_dir, "stallo-ui.current")
+        self.hung_file = os.path.join(state_dir, "stallo-ui.hung")
+        self.hung = set()
+        try:
+            with open(self.current) as f:
+                app = f.read().strip()
+            os.unlink(self.current)
+            if app.replace(":", "").isdigit():
+                with open(self.hung_file, "a") as f:
+                    f.write(app + "\n")
+        except OSError:
+            pass
+        try:
+            with open(self.hung_file) as f:
+                self.hung = set(f.read().split())
+        except OSError:
+            pass
+
+    def busy(self, pid):
+        """Notes the app being read (None or 0: none)."""
+        try:
+            if not pid:
+                os.unlink(self.current)
+            else:
+                with open(self.current, "w") as f:
+                    f.write(app_id(pid) + "\n")
+        except OSError:
+            pass
+
+    def skipped(self, pid):
+        """Whether the app `pid` hung a helper before."""
+        return bool(pid) and app_id(pid) in self.hung
 
     def idle(self):
         """Handles pending bus messages, so nothing piles up while idle."""
-        while self.context is not None and self.context.pending():
+        # Bounded: a flood of events (a busy web page) waits for the next
+        # pass instead of keeping the helper from answering.
+        end = time.monotonic() + 0.2
+        while self.context is not None and self.context.pending() and time.monotonic() < end:
             self.context.iteration(False)
 
     def has(self, acc):
@@ -269,11 +321,19 @@ class Desktop:
             if time.monotonic() > deadline or len(windows) >= 64:
                 partial = True
                 break
+            # Nothing is blamed for a hang before the app's pid is known.
+            self.busy(None)
             try:
                 app = desktop.get_child_at_index(i)
-                app.set_cache_mask(self.atspi.Cache.NONE)
-                app_name = (app.get_name() or "")[:APP_MAX + 1]
                 pid = self.pid(app)
+                if self.skipped(pid):
+                    partial = True  # it hung a helper before
+                    continue
+                self.busy(pid)
+                # The cache stays as libatspi keeps it, current through the
+                # events registered above: a cache mask of NONE hangs
+                # libatspi 2.60 on a futex at the first get_name.
+                app_name = (app.get_name() or "")[:APP_MAX + 1]
                 tops, _ = self.children(app, 64, deadline)
             except Exception:
                 continue
@@ -323,6 +383,7 @@ class Desktop:
                     # Nothing below a password field shows its text.
                     secret = secret or node["role"] == "password"
                     stack.extend((k, depth + 1, secret) for k in reversed(kids))
+        self.busy(None)
         return {
             "screen": self.screen(bounds),
             "coords": "window" if wayland() else "screen",
@@ -369,7 +430,24 @@ class Desktop:
             raise LookupError("unknown element; call ui_tree")
         return found
 
+    def acting(self, fn, key):
+        """fn(key), with the control's app noted while it runs."""
+        self.busy(self.find(key)[2])
+        try:
+            return fn(key)
+        finally:
+            self.busy(None)
+
     def probe(self, key):
+        return self.acting(self._probe, key)
+
+    def focus(self, key):
+        return self.acting(self._focus, key)
+
+    def invoke(self, key):
+        return self.acting(self._invoke, key)
+
+    def _probe(self, key):
         acc, window, pid = self.find(key)
         bbox = self.extents(acc)
         screen = self.screen([self.extents(window)])
@@ -414,7 +492,7 @@ class Desktop:
                     return True
         return False
 
-    def focus(self, key):
+    def _focus(self, key):
         """Focuses `key`, and checks keys would reach it: on Wayland a
         control in an inactive window can take focus while typed keys go
         to the active window."""
@@ -426,7 +504,7 @@ class Desktop:
         if not self.has(acc)("focused"):
             raise RuntimeError("the control did not take focus")
 
-    def invoke(self, key):
+    def _invoke(self, key):
         acc, _, _ = self.find(key)
         n = acc.get_n_actions()
         if n <= 0:
@@ -435,6 +513,15 @@ class Desktop:
         index = next((i for i, a in enumerate(names) if a in INVOKE_NAMES), 0)
         if not acc.do_action(index):
             raise RuntimeError("the action failed")
+
+
+def app_id(pid):
+    """`pid:start time`, so that a reused pid is another app."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return "%d:%s" % (pid, f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError):
+        return str(pid)
 
 
 def wayland():
@@ -577,16 +664,19 @@ class FakeAcc:
         self.states = set(states) | {"SHOWING", "VISIBLE", "ENABLED", "SENSITIVE"}
         self.kids, self.actions, self.value, self.parent = list(kids), list(actions), text, None
         self.done = []
+        self.pid, self.hangs = 42, False
         for k in self.kids:
             k.parent = self
 
     def get_process_id(self):
-        return 42
+        return self.pid
 
     def get_role_name(self):
         return self.role
 
     def get_name(self):
+        if self.hangs:
+            raise SystemExit("hung")  # as the watchdog ends a helper
         return self.name
 
     def get_state_set(self):
@@ -603,9 +693,6 @@ class FakeAcc:
 
     def get_parent(self):
         return self.parent
-
-    def set_cache_mask(self, mask):
-        pass
 
     def get_extents(self, coord):
         if self.box is None:
@@ -650,7 +737,6 @@ class FakeAtspi:
 
     StateType = StateType()
     CoordType = type("CoordType", (), {"SCREEN": 0})
-    Cache = type("Cache", (), {"NONE": 0})
 
     def __init__(self, desktop):
         self.desktop = desktop
@@ -660,6 +746,10 @@ class FakeAtspi:
 
 
 def fake_desktop_test():
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
     save = FakeAcc("/save", "push button", "Save", box=(600, 400, 90, 32), actions=["click"])
     hidden = FakeAcc("/hidden", "push button", "Hidden", box=(0, 0, 9, 9))
     hidden.states.discard("SHOWING")
@@ -671,7 +761,7 @@ def fake_desktop_test():
     off = FakeAcc("/off", "frame", "Minimised")
     off.states.discard("SHOWING")
     app = FakeAcc("/app", "application", "gedit", kids=[dialog, off])
-    d = Desktop(FakeAtspi(FakeAcc("/", "desktop frame", kids=[app], box=(0, 0, 1920, 1080))))
+    d = Desktop(FakeAtspi(FakeAcc("/", "desktop frame", kids=[app], box=(0, 0, 1920, 1080))), state_dir=tmp)
     tree = d.tree()
     assert tree["screen"] == [1920, 1080] and not tree["partial"]
     assert [w["title"] for w in tree["windows"]] == ["Save As"] and tree["windows"][0]["active"]
@@ -710,16 +800,41 @@ def fake_desktop_test():
     table = FakeAcc("/rows", "list", "Rows", states=["MANAGES_DESCENDANTS"], kids=rows)
     big = [FakeAcc("/b%d" % i, "push button", "名" * 100) for i in range(MAX_NODES)]
     frame = FakeAcc("/f", "frame", "Big", states=["ACTIVE"], kids=[secret, table] + big)
-    d = Desktop(FakeAtspi(FakeAcc("/", "desktop frame", kids=[FakeAcc("/a", "application", "x", kids=[frame])])))
+    d = Desktop(FakeAtspi(FakeAcc("/", "desktop frame", kids=[FakeAcc("/a", "application", "x", kids=[frame])])), state_dir=tmp)
     tree = d.tree()
     assert "hunter2" not in json.dumps(tree)
     assert sum(1 for n in tree["nodes"] if n["name"].startswith("Row ")) == MAX_MANAGED
     assert tree["partial"] and len(dump(tree)) < (1 << 20) - 100
     assert all(len(n["name"]) <= NAME_MAX + 1 for n in tree["nodes"])
 
+    # An app that hangs the walk (the watchdog ends the helper) is
+    # skipped by the next helper; the others still show.
+    stuck = FakeAcc("/stuck", "application", "stuck", kids=[FakeAcc("/w", "frame", "W", states=["ACTIVE"])])
+    stuck.pid, stuck.hangs = 7, True
+    fine = FakeAcc("/fine", "application", "fine", kids=[FakeAcc("/v", "frame", "Fine")])
+    fine.pid = 8
+    root = FakeAcc("/", "desktop frame", kids=[stuck, fine], box=(0, 0, 800, 600))
+    try:
+        Desktop(FakeAtspi(root), state_dir=tmp).tree()
+        raise AssertionError("no hang")
+    except SystemExit:
+        pass
+    tree = Desktop(FakeAtspi(root), state_dir=tmp).tree()
+    assert [w["title"] for w in tree["windows"]] == ["Fine"] and tree["partial"]
+    assert not os.path.exists(os.path.join(tmp, "stallo-ui.current"))
+    # A reused pid is another app; pid 0 (unknown) is never blamed.
+    assert app_id(os.getpid()) != app_id(1) and ":" in app_id(os.getpid())
+    d = Desktop(FakeAtspi(root), state_dir=tmp)
+    d.busy(0)
+    assert not os.path.exists(os.path.join(tmp, "stallo-ui.current")) and not d.skipped(0)
+    shutil.rmtree(tmp)
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         self_test()
     else:
-        serve(Desktop())
+        desktop = Desktop()
+        # A helper stopped on purpose (restart, reinstall) blames no app;
+        # one stuck in C code gets SIGKILL and leaves its note.
+        signal.signal(signal.SIGTERM, lambda *_: (desktop.busy(None), sys.exit(0)))
+        serve(desktop)
