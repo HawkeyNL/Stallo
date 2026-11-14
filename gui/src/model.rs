@@ -2257,9 +2257,7 @@ pub fn paste_text(text: &str) -> Result<String, &'static str> {
         return Err("The clipboard has no text");
     }
     if stallo::input::text_keys(text).is_err() {
-        return Err(
-            "Only plain text can be pasted: ASCII letters, digits and symbols, Tab and line breaks, up to 1024 characters",
-        );
+        return Err("Only plain ASCII text of up to 1024 characters can be pasted");
     }
     Ok(text.to_owned())
 }

@@ -185,7 +185,7 @@ impl Screen {
             .build();
         let paste = gtk::Button::builder()
             .icon_name("edit-paste-symbolic")
-            .tooltip_text("Paste: type the clipboard text into the VM")
+            .tooltip_text("Paste: types the clipboard text into the VM, as on a US keyboard")
             .build();
         paste.update_property(&[gtk::accessible::Property::Label("Paste")]);
         let hint = gtk::Label::builder()
