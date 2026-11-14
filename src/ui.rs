@@ -58,26 +58,51 @@ pub const LINUX_HELPER: &str = include_str!("../guest/stallo-ui.py");
 /// Exits 0 when the guest's Python has GObject introspection for AT-SPI.
 pub const ATSPI_CHECK: &str =
     "import gi; gi.require_version('Atspi', '2.0'); from gi.repository import Atspi";
-const AUTOSTART: &str = "[Desktop Entry]
-Type=Application
-Name=Stallo UI helper
-Comment=Lets Stallo read this desktop's windows and controls
-Exec=/usr/bin/python3 -I /usr/local/lib/stallo-ui/stallo-ui.py
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
+/// Started with every desktop session; restarted after the helper exits
+/// on a hang.
+const SERVICE: &str = "[Unit]
+Description=Stallo UI helper: lets Stallo read this desktop's windows and controls
+PartOf=graphical-session.target
+After=graphical-session.target
+# Not in the login screen's session (gdm): only for people.
+ConditionUser=!@system
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/lib/stallo-ui/stallo-ui.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
 ";
+/// The user unit `SERVICE` is installed as.
+pub const SERVICE_UNIT: &str = "stallo-ui.service";
+/// How a failed connection to the helper starts: nothing answered.
+pub const NO_HELPER: &str = "no UI helper answered in";
+/// The helper's own limit on one request (`HANG_SECONDS` in the helper).
+pub const HANG_SECONDS: u32 = 30;
+/// Apps expose their controls only with toolkit accessibility on: on by
+/// default, while a user's own setting still wins. Installed best effort.
+pub const A11Y_DEFAULT: (&str, &str) = (
+    "/usr/share/glib-2.0/schemas/90_stallo-ui.gschema.override",
+    "# Stallo UI helper\n[org.gnome.desktop.interface]\ntoolkit-accessibility=true\n",
+);
+pub const SCHEMAS_DIR: &str = "/usr/share/glib-2.0/schemas";
+/// Where installs before the service started the helper.
+pub const OLD_AUTOSTART: &str = "/etc/xdg/autostart/stallo-ui.desktop";
 /// The logged-in user gets the port, nobody else.
 const UDEV_RULE: &str =
     "SUBSYSTEM==\"virtio-ports\", ATTR{name}==\"org.stallo.ui.0\", TAG+=\"uaccess\"\n";
 /// Where the Linux helper lives in the guest.
 pub const LINUX_DIR: &str = "/usr/local/lib/stallo-ui";
+pub const HELPER_PATH: &str = "/usr/local/lib/stallo-ui/stallo-ui.py";
 
 /// The files a Linux install writes (all root-owned and system-wide: it
 /// starts in whoever logs in to the desktop).
 pub fn linux_install() -> [(&'static str, &'static str); 3] {
     [
-        ("/usr/local/lib/stallo-ui/stallo-ui.py", LINUX_HELPER),
-        ("/etc/xdg/autostart/stallo-ui.desktop", AUTOSTART),
+        (HELPER_PATH, LINUX_HELPER),
+        ("/etc/systemd/user/stallo-ui.service", SERVICE),
         ("/etc/udev/rules.d/70-stallo-ui.rules", UDEV_RULE),
     ]
 }
@@ -793,7 +818,7 @@ impl Conn {
     pub async fn connect(path: &Path, vm: &str) -> Result<Self> {
         let no_helper = || {
             format!(
-                "no UI helper answered in {vm}; is someone logged in to its desktop, with the Stallo UI helper running?"
+                "{NO_HELPER} {vm}; is someone logged in to its desktop, with the Stallo UI helper running?"
             )
         };
         let (r, w) = timeout(HELLO_TIMEOUT, UnixStream::connect(path))
@@ -1534,12 +1559,18 @@ e8 window \"Terminal\" (gnome-terminal)
             assert!(!content.contains("/home/") && !content.is_empty(), "{path}");
         }
         assert!(files[0].0.starts_with(LINUX_DIR) && files[0].1 == LINUX_HELPER);
+        assert!(LINUX_HELPER.contains(&format!("\nHANG_SECONDS = {HANG_SECONDS}\n")));
+        assert!(files[1].0.ends_with(SERVICE_UNIT));
         assert!(
-            files[1]
-                .1
-                .contains("\nExec=/usr/bin/python3 -I /usr/local/lib/stallo-ui/stallo-ui.py\n")
+            files[1].1.contains(
+                "\nExecStart=/usr/bin/python3 -I /usr/local/lib/stallo-ui/stallo-ui.py\n"
+            )
         );
+        assert!(files[1].1.contains("\nRestart=always\n"));
         assert!(files[2].1.contains(r#"ATTR{name}=="org.stallo.ui.0""#));
+        assert!(files[1].1.contains("\nConditionUser=!@system\n"));
+        let (path, content) = A11Y_DEFAULT;
+        assert!(path.starts_with(SCHEMAS_DIR) && content.contains("toolkit-accessibility=true"));
     }
 
     #[test]

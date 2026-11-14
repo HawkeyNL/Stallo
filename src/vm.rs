@@ -1541,6 +1541,27 @@ impl Manager {
             run(&[&["chmod", "0644"][..], &paths].concat()).await?,
             "chmod",
         )?;
+        // The service first: an install that stops half way still starts
+        // a helper.
+        let enable = ["systemctl", "--global", "enable", ui::SERVICE_UNIT];
+        guest_ok(run(&enable).await?, "systemctl")?;
+        guest_ok(run(&["rm", "-f", ui::OLD_AUTOSTART]).await?, "rm")?;
+        // A helper from an older install would keep the port; the new one
+        // starts at the next login. None running is fine.
+        run(&["pkill", "-f", ui::HELPER_PATH]).await?;
+        // Best effort (a read-only /usr, no GLib tools): without it the
+        // helper still runs, with fewer apps.
+        let (path, content) = ui::A11Y_DEFAULT;
+        let a11y = self
+            .file_write(name, path, content.as_bytes(), false, true)
+            .await
+            .is_ok()
+            && run(&["chmod", "0644", path])
+                .await
+                .is_ok_and(|o| o.exit_code == 0)
+            && run(&["glib-compile-schemas", ui::SCHEMAS_DIR])
+                .await
+                .is_ok_and(|o| o.exit_code == 0);
         guest_ok(run(&["udevadm", "control", "--reload"]).await?, "udevadm")?;
         let trigger = [
             "udevadm",
@@ -1550,9 +1571,13 @@ impl Manager {
             "--attr-match=name=org.stallo.ui.0",
         ];
         guest_ok(run(&trigger).await?, "udevadm")?;
-        Ok(format!(
+        let mut out = format!(
             "installed the UI helper in {name}; it starts at the next desktop login (log out and in, or restart the guest)"
-        ))
+        );
+        if !a11y {
+            out += "; toolkit accessibility could not be made the default (glib-compile-schemas failed), so some apps may show no controls";
+        }
+        Ok(out)
     }
 
     /// Acts on a control from `ui_tree`, waits `act.settle` (and for
@@ -2151,15 +2176,17 @@ impl Running {
     /// Whether the guest has its end of the guest-agent port open, as QEMU
     /// reports it; `None` if QEMU does not say.
     pub async fn agent_port_open(&self) -> Option<bool> {
+        self.port_open(qemu::QGA_CHARDEV).await
+    }
+
+    /// Whether the guest has the port on `chardev` open (`query-chardev`).
+    async fn port_open(&self, chardev: &str) -> Option<bool> {
         let v = self
             .qmp
             .execute_timeout("query-chardev", None, Duration::from_secs(1))
             .await
             .ok()?;
-        v.as_array()?
-            .iter()
-            .find(|c| c["label"] == qemu::QGA_CHARDEV)?["frontend-open"]
-            .as_bool()
+        v.as_array()?.iter().find(|c| c["label"] == chardev)?["frontend-open"].as_bool()
     }
 
     /// Fails with what to do if no guest agent has the port open, after
@@ -2187,7 +2214,21 @@ impl Running {
         // leaves a connection that is out of step.
         let mut conn = match link.conn.take() {
             Some(conn) => conn,
-            None => ui::Conn::connect(&self.ui_sock, name).await?,
+            None => match ui::Conn::connect(&self.ui_sock, name).await {
+                Ok(conn) => conn,
+                // Someone holds the port but does not answer.
+                Err(e)
+                    if e.to_string().starts_with(ui::NO_HELPER)
+                        && self.port_open(qemu::UI_CHARDEV).await == Some(true) =>
+                {
+                    bail!(
+                        "the UI helper in {name} has its port open but does not answer; it may hang on an app, and then stops itself within {}s and restarts (in the guest: journalctl --user -u {})",
+                        ui::HANG_SECONDS,
+                        ui::SERVICE_UNIT
+                    )
+                }
+                Err(e) => return Err(e),
+            },
         };
         let result = op(&mut conn, &mut link.session).await;
         if result.is_ok() {
@@ -2772,10 +2813,11 @@ mod tests {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 let reply = match req["execute"].as_str().unwrap() {
                     "query-status" => serde_json::json!({"return": {"status": status}}),
-                    // No guest agent opened its port.
+                    // No guest agent opened its port; a UI helper did.
                     "query-chardev" => serde_json::json!({"return": [
                         {"label": "qmp", "filename": "unix:", "frontend-open": true},
-                        {"label": "qga0", "filename": "unix:", "frontend-open": false}
+                        {"label": "qga0", "filename": "unix:", "frontend-open": false},
+                        {"label": "ui0", "filename": "unix:", "frontend-open": true}
                     ]}),
                     "input-send-event" => {
                         events += 1;
@@ -3064,6 +3106,36 @@ mod tests {
             e.starts_with("no guest agent in dev:") && e.contains("apt install qemu-guest-agent"),
             "{e}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hung_ui_helper_is_named() {
+        // The port is open in the guest, but nothing answers.
+        let (_d, vm, _) = fake_vm("running", None).await;
+        let e = vm
+            .with_ui(async |conn, _| conn.tree().await.map(|_| ()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("the UI helper in dev has its port open but does not answer"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_ui_helper_is_not_a_hung_one() {
+        let (_d, vm, _) = fake_vm("running", None).await;
+        crate::ui::tests::fake_helper(&vm.ui_sock, |op, id| match op {
+            "hello" => vec![format!(r#"{{"id":{id},"ok":true,"v":2}}"#)],
+            _ => vec![],
+        });
+        let e = vm
+            .with_ui(async |conn, _| conn.tree().await.map(|_| ()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("the UI helper speaks protocol 2"), "{e}");
     }
 
     #[tokio::test]

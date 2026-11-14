@@ -43,6 +43,7 @@ pub const QGA_CHARDEV: &str = "qga0";
 /// The UI helper's channel (`VmConfig::ui`): host socket and guest port.
 pub const UI_SOCK: &str = "ui.sock";
 pub const UI_PORT: &str = "org.stallo.ui.0";
+pub const UI_CHARDEV: &str = "ui0";
 pub const VNC_SOCK: &str = "vnc.sock";
 /// Screendumps; created by the daemon, written by QEMU.
 pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
@@ -252,10 +253,10 @@ pub fn argv(
     let ui = if vm.ui {
         vec![
             format!(
-                "-chardev socket,id=ui0,path={},server=on,wait=off",
+                "-chardev socket,id={UI_CHARDEV},path={},server=on,wait=off",
                 file(rt_dir, UI_SOCK)?
             ),
-            format!("-device virtserialport,chardev=ui0,name={UI_PORT}"),
+            format!("-device virtserialport,chardev={UI_CHARDEV},name={UI_PORT}"),
         ]
     } else {
         vec![]
