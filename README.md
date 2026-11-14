@@ -274,7 +274,9 @@ side, left to right, screen 1 first (GNOME does this). If you rearrange
 the monitors in the guest's settings, clicks on screens 2 and 3 land in
 the wrong place. Each screen has its own VNC socket: `vnc.sock` for
 screen 1, then `vnc-2.sock` and `vnc-3.sock` in the same directory.
-The desktop app's Screen tab shows the screens side by side. Agents get
+The desktop app's Screen tab shows the screens side by side; its
+pointer is exact to within a pixel or two there, and a drag can cross
+from one screen to the next. Agents get
 one image per screen from `screenshot`, and their pointer coordinates
 run across the whole desktop: screen 2 starts at x = screen 1's width.
 Every screen must be on in the guest (on Windows, install the driver

@@ -29,6 +29,9 @@ impl AsRef<[u8]> for Pixels {
     }
 }
 
+/// The serial and size of a frame on screen.
+type Shown = (u64, u16, u16);
+
 /// A screen after the first (VMs with several): drawn from its own VNC
 /// session; its pointer goes through the first screen's session.
 struct Head {
@@ -373,7 +376,7 @@ impl Screen {
             }
         });
 
-        self.watch(&self.picture, 0);
+        self.watch(&self.picture);
 
         // F11 while the focus is in this tab (local scope) and the screen
         // shows; never under a dialog.
@@ -405,14 +408,14 @@ impl Screen {
         self.root.add_controller(shortcuts);
     }
 
-    /// Input on screen `head`'s picture goes to the guest. A click or
+    /// Input on a screen's picture goes to the guest. A click or
     /// fullscreen hands the guest the keyboard; focus elsewhere takes it
     /// back.
-    fn watch(self: &Rc<Self>, picture: &gtk::Picture, head: usize) {
+    fn watch(self: &Rc<Self>, picture: &gtk::Picture) {
         let input = gtk::EventControllerLegacy::new();
         let s = Rc::downgrade(self);
         input.connect_event(move |c, event| match s.upgrade() {
-            Some(s) => s.input(event, head, c.widget().as_ref()),
+            Some(s) => s.input(event, c.widget().as_ref()),
             None => glib::Propagation::Proceed,
         });
         picture.add_controller(input);
@@ -491,7 +494,7 @@ impl Screen {
         let picture = new_picture(&format!("Screen {} of {title}", i + 2));
         self.set_fit(&picture, self.actual_size.is_active());
         self.pictures.append(&picture);
-        self.watch(&picture, i + 1);
+        self.watch(&picture);
         self.heads.borrow_mut().push(Head {
             picture,
             session: None,
@@ -786,12 +789,7 @@ impl Screen {
     }
 
     /// Keys while grabbed, the pointer and the wheel, for the guest.
-    fn input(
-        &self,
-        event: &gdk::Event,
-        head: usize,
-        picture: Option<&gtk::Widget>,
-    ) -> glib::Propagation {
+    fn input(&self, event: &gdk::Event, picture: Option<&gtk::Widget>) -> glib::Propagation {
         use gdk::EventType as T;
         if !self.input_allowed() {
             return glib::Propagation::Proceed;
@@ -835,15 +833,17 @@ impl Screen {
                 let bit = event
                     .downcast_ref::<gdk::ButtonEvent>()
                     .and_then(|b| model::button_bit(b.button()));
-                let (Some(bit), Some((x, y, inside))) = (bit, self.point(event, head)) else {
+                let (Some(bit), Some((x, y, inside))) = (bit, self.point(event)) else {
                     return glib::Propagation::Proceed;
                 };
                 let press = kind == T::ButtonPress;
                 if press {
-                    self.grab(Some(event));
+                    // Focus first: moving it from another screen's picture
+                    // ungrabs, so the grab comes after.
                     if let Some(picture) = picture {
                         picture.grab_focus();
                     }
+                    self.grab(Some(event));
                     // A click on the letterbox only focuses.
                     if !inside {
                         return glib::Propagation::Stop;
@@ -856,7 +856,7 @@ impl Screen {
                 glib::Propagation::Stop
             }
             T::MotionNotify => {
-                if let Some((x, y, inside)) = self.point(event, head) {
+                if let Some((x, y, inside)) = self.point(event) {
                     let input = self.mouse.borrow_mut().moved(x, y, inside);
                     if let Some(input) = input {
                         self.send(input);
@@ -887,10 +887,11 @@ impl Screen {
         }
     }
 
-    /// The pixel of screen 1's framebuffer to send for a pointer event on
-    /// screen `head`, and whether it is on a screen rather than the
-    /// letterbox.
-    fn point(&self, event: &gdk::Event, head: usize) -> Option<(u16, u16, bool)> {
+    /// The pixel of screen 1's framebuffer to send for a pointer event,
+    /// and whether it is on a screen rather than the letterbox. The screen
+    /// is the picture under the pointer, or the nearest one: a drag can
+    /// cross from one screen to the next.
+    fn point(&self, event: &gdk::Event) -> Option<(u16, u16, bool)> {
         let first = self.shown.get()?;
         let heads = self.heads.borrow();
         // A screen not drawn yet counts as screen 1's size.
@@ -901,24 +902,31 @@ impl Screen {
                     .map(|h| h.shown.map_or((first.1, first.2), |s| (s.1, s.2))),
             )
             .collect();
-        let (picture, (_, w, h)) = match head {
-            0 => (&self.picture, first),
-            n => {
-                let h = heads.get(n - 1)?;
-                (&h.picture, h.shown?)
-            }
-        };
+        let pictures: Vec<(&gtk::Picture, Option<Shown>)> =
+            std::iter::once((&self.picture, Some(first)))
+                .chain(heads.iter().map(|h| (&h.picture, h.shown)))
+                .collect();
         // Events carry surface coordinates.
         let (ex, ey) = event.position()?;
-        let native = picture.native()?;
+        let native = self.pictures.native()?;
         let (sx, sy) = native.surface_transform();
         let p = native.compute_point(
-            picture,
+            &self.pictures,
             &gtk::graphene::Point::new((ex - sx) as f32, (ey - sy) as f32),
         )?;
+        let bounds: Vec<_> = pictures
+            .iter()
+            .map(|(pic, _)| pic.compute_bounds(&self.pictures))
+            .collect::<Option<_>>()?;
+        let head = bounds
+            .iter()
+            .position(|b| p.x() < b.x() + b.width())
+            .unwrap_or(bounds.len() - 1);
+        let (picture, (_, w, h)) = (pictures[head].0, pictures[head].1?);
         let widget = (f64::from(picture.width()), f64::from(picture.height()));
         let place = model::placement(widget, (w, h), !self.actual_size.is_active());
-        let (x, y, inside) = model::to_guest(place, (w, h), p.x().into(), p.y().into());
+        let (x, y) = (p.x() - bounds[head].x(), p.y() - bounds[head].y());
+        let (x, y, inside) = model::to_guest(place, (w, h), x.into(), y.into());
         let (x, y) = model::pointer_on_first(&sizes, head, x, y);
         Some((x, y, inside))
     }
