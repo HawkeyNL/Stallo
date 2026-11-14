@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import select
+import signal
 import sys
 import time
 
@@ -191,29 +192,33 @@ class Desktop:
         self.hung = set()
         try:
             with open(self.current) as f:
-                pid = f.read().strip()
+                app = f.read().strip()
             os.unlink(self.current)
-            if pid.isdigit():
+            if app.replace(":", "").isdigit():
                 with open(self.hung_file, "a") as f:
-                    f.write(pid + "\n")
+                    f.write(app + "\n")
         except OSError:
             pass
         try:
             with open(self.hung_file) as f:
-                self.hung = {int(p) for p in f.read().split() if p.isdigit()}
+                self.hung = set(f.read().split())
         except OSError:
             pass
 
     def busy(self, pid):
-        """Notes the app being read (None: none)."""
+        """Notes the app being read (None or 0: none)."""
         try:
-            if pid is None:
+            if not pid:
                 os.unlink(self.current)
             else:
                 with open(self.current, "w") as f:
-                    f.write("%d\n" % pid)
+                    f.write(app_id(pid) + "\n")
         except OSError:
             pass
+
+    def skipped(self, pid):
+        """Whether the app `pid` hung a helper before."""
+        return bool(pid) and app_id(pid) in self.hung
 
     def idle(self):
         """Handles pending bus messages, so nothing piles up while idle."""
@@ -301,19 +306,18 @@ class Desktop:
             if time.monotonic() > deadline or len(windows) >= 64:
                 partial = True
                 break
+            # Nothing is blamed for a hang before the app's pid is known.
+            self.busy(None)
             try:
                 app = desktop.get_child_at_index(i)
                 pid = self.pid(app)
-                if pid in self.hung:
+                if self.skipped(pid):
                     partial = True  # it hung a helper before
                     continue
                 self.busy(pid)
-                # Fresh names and states. (A cache mask of NONE hangs
-                # libatspi 2.60 on a futex at the first get_name.)
-                try:
-                    app.clear_cache()
-                except Exception:
-                    pass  # an older libatspi: names may be a walk old
+                # The cache stays as libatspi keeps it (events update it
+                # while idle): a cache mask of NONE hangs libatspi 2.60 on a
+                # futex at the first get_name.
                 app_name = (app.get_name() or "")[:APP_MAX + 1]
                 tops, _ = self.children(app, 64, deadline)
             except Exception:
@@ -411,7 +415,24 @@ class Desktop:
             raise LookupError("unknown element; call ui_tree")
         return found
 
+    def acting(self, fn, key):
+        """fn(key), with the control's app noted while it runs."""
+        self.busy(self.find(key)[2])
+        try:
+            return fn(key)
+        finally:
+            self.busy(None)
+
     def probe(self, key):
+        return self.acting(self._probe, key)
+
+    def focus(self, key):
+        return self.acting(self._focus, key)
+
+    def invoke(self, key):
+        return self.acting(self._invoke, key)
+
+    def _probe(self, key):
         acc, window, pid = self.find(key)
         bbox = self.extents(acc)
         screen = self.screen([self.extents(window)])
@@ -456,7 +477,7 @@ class Desktop:
                     return True
         return False
 
-    def focus(self, key):
+    def _focus(self, key):
         """Focuses `key`, and checks keys would reach it: on Wayland a
         control in an inactive window can take focus while typed keys go
         to the active window."""
@@ -468,7 +489,7 @@ class Desktop:
         if not self.has(acc)("focused"):
             raise RuntimeError("the control did not take focus")
 
-    def invoke(self, key):
+    def _invoke(self, key):
         acc, _, _ = self.find(key)
         n = acc.get_n_actions()
         if n <= 0:
@@ -477,6 +498,15 @@ class Desktop:
         index = next((i for i, a in enumerate(names) if a in INVOKE_NAMES), 0)
         if not acc.do_action(index):
             raise RuntimeError("the action failed")
+
+
+def app_id(pid):
+    """`pid:start time`, so that a reused pid is another app."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return "%d:%s" % (pid, f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError):
+        return str(pid)
 
 
 def wayland():
@@ -630,6 +660,8 @@ class FakeAcc:
         return self.role
 
     def get_name(self):
+        if self.hangs:
+            raise SystemExit("hung")  # as the watchdog ends a helper
         return self.name
 
     def get_state_set(self):
@@ -646,10 +678,6 @@ class FakeAcc:
 
     def get_parent(self):
         return self.parent
-
-    def clear_cache(self):
-        if self.hangs:
-            raise SystemExit("hung")
 
     def get_extents(self, coord):
         if self.box is None:
@@ -703,6 +731,7 @@ class FakeAtspi:
 
 
 def fake_desktop_test():
+    import shutil
     import tempfile
 
     tmp = tempfile.mkdtemp()
@@ -778,9 +807,19 @@ def fake_desktop_test():
     tree = Desktop(FakeAtspi(root), state_dir=tmp).tree()
     assert [w["title"] for w in tree["windows"]] == ["Fine"] and tree["partial"]
     assert not os.path.exists(os.path.join(tmp, "stallo-ui.current"))
+    # A reused pid is another app; pid 0 (unknown) is never blamed.
+    assert app_id(os.getpid()) != app_id(1) and ":" in app_id(os.getpid())
+    d = Desktop(FakeAtspi(root), state_dir=tmp)
+    d.busy(0)
+    assert not os.path.exists(os.path.join(tmp, "stallo-ui.current")) and not d.skipped(0)
+    shutil.rmtree(tmp)
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         self_test()
     else:
-        serve(Desktop())
+        desktop = Desktop()
+        # A helper stopped on purpose (restart, reinstall) blames no app;
+        # one stuck in C code gets SIGKILL and leaves its note.
+        signal.signal(signal.SIGTERM, lambda *_: (desktop.busy(None), sys.exit(0)))
+        serve(desktop)

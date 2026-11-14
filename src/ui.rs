@@ -523,7 +523,7 @@ impl Session {
             head += &format!("; screen {w}x{h}");
         }
         if tree.partial {
-            head += "; partial (helper limit hit: use find)";
+            head += "; partial (a helper limit hit or an app skipped: use find)";
         }
         if tree.coords != Coords::Screen {
             head += "; no screen coordinates (click works by invoke; double/right/scroll by id unavailable)";
@@ -1796,7 +1796,7 @@ e8 window \"Terminal\" (gnome-terminal)
         ));
         let mut v = small();
         v["partial"] = json!(true);
-        assert!(head(v).ends_with("; partial (helper limit hit: use find)"));
+        assert!(head(v).ends_with("; partial (a helper limit hit or an app skipped: use find)"));
 
         let mut v = small();
         v["windows"] = json!([]);
