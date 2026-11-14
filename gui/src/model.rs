@@ -2244,6 +2244,26 @@ pub fn partial_redraw(shown: Option<(u64, u16, u16)>, serial: u64, size: (u16, u
 pub const RELEASE_HINT: &str = "Ctrl+Alt+Esc releases the keyboard";
 pub const GRAB_HINT: &str = "Click the screen to use it";
 
+/// How long the daemon may take to type a pasted text.
+pub const PASTE_LIMIT: Duration = Duration::from_secs(60);
+
+/// The clipboard text to type into the VM: Windows line ends become
+/// newlines and trailing ones go, so a paste never presses Enter at its
+/// end. Errors never quote the text: it may be a password.
+pub fn paste_text(text: &str) -> Result<String, &'static str> {
+    let text = text.replace("\r\n", "\n");
+    let text = text.trim_end_matches('\n');
+    if text.is_empty() {
+        return Err("The clipboard has no text");
+    }
+    if stallo::input::text_keys(text).is_err() {
+        return Err(
+            "Only plain text can be pasted: ASCII letters, digits and symbols, Tab and line breaks, up to 1024 characters",
+        );
+    }
+    Ok(text.to_owned())
+}
+
 /// X keysyms the window looks for or sends.
 const XK_ESCAPE: u32 = 0xff1b;
 const XK_CONTROL_L: u32 = 0xffe3;
@@ -4972,6 +4992,17 @@ mod tests {
         assert_eq!(d.progress(), "3.0 GiB so far");
         assert_eq!(d.done_text("dev"), "syslog copied from dev");
         assert_eq!(d.cancelled(), "Download cancelled");
+    }
+
+    #[test]
+    fn paste() {
+        assert_eq!(paste_text("s3cret!\r\n").unwrap(), "s3cret!");
+        assert_eq!(paste_text("a\r\nb\tc\n\n").unwrap(), "a\nb\tc");
+        assert_eq!(paste_text("\n"), Err("The clipboard has no text"));
+        for bad in ["pässword", &"x".repeat(1025)] {
+            let e = paste_text(bad).unwrap_err();
+            assert!(e.starts_with("Only plain text") && !e.contains("ä"), "{e}");
+        }
     }
 
     #[test]

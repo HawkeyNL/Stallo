@@ -181,6 +181,15 @@ pub async fn file(socket: &Path, request: Request) -> Result<serde_json::Value, 
     send(socket, request, model::FILE_LIMIT).await
 }
 
+/// Types `text` into the VM's keyboard (`type_text`).
+pub async fn type_text(
+    socket: &Path,
+    name: String,
+    text: String,
+) -> Result<serde_json::Value, CallError> {
+    send(socket, Request::TypeText { name, text }, model::PASTE_LIMIT).await
+}
+
 /// The time limit of an ISO import: the daemon's own, and its answer.
 const IMPORT_LIMIT: Duration = Duration::from_secs(IMPORT_TOTAL.as_secs() + 60);
 

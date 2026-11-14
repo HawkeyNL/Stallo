@@ -50,6 +50,7 @@ pub struct Screen {
     picture: gtk::Picture,
     hint: gtk::Label,
     ctrl_alt_del: gtk::Button,
+    paste: gtk::Button,
     view_only: gtk::ToggleButton,
     actual_size: gtk::ToggleButton,
     /// Fullscreen only, above the guest: whose screen this is, and the
@@ -182,6 +183,11 @@ impl Screen {
             .label("Ctrl+Alt+Del")
             .tooltip_text("Send Ctrl+Alt+Del")
             .build();
+        let paste = gtk::Button::builder()
+            .icon_name("edit-paste-symbolic")
+            .tooltip_text("Paste: type the clipboard text into the VM")
+            .build();
+        paste.update_property(&[gtk::accessible::Property::Label("Paste")]);
         let hint = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .build();
@@ -202,6 +208,7 @@ impl Screen {
         fullscreen.update_property(&[gtk::accessible::Property::Label("Fullscreen")]);
         let bar = gtk::ActionBar::new();
         bar.pack_start(&ctrl_alt_del);
+        bar.pack_start(&paste);
         bar.set_center_widget(Some(&hint));
         bar.pack_end(&fullscreen);
         bar.pack_end(&actual_size);
@@ -233,6 +240,7 @@ impl Screen {
             picture,
             hint,
             ctrl_alt_del,
+            paste,
             view_only,
             actual_size,
             strip,
@@ -281,6 +289,22 @@ impl Screen {
                     s.send(input);
                 }
             }
+        });
+        let s = weak();
+        self.paste.connect_clicked(move |b| {
+            let s = s.clone();
+            let clipboard = b.clipboard();
+            glib::spawn_future_local(async move {
+                // Read only on a click, never kept or logged.
+                let text = clipboard.read_text_future().await.ok().flatten();
+                let Some(s) = s.upgrade().filter(|s| s.input_allowed()) else {
+                    return;
+                };
+                let Some(v) = s.vms.upgrade() else {
+                    return;
+                };
+                v.paste(&s.name, model::paste_text(text.as_deref().unwrap_or("")));
+            });
         });
         let s = weak();
         self.view_only.connect_toggled(move |_| {
@@ -577,6 +601,7 @@ impl Screen {
         self.strip_hint.set_visible(grabbed);
         self.release.set_visible(grabbed);
         self.ctrl_alt_del.set_sensitive(allowed);
+        self.paste.set_sensitive(allowed);
         self.banner
             .set_revealed(self.view_only.is_active() && self.agent.get() == Some(true));
     }
