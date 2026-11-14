@@ -4999,7 +4999,7 @@ mod tests {
         assert_eq!(paste_text("\n"), Err("The clipboard has no text"));
         for bad in ["pässword", &"x".repeat(1025)] {
             let e = paste_text(bad).unwrap_err();
-            assert!(e.starts_with("Only plain text") && !e.contains("ä"), "{e}");
+            assert!(e.starts_with("Only plain ASCII") && !e.contains("ä"), "{e}");
         }
     }
 
