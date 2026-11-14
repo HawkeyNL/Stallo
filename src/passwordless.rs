@@ -10,6 +10,8 @@
 pub const SUDOERS: &str = "/etc/sudoers.d/90-stallo-passwordless";
 pub const SUDOERS_TMP: &str = "/etc/sudoers.d/.stallo-passwordless";
 pub const POLKIT_RULE: &str = "/etc/polkit-1/rules.d/49-stallo-passwordless.rules";
+/// Written first, then moved: polkitd reads only `*.rules`.
+pub const POLKIT_TMP: &str = "/etc/polkit-1/rules.d/.stallo-passwordless.tmp";
 /// No lock screen and no blank screen (a blank screen shows agents
 /// nothing); a user's own settings still win.
 pub const SCREEN_DEFAULTS: (&str, &str) = (
@@ -28,6 +30,8 @@ const GDM_KEYS: [&str; 5] = [
     "TimedLoginDelay",
 ];
 const MARK: &str = "# Stallo: passwordless login (stallo set <vm> --passwordless off)";
+/// Before an owner's own login key while Stallo's block is in place.
+const SAVED: &str = "#stallo-saved# ";
 
 /// The sudoers line for `user` (a name checked by `validate_guest_user`).
 pub fn sudoers(user: &str) -> String {
@@ -42,44 +46,55 @@ pub fn polkit_rule(user: &str) -> String {
 }
 
 /// GDM's `custom.conf` with automatic login (at boot) and timed login
-/// (after a log out) for `user`, or with neither (`None`). Other lines stay
-/// as they are; the keys this sets are replaced in `[daemon]`.
+/// (after a log out) for `user`, or as it was before (`None`). Login keys
+/// the owner set in `[daemon]` are commented out while Stallo's block is
+/// there, and come back when it goes.
 pub fn gdm_conf(conf: &str, user: Option<&str>) -> String {
-    let ours = |line: &str| {
-        let line = line.trim();
-        line == MARK
-            || line
-                .split_once('=')
-                .is_some_and(|(key, _)| GDM_KEYS.contains(&key.trim()))
+    let login_key = |line: &str| {
+        line.split_once('=')
+            .is_some_and(|(key, _)| GDM_KEYS.contains(&key.trim()))
     };
-    let lines = user.map(|u| {
-        format!(
-            "{MARK}\nAutomaticLoginEnable=true\nAutomaticLogin={u}\nTimedLoginEnable=true\nTimedLogin={u}\nTimedLoginDelay={TIMED_LOGIN_DELAY}\n"
-        )
-    });
-    let mut out = String::with_capacity(conf.len() + 256);
-    let mut section = String::new();
-    let mut placed = false;
+    // The file without Stallo: its block dropped, saved lines restored.
+    let mut lines = Vec::new();
+    let mut block = false;
     for line in conf.lines() {
+        if line.trim() == MARK {
+            block = true;
+            continue;
+        }
+        if block && login_key(line) {
+            continue;
+        }
+        block = false;
+        lines.push(line.strip_prefix(SAVED).unwrap_or(line));
+    }
+    let Some(user) = user else {
+        return lines.iter().map(|l| format!("{l}\n")).collect();
+    };
+    let ours = format!(
+        "{MARK}\nAutomaticLoginEnable=true\nAutomaticLogin={user}\nTimedLoginEnable=true\nTimedLogin={user}\nTimedLoginDelay={TIMED_LOGIN_DELAY}\n"
+    );
+    let mut out = String::with_capacity(conf.len() + 256);
+    let mut section = "";
+    let mut placed = false;
+    for line in lines {
         let t = line.trim();
         if t.starts_with('[') {
-            section = t.to_owned();
+            section = t;
         }
-        if section == "[daemon]" && ours(line) {
-            continue;
+        if section == "[daemon]" && !t.starts_with('#') && login_key(line) {
+            out.push_str(SAVED);
         }
         out.push_str(line);
         out.push('\n');
         if t == "[daemon]" && !placed {
-            if let Some(lines) = &lines {
-                out.push_str(lines);
-            }
+            out.push_str(&ours);
             placed = true;
         }
     }
-    if let (Some(lines), false) = (&lines, placed) {
+    if !placed {
         out.push_str("\n[daemon]\n");
-        out.push_str(lines);
+        out.push_str(&ours);
     }
     out
 }
@@ -120,11 +135,17 @@ mod tests {
         assert!(other.contains("AutomaticLogin=bob\n") && !other.contains("gus-ai"));
         // Off: back to the original.
         assert_eq!(gdm_conf(&on, None), UBUNTU);
-        // Keys the owner set by hand in [daemon] are replaced, not doubled;
-        // the same keys elsewhere stay.
+        // Keys the owner set by hand in [daemon] are kept, commented out,
+        // and come back with off; the same keys elsewhere stay as they are.
         let hand =
             "[daemon]\nAutomaticLoginEnable = True\nAutomaticLogin=old\n[other]\nTimedLogin=x\n";
-        assert_eq!(gdm_conf(hand, None), "[daemon]\n[other]\nTimedLogin=x\n");
+        let on = gdm_conf(hand, Some("a"));
+        assert!(
+            on.contains("#stallo-saved# AutomaticLogin=old\n")
+                && on.ends_with("[other]\nTimedLogin=x\n")
+        );
+        assert_eq!(gdm_conf(&on, Some("a")), on);
+        assert_eq!(gdm_conf(&on, None), hand);
         // No [daemon] section: one is added.
         assert!(gdm_conf("[security]\n", Some("a")).ends_with("\n[daemon]\n# Stallo: passwordless login (stallo set <vm> --passwordless off)\nAutomaticLoginEnable=true\nAutomaticLogin=a\nTimedLoginEnable=true\nTimedLogin=a\nTimedLoginDelay=5\n"));
         assert_eq!(gdm_conf("", None), "");
@@ -140,6 +161,8 @@ mod tests {
         // sudo skips names with a dot: the unchecked file is never read.
         assert!(SUDOERS_TMP.rsplit('/').next().unwrap().contains('.'));
         assert!(!SUDOERS.rsplit('/').next().unwrap().contains('.'));
+        // polkitd reads only *.rules.
+        assert!(POLKIT_RULE.ends_with(".rules") && !POLKIT_TMP.ends_with(".rules"));
         assert!(SCREEN_DEFAULTS.1.contains("lock-enabled=false"));
     }
 }

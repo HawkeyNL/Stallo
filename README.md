@@ -332,18 +332,9 @@ agent in the guest, which Stallo does not install:
   again. Anyone at the VM's console is then root too. Agents with agent
   control can already run commands as root (`exec` with `admin`), so
   this adds no power inside the guest. GNOME's keyring may still ask for
-  the password when an app uses it.
-- To let an agent use sudo in a terminal, admin dialogs and the login
-  screen without ever being given a password:
-  `stallo set desk --passwordless on` (the VM running, with its guest
-  agent). The guest user then needs no password for sudo (a sudoers
-  drop-in, checked with `visudo`) or polkit, GDM logs it in at boot and
-  again after a log out, and the screen neither locks nor blanks. No
-  password is stored anywhere; `--passwordless off` asks for passwords
-  again. Anyone at the VM's console is then root too. Agents with agent
-  control can already run commands as root (`exec` with `admin`), so
-  this adds no power inside the guest. GNOME's keyring may still ask for
-  the password when an app uses it.
+  the password when an app uses it, and polkit before 0.106 (Ubuntu
+  22.04 and older) ignores the rule. If the command stops half way, run
+  it again.
 - Fedora: SELinux confines the guest agent (`virt_qemu_ga_t`) and refuses
   what `exec` needs. Make only that domain permissive, as Stallo does for
   its Fedora cloud image:

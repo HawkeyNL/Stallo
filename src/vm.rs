@@ -1603,54 +1603,67 @@ impl Manager {
                 .await?;
             guest_ok(run(&["chmod", mode, path]).await?, "chmod")
         };
-        if on {
-            ensure!(
-                run(&["id", "-u", &user]).await?.exit_code == 0,
-                "the guest user {user:?} does not exist in {name}; name yours with `stallo set {name} --guest-user NAME`"
-            );
-            write(pw::SUDOERS_TMP, &pw::sudoers(&user), "0440").await?;
-            guest_ok(run(&["visudo", "-cf", pw::SUDOERS_TMP]).await?, "visudo")?;
-            guest_ok(
-                run(&["mv", "-f", pw::SUDOERS_TMP, pw::SUDOERS]).await?,
-                "mv",
-            )?;
-            guest_ok(
-                run(&["mkdir", "-p", "/etc/polkit-1/rules.d"]).await?,
-                "mkdir",
-            )?;
-            write(pw::POLKIT_RULE, &pw::polkit_rule(&user), "0644").await?;
-            write(pw::SCREEN_DEFAULTS.0, pw::SCREEN_DEFAULTS.1, "0644").await?;
-        } else {
-            let files = [
-                pw::SUDOERS,
-                pw::SUDOERS_TMP,
-                pw::POLKIT_RULE,
-                pw::SCREEN_DEFAULTS.0,
-            ];
-            guest_ok(run(&[&["rm", "-f"][..], &files].concat()).await?, "rm")?;
-        }
-        // Best effort: a guest without GLib's tools has no GNOME screen
-        // settings to change.
-        run(&["glib-compile-schemas", ui::SCHEMAS_DIR]).await?;
-        // The login screen, if it is GDM's.
-        let mut gdm = None;
-        for conf in pw::GDM_CONFS {
-            if run(&["test", "-f", conf]).await?.exit_code != 0 {
-                continue;
+        ensure!(
+            !on || run(&["id", "-u", &user]).await?.exit_code == 0,
+            "the guest user {user:?} does not exist in {name}; name yours with `stallo set {name} --guest-user NAME`"
+        );
+        // Every step can run again, so a stop half way is fixed by
+        // running the same command again.
+        let gdm = async {
+            if on {
+                write(pw::SUDOERS_TMP, &pw::sudoers(&user), "0440").await?;
+                guest_ok(run(&["visudo", "-cf", pw::SUDOERS_TMP]).await?, "visudo")?;
+                guest_ok(
+                    run(&["mv", "-f", pw::SUDOERS_TMP, pw::SUDOERS]).await?,
+                    "mv",
+                )?;
+                guest_ok(
+                    run(&["mkdir", "-p", "/etc/polkit-1/rules.d"]).await?,
+                    "mkdir",
+                )?;
+                // polkitd reloads on any change: never a half-written rule.
+                write(pw::POLKIT_TMP, &pw::polkit_rule(&user), "0644").await?;
+                guest_ok(
+                    run(&["mv", "-f", pw::POLKIT_TMP, pw::POLKIT_RULE]).await?,
+                    "mv",
+                )?;
+                write(pw::SCREEN_DEFAULTS.0, pw::SCREEN_DEFAULTS.1, "0644").await?;
+            } else {
+                let files = [
+                    pw::SUDOERS,
+                    pw::SUDOERS_TMP,
+                    pw::POLKIT_RULE,
+                    pw::POLKIT_TMP,
+                    pw::SCREEN_DEFAULTS.0,
+                ];
+                guest_ok(run(&[&["rm", "-f"][..], &files].concat()).await?, "rm")?;
             }
-            let (old, more) = self.file_read(name, conf, 0, 64 << 10, true).await?;
-            ensure!(!more, "{conf} in {name} is over 64 KiB; edit it by hand");
-            let old = String::from_utf8(old).with_context(|| format!("{conf} is not UTF-8"))?;
-            let new = pw::gdm_conf(&old, on.then_some(user.as_str()));
-            if new != old {
-                // Replaced whole: a cut-off write never leaves half a file.
-                let tmp = format!("{conf}.stallo-new");
-                write(&tmp, &new, "0644").await?;
-                guest_ok(run(&["mv", "-f", &tmp, conf]).await?, "mv")?;
+            // Best effort: a guest without GLib's tools has no GNOME screen
+            // settings to change.
+            run(&["glib-compile-schemas", ui::SCHEMAS_DIR]).await?;
+            // The login screen, if it is GDM's.
+            let mut gdm = None;
+            for conf in pw::GDM_CONFS {
+                if run(&["test", "-f", conf]).await?.exit_code != 0 {
+                    continue;
+                }
+                let (old, more) = self.file_read(name, conf, 0, 64 << 10, true).await?;
+                ensure!(!more, "{conf} in {name} is over 64 KiB; edit it by hand");
+                let old = String::from_utf8(old).with_context(|| format!("{conf} is not UTF-8"))?;
+                let new = pw::gdm_conf(&old, on.then_some(user.as_str()));
+                if new != old {
+                    // Replaced whole: a cut-off write never leaves half a file.
+                    let tmp = format!("{conf}.stallo-new");
+                    write(&tmp, &new, "0644").await?;
+                    guest_ok(run(&["mv", "-f", &tmp, conf]).await?, "mv")?;
+                }
+                gdm = Some(conf);
+                break;
             }
-            gdm = Some(conf);
-            break;
+            Ok::<_, anyhow::Error>(gdm)
         }
+        .await
+        .context("passwordless is only partly applied; run the same command again")?;
         Ok(match (on, gdm) {
             (true, Some(_)) => format!(
                 "{name}: {user} needs no password for sudo, admin dialogs or login (automatic at boot, after {}s on the login screen after a log out); no lock screen. Log out and in, or restart the guest, for all of it to apply",
