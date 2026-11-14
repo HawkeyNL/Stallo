@@ -1242,6 +1242,7 @@ mod tests {
             forwards: vec![],
             vnc: true,
             ui: false,
+            guest_user: None,
             cdrom: None,
             machine: crate::images::Os::Windows,
         }

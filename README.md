@@ -315,10 +315,12 @@ agent in the guest, which Stallo does not install:
   `--net internet` (production mode) the VM is offline: if neither the
   installed system nor its ISO holds the package, it cannot be installed.
 - Without `--admin`, Stallo runs commands and file copies as the guest
-  user `agent`. Create that user with a locked password, or use
-  `--admin` (root) for every call:
-  `sudo useradd -m -s /bin/bash agent && sudo passwd -l agent`. The
-  account shows on the login screen, but nobody can log in to it.
+  user `agent`. Name the account you made at install instead
+  (`stallo set desk --guest-user alice`; its group must have the same
+  name, the default on Ubuntu and Fedora), create `agent` with a locked
+  password (`sudo useradd -m -s /bin/bash agent && sudo passwd -l
+  agent`; it shows on the login screen, but nobody can log in to it), or
+  use `--admin` (root) for every call. Agents act as that user too.
 - Fedora: SELinux confines the guest agent (`virt_qemu_ga_t`) and refuses
   what `exec` needs. Make only that domain permissive, as Stallo does for
   its Fedora cloud image:

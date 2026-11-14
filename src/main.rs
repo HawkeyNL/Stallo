@@ -183,6 +183,10 @@ enum Cmd {
         /// (`eject`), or put a pulled ISO in it (its image id).
         #[arg(long, value_name = "eject|ISO", group = "change")]
         cdrom: Option<String>,
+        /// The guest account that exec and cp run as without --admin
+        /// (default: agent); applies to the next call.
+        #[arg(long, value_name = "USER", group = "change")]
+        guest_user: Option<String>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
@@ -574,6 +578,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             net,
             ui,
             cdrom,
+            guest_user,
         } => {
             // First, so a running VM is refused before VNC changes.
             let resources = if cpus.is_some() || mem.is_some() {
@@ -685,6 +690,32 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 cdrom_result = Some(v);
             }
+            let mut user_result = None;
+            if let Some(user) = guest_user {
+                let v = call(Request::SetGuestUser {
+                    name: vm.clone(),
+                    user: Some(user.clone()),
+                })
+                .await
+                .map_err(|e| {
+                    match (
+                        &resources,
+                        &net_result,
+                        &ui_result,
+                        &vnc_result,
+                        &cdrom_result,
+                    ) {
+                        (None, None, None, None, None) => e,
+                        _ => e.context(format!(
+                            "the other changes of {vm} were applied, the guest user was not"
+                        )),
+                    }
+                })?;
+                if !json {
+                    println!("{vm}  guest user {user}");
+                }
+                user_result = Some(v);
+            }
             if json {
                 print_json(&serde_json::json!({
                     "resources": resources,
@@ -692,6 +723,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "ui": ui_result,
                     "vnc": vnc_result,
                     "cdrom": cdrom_result,
+                    "guest_user": user_result,
                 }));
             }
         }
