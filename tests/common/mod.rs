@@ -409,12 +409,15 @@ fn check_argv_max(argv: &[String], max_memory_mib: u64) {
         assert!(after(name).is_empty(), "VM must have no {name}: {argv:?}");
     }
     // A Unix socket path and nothing else: no options after it (a comma
-    // that is not doubled), no websocket, no VNC display.
+    // that is not doubled) but the screen it shows, no websocket.
     for vnc in after("-vnc") {
+        let path = vnc.replace(",,", "");
+        let path = match path.rsplit_once(",display=video") {
+            Some((path, n)) if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() => path,
+            _ => &path,
+        };
         assert!(
-            vnc.starts_with("unix:")
-                && !vnc.replace(",,", "").contains(',')
-                && !vnc.contains("websocket"),
+            path.starts_with("unix:") && !path.contains(',') && !path.contains("websocket"),
             "VNC only on a plain Unix socket: {argv:?}"
         );
     }

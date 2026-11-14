@@ -490,11 +490,17 @@ async fn dispatch(
             let (addresses, disk_used_bytes) = m.details(&name).await?;
             // The live socket: it exists only while the VM runs with VNC.
             let vnc_socket = Some(m.paths.vnc_socket(&name)).filter(|s| s.exists());
+            let mut vnc_sockets = m.paths.vnc_sockets(&name, stallo::config::MAX_SCREENS);
+            vnc_sockets.retain(|s| s.exists());
+            if vnc_sockets.len() < 2 {
+                vnc_sockets.clear();
+            }
             json!(api::VmDetails {
                 vm,
                 addresses,
                 disk_used_bytes,
                 vnc_socket,
+                vnc_sockets,
             })
         }
         Request::Reset { name } => {
@@ -624,6 +630,10 @@ async fn dispatch(
             let cfg = m.set_guest_user(&name, user.as_deref()).await?;
             json!(info(m, &cfg).await)
         }
+        Request::SetScreens { name, screens } => {
+            let (cfg, note) = m.set_screens(&name, screens).await?;
+            json!({"vm": info(m, &cfg).await, "note": note})
+        }
         Request::SetUi { name, on } => {
             let cfg = m.set_ui(&name, on).await?;
             json!(info(m, &cfg).await)
@@ -713,6 +723,15 @@ fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
     if let Some(stable) = stable {
         v["stable"] = stable.into();
     }
+    if !shot.more.is_empty() {
+        v["more"] = shot
+            .more
+            .into_iter()
+            .map(|(png, width, height)| {
+                json!({"png_base64": BASE64.encode(png), "width": width, "height": height})
+            })
+            .collect();
+    }
     v
 }
 
@@ -735,6 +754,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         ui: cfg.ui,
         guest_agent,
         guest_user: cfg.guest_user.clone(),
+        screens: cfg.screens,
         image: Some(cfg.image.clone()),
         cdrom: cfg.cdrom.clone(),
     }

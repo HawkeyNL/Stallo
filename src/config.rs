@@ -140,6 +140,10 @@ pub struct VmConfig {
     /// run as; `None` is `agent`, the user the seed makes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_user: Option<String>,
+    /// Guest monitors (1 to [`MAX_SCREENS`]), from the next start: one
+    /// `virtio-gpu-pci` each when more than one, else `bochs-display`.
+    #[serde(default = "one_screen", skip_serializing_if = "is_one_screen")]
+    pub screens: u8,
     /// The installer ISO (catalog id) in the CD-ROM drive of a VM made from
     /// an ISO. Such a VM has the drive and no seed; `None` leaves the drive
     /// empty.
@@ -162,6 +166,16 @@ pub struct PortForward {
 
 /// Most port forwards per VM.
 pub const MAX_FORWARDS: usize = 16;
+/// The most guest monitors a VM can have.
+pub const MAX_SCREENS: u8 = 3;
+
+fn one_screen() -> u8 {
+    1
+}
+
+fn is_one_screen(n: &u8) -> bool {
+    *n == 1
+}
 /// Forwarded host ports must be above 1024, away from system services.
 pub const MIN_HOST_PORT: u16 = 1025;
 
@@ -203,6 +217,10 @@ impl VmConfig {
         if let Some(user) = &self.guest_user {
             validate_guest_user(user)?;
         }
+        ensure!(
+            (1..=MAX_SCREENS).contains(&self.screens),
+            "screens must be between 1 and {MAX_SCREENS}"
+        );
         if let Some(source) = &self.throwaway_of {
             validate_name(source)?;
             ensure!(*source != self.name, "a VM cannot overlay itself");
@@ -440,6 +458,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn screens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = vm();
+        let dir = tmp.path().join(&cfg.name);
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(cfg.screens, 1);
+        cfg.save(&dir).unwrap();
+        // One screen writes no key, so older daemons read the file.
+        let text = std::fs::read_to_string(dir.join(VmConfig::FILE)).unwrap();
+        assert!(!text.contains("screens"), "{text}");
+        cfg.screens = 3;
+        cfg.save(&dir).unwrap();
+        assert_eq!(VmConfig::load(&dir).unwrap().screens, 3);
+        for n in [0, 4] {
+            cfg.screens = n;
+            assert!(cfg.validate().is_err(), "{n}");
+        }
+    }
+
+    #[test]
     fn guest_users() {
         for ok in ["agent", "gus-ai", "_svc", "a1"] {
             validate_guest_user(ok).unwrap();
@@ -513,6 +551,7 @@ mod tests {
             vnc: false,
             ui: false,
             guest_user: None,
+            screens: 1,
             cdrom: None,
             machine: Os::Linux,
         }

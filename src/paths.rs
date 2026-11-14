@@ -114,6 +114,15 @@ impl Paths {
     pub fn vnc_socket(&self, name: &str) -> PathBuf {
         self.vnc_root().join(name).join(crate::qemu::VNC_SOCK)
     }
+
+    /// The VNC socket of each of `screens` guest screens: `vnc.sock`, then
+    /// `vnc-2.sock` and `vnc-3.sock`.
+    pub fn vnc_sockets(&self, name: &str, screens: u8) -> Vec<PathBuf> {
+        let first = self.vnc_socket(name);
+        (0..screens)
+            .map(|i| crate::qemu::head_socket(&first, i))
+            .collect()
+    }
 }
 
 /// The production daemon's socket when it is there (and this user may

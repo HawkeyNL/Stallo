@@ -249,6 +249,12 @@ pub enum Request {
         name: String,
         on: bool,
     },
+    /// Sets a stopped ISO VM's number of guest screens, from its next
+    /// start (humans only).
+    SetScreens {
+        name: String,
+        screens: u8,
+    },
     /// Adds or removes a stopped VM's UI channel (humans only).
     SetUi {
         name: String,
@@ -345,6 +351,9 @@ pub struct VmInfo {
     /// The guest account for calls without `admin`, if not `agent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_user: Option<String>,
+    /// Guest screens (an older stallod does not send it: 1).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub screens: u8,
     /// The image the VM was made from (an older stallod does not send it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -367,6 +376,18 @@ pub struct VmDetails {
     /// differ until the next start).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vnc_socket: Option<std::path::PathBuf>,
+    /// With more than one screen: every screen's VNC socket, screen 1
+    /// first (`vnc_socket` is screen 1's).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vnc_sockets: Vec<std::path::PathBuf>,
+}
+
+fn one() -> u8 {
+    1
+}
+
+fn is_one(n: &u8) -> bool {
+    *n == 1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +417,19 @@ pub struct ScreenResult {
     /// `wait_for_screen` only: whether the screen settled in time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,
+    /// Screens 2 and up, left to right after this one (screen 1). Pointer
+    /// coordinates span all screens: screen 2 starts at x = screen 1's
+    /// width.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more: Vec<ScreenPart>,
+}
+
+/// One more guest screen of a [`ScreenResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenPart {
+    pub png_base64: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Part of a guest file.
@@ -479,6 +513,7 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | SetVnc { .. }
         // A guest-visible device that voids RAM snapshots, as SetNet.
         | SetUi { .. }
+        | SetScreens { .. }
         // Software that runs in the user's session: a human's choice.
         | UiInstall { .. }
         // Which guest account agents act as is a human's choice.
@@ -775,6 +810,13 @@ mod tests {
             agent_gate(&Request::SetGuestUser {
                 name: name(),
                 user: Some("gus".into())
+            }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::SetScreens {
+                name: name(),
+                screens: 2
             }),
             Gate::Closed
         );

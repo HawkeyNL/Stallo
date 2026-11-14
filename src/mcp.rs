@@ -155,15 +155,36 @@ fn image_result(result: anyhow::Result<serde_json::Value>) -> CallToolResult {
         Err(e) => return error(e),
     };
     let mut text = format!("{}x{}", shot.width, shot.height);
+    if !shot.more.is_empty() {
+        // One image per screen; x counts across them.
+        let n = shot.more.len() + 1;
+        text = format!("screen 1 of {n}: {text} at x 0");
+        let mut x = shot.width;
+        for (i, s) in shot.more.iter().enumerate() {
+            text.push_str(&format!(
+                "; screen {}: {}x{} at x {x}",
+                i + 2,
+                s.width,
+                s.height
+            ));
+            x += s.width;
+        }
+        text.push_str(&format!(
+            "; pointer x and y are on the whole desktop, 0-{} wide (screens left to right)",
+            x - 1
+        ));
+    }
     match shot.stable {
         Some(true) => text.push_str(", stable"),
         Some(false) => text.push_str(", still changing (timed out)"),
         None => {}
     }
-    CallToolResult::success(vec![
-        ContentBlock::image(shot.png_base64, "image/png"),
-        ContentBlock::text(text),
-    ])
+    let mut blocks = vec![ContentBlock::image(shot.png_base64, "image/png")];
+    for s in shot.more {
+        blocks.push(ContentBlock::image(s.png_base64, "image/png"));
+    }
+    blocks.push(ContentBlock::text(text));
+    CallToolResult::success(blocks)
 }
 
 /// Most bytes `file_write` takes in one call (sent in appended chunks).
@@ -305,7 +326,7 @@ struct StopArgs {
 struct PointArgs {
     /// VM name.
     vm: String,
-    /// Pixel column in the last screenshot.
+    /// Pixel column in the last screenshot; with several screens, across them (screen 2 starts at screen 1's width).
     x: u32,
     /// Pixel row in the last screenshot.
     y: u32,
@@ -324,7 +345,7 @@ enum ButtonArg {
 struct ClickArgs {
     /// VM name.
     vm: String,
-    /// Pixel column in the last screenshot.
+    /// Pixel column in the last screenshot; with several screens, across them (screen 2 starts at screen 1's width).
     x: u32,
     /// Pixel row in the last screenshot.
     y: u32,
@@ -341,11 +362,11 @@ struct ClickArgs {
 struct DragArgs {
     /// VM name.
     vm: String,
-    /// Start: pixel column in the last screenshot.
+    /// Start: pixel column in the last screenshot (across all screens).
     from_x: u32,
     /// Start: pixel row in the last screenshot.
     from_y: u32,
-    /// End: pixel column in the last screenshot.
+    /// End: pixel column in the last screenshot (across all screens).
     to_x: u32,
     /// End: pixel row in the last screenshot.
     to_y: u32,
@@ -356,7 +377,7 @@ struct DragArgs {
 struct ScrollArgs {
     /// VM name.
     vm: String,
-    /// Pixel column in the last screenshot.
+    /// Pixel column in the last screenshot; with several screens, across them (screen 2 starts at screen 1's width).
     x: u32,
     /// Pixel row in the last screenshot.
     y: u32,
@@ -1088,6 +1109,26 @@ mod tests {
             got.push(env.request);
         }
         (r[1].clone(), got)
+    }
+
+    /// Several screens: one image each, and where each starts.
+    #[test]
+    fn screens_as_images() {
+        let r = image_result(Ok(
+            json!({"png_base64": "AA==", "width": 1280, "height": 800,
+            "more": [{"png_base64": "AQ==", "width": 1920, "height": 1080}]}),
+        ));
+        let r = serde_json::to_value(r).unwrap();
+        let c = r["content"].as_array().unwrap();
+        assert_eq!(c.len(), 3);
+        assert_eq!(
+            (c[0]["data"].as_str(), c[1]["data"].as_str()),
+            (Some("AA=="), Some("AQ=="))
+        );
+        assert_eq!(
+            c[2]["text"],
+            "screen 1 of 2: 1280x800 at x 0; screen 2: 1920x1080 at x 1280; pointer x and y are on the whole desktop, 0-3199 wide (screens left to right)"
+        );
     }
 
     #[tokio::test]

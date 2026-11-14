@@ -111,6 +111,9 @@ pub struct Screenshot {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Screens 2 and up as (PNG, width, height), left to right after this
+    /// one; empty with one screen. Pointer coordinates span them all.
+    pub more: Vec<(Vec<u8>, u32, u32)>,
 }
 
 /// What a new VM looks like.
@@ -475,6 +478,7 @@ impl Manager {
             vnc: new.vnc || iso,
             ui: iso,
             guest_user: None,
+            screens: 1,
             cdrom: iso.then(|| new.image.clone()),
             machine: images::image_os(&self.paths, &new.image)?,
         };
@@ -860,18 +864,26 @@ impl Manager {
         // QEMU created the VNC socket before it answered QMP; it carries
         // QEMU's umask, so open it to API users here.
         if cfg.vnc {
-            let sock = self.paths.vnc_socket(name);
             let mode = fs::Permissions::from_mode(self.shared_modes().1);
-            // chmod follows symlinks: only ever touch QEMU's own socket.
-            let shared = match fs::symlink_metadata(&sock) {
-                Ok(m) if m.file_type().is_socket() => fs::set_permissions(&sock, mode),
-                Ok(_) => Err(std::io::Error::other("not a socket")),
-                Err(e) => Err(e),
-            };
+            // chmod follows symlinks: only ever touch QEMU's own sockets.
+            let shared = self
+                .paths
+                .vnc_sockets(name, cfg.screens)
+                .iter()
+                .try_for_each(|sock| {
+                    match fs::symlink_metadata(sock) {
+                        Ok(m) if m.file_type().is_socket() => {
+                            fs::set_permissions(sock, mode.clone())
+                        }
+                        Ok(_) => Err(std::io::Error::other("not a socket")),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| anyhow::Error::from(e).context(format!("{}", sock.display())))
+                });
             if let Err(e) = shared {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                return Err(anyhow::Error::from(e).context("cannot share the VNC socket"));
+                return Err(e.context("cannot share the VNC socket"));
             }
         }
         // passt checks its arguments at once; by the time QMP answers, a
@@ -980,7 +992,8 @@ impl Manager {
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
             boot_key_task: Mutex::new(None),
-            screen_size: Mutex::new(qemu::SCREEN),
+            // The desktop until the first screenshot: screens side by side.
+            screen_size: Mutex::new((qemu::SCREEN.0 * u32::from(cfg.screens), qemu::SCREEN.1)),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
             qemu_log,
@@ -1220,6 +1233,49 @@ impl Manager {
         Ok(cfg)
     }
 
+    /// Sets a stopped ISO VM's guest screens (1 to `MAX_SCREENS`), from
+    /// its next start. Guarded as `set_net`: a RAM snapshot only loads into
+    /// the same display devices. Returns the config and, for Windows, a
+    /// note on the driver screens 2+ need.
+    pub async fn set_screens(&self, name: &str, screens: u8) -> Result<(VmConfig, Option<String>)> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        ensure!(
+            self.running(name).is_none(),
+            "{name} is running; stop it first to change its screens: stallo stop {name}"
+        );
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        // Back to one screen is always allowed.
+        ensure!(
+            screens == 1
+                || images::is_iso(&cfg.image).with_context(|| format!(
+                    "{name} is made from an image this build does not know"
+                ))?,
+            "{name} is made from cloud image {}, which has no desktop; more screens are for VMs installed from an ISO",
+            cfg.image
+        );
+        let note = (cfg.machine == images::Os::Windows && screens > 1).then(|| {
+            "screens 2 and up need the virtio-win display driver (viogpudo) in the guest".to_owned()
+        });
+        if cfg.screens == screens {
+            return Ok((cfg, note));
+        }
+        cfg.screens = screens;
+        cfg.validate()?;
+        let ram = self.ram_snapshots(name).await?;
+        ensure!(
+            ram.is_empty(),
+            "{name} has RAM snapshots ({}) that only restore with its current screens; delete them first: stallo snap {name} --delete <name>",
+            ram.join(", ")
+        );
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok((cfg, note))
+    }
+
     /// Adds or removes a stopped VM's UI channel (see [`VmConfig::ui`]).
     /// Refused while the VM has RAM snapshots: their device state holds
     /// the port (or its absence), so they only restore with it as it is.
@@ -1291,7 +1347,11 @@ impl Manager {
         } else {
             tpm::MEMORY_MIB
         };
-        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt + swtpm
+        let screens = match cfg.screens {
+            1 => 0,
+            n => u64::from(n) * qemu::SCREEN_HOSTMEM_MIB,
+        };
+        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt + swtpm + screens
     }
 
     /// QEMU creates the QMP socket shortly after start.
@@ -1839,7 +1899,7 @@ impl Manager {
         // The returned PNG is taken after the screen settled; on a screen
         // that keeps changing it can differ from the last compared frame.
         let vm = self.running_vm(name)?;
-        let settled = settle(|| vm.screendump("screen.ppm", "ppm"), stable, limit).await?;
+        let settled = settle(|| vm.dump_all(), stable, limit).await?;
         Ok((vm.screenshot().await?, settled))
     }
 
@@ -2163,14 +2223,46 @@ impl Running {
         pressed.and(released)
     }
 
+    /// Every screen. The pointer then spans the desktop they make: side
+    /// by side, left to right, top-aligned (the guest's default layout).
     async fn screenshot(&self) -> Result<Screenshot> {
-        let png = self.screendump("screen.png", "png").await?;
-        let (width, height) = input::png_size(&png)?;
-        *self.screen_size.lock().unwrap() = (width, height);
-        Ok(Screenshot { png, width, height })
+        let mut shots = Vec::new();
+        for head in 0..self.config.screens {
+            let png = self.screendump("screen.png", "png", head).await?;
+            let (w, h) = input::png_size(&png)?;
+            shots.push((png, w, h));
+        }
+        // Base64 in one response: stay well under the client's limit.
+        let bytes: usize = shots.iter().map(|s| s.0.len()).sum();
+        ensure!(
+            bytes <= crate::api::MAX_RESPONSE / 2,
+            "the screens are too large for one screenshot ({} MiB of PNG)",
+            bytes >> 20
+        );
+        let desktop = shots.iter().fold((0, 0), |(w, h), s| (w + s.1, h.max(s.2)));
+        *self.screen_size.lock().unwrap() = desktop;
+        let mut shots = shots.into_iter();
+        let (png, width, height) = shots.next().context("no screen")?;
+        Ok(Screenshot {
+            png,
+            width,
+            height,
+            more: shots.collect(),
+        })
     }
 
-    /// Absolute pointer events for pixel (`x`, `y`) of the last screenshot.
+    /// Every screen's raw frame, one after the other: for telling whether
+    /// anything changed.
+    async fn dump_all(&self) -> Result<Vec<u8>> {
+        let mut all = Vec::new();
+        for head in 0..self.config.screens {
+            all.extend(self.screendump("screen.ppm", "ppm", head).await?);
+        }
+        Ok(all)
+    }
+
+    /// Absolute pointer events for pixel (`x`, `y`) of the last screenshot,
+    /// on the desktop of all screens.
     fn move_events(&self, x: u32, y: u32) -> Result<Vec<Value>> {
         pointer_events(x, y, *self.screen_size.lock().unwrap())
     }
@@ -2206,16 +2298,19 @@ impl Running {
         pressed.and(released)
     }
 
-    /// Has QEMU write the screen to `<rt>/<file>` and reads it back.
-    async fn screendump(&self, file: &str, format: &str) -> Result<Vec<u8>> {
+    /// Has QEMU write screen `head` (0-based) to `<rt>/<file>` and reads
+    /// it back.
+    async fn screendump(&self, file: &str, format: &str, head: u8) -> Result<Vec<u8>> {
         let _screen = self.screen_lock.lock().await;
         let _slot = SCREENS.acquire().await?;
         let path = self.rt_dir.join(file);
+        let mut args = serde_json::json!({"filename": path, "format": format});
+        // One screen: no device, as before.
+        if self.config.screens > 1 {
+            args["device"] = format!("video{head}").into();
+        }
         self.qmp
-            .execute(
-                "screendump",
-                Some(serde_json::json!({"filename": path, "format": format})),
-            )
+            .execute("screendump", Some(args))
             .await
             .context("cannot take a screenshot")?;
         // Off the async workers: a read of up to MAX_SCREEN_BYTES.
@@ -2954,6 +3049,7 @@ mod tests {
                 vnc: false,
                 ui: false,
                 guest_user: None,
+                screens: 1,
                 cdrom: None,
                 machine: images::Os::Linux,
             },
@@ -3704,7 +3800,18 @@ mod tests {
             .insert("win".into(), Arc::new(running));
         let e = err(m.set_net("win", Offline).await);
         assert!(e.contains("win is running; stop it first"), "{e}");
+        let e = err(m.set_screens("win", 2).await.map(|r| r.0));
+        assert!(e.contains("win is running; stop it first"), "{e}");
         m.running.lock().unwrap().clear();
+        assert_eq!(m.load("win").unwrap(), win, "nothing saved");
+
+        // Screens: the same guards, 1 to 3, a driver note for Windows.
+        let e = err(m.set_screens("dev", 2).await.map(|r| r.0));
+        assert!(e.contains("which has no desktop"), "{e}");
+        let e = err(m.set_screens("run-0a1b2c3d", 2).await.map(|r| r.0));
+        assert!(e.contains("clone"), "{e}");
+        let e = err(m.set_screens("win", 4).await.map(|r| r.0));
+        assert!(e.contains("screens must be between 1 and 3"), "{e}");
         assert_eq!(m.load("win").unwrap(), win, "nothing saved");
 
         // Below: snapshots are listed with a confined qemu-img.
@@ -3740,6 +3847,13 @@ mod tests {
             }
         );
         assert_eq!(m.load("win").unwrap(), cfg, "vm.toml round-trip");
+        // Screens too, once snapshots can be listed: 2 with a driver note
+        // for Windows, and back.
+        let (cfg, note) = m.set_screens("win", 2).await.unwrap();
+        assert_eq!(cfg.screens, 2);
+        assert!(note.unwrap().contains("viogpudo"));
+        let (cfg, note) = m.set_screens("win", 1).await.unwrap();
+        assert_eq!((cfg.screens, note), (1, None));
     }
 
     /// `ui_tree`: only for a VM started with the UI channel; a helper
