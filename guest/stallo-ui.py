@@ -171,9 +171,10 @@ class Desktop:
             from gi.repository import Atspi as atspi
 
             atspi.init()
-            # Per call to an app, in ms, and while an app starts (default
-            # 15 s): a slow app costs a partial tree, not a stuck helper.
-            atspi.set_timeout(1000, 3000)
+            # Per call to an app, in ms (the default), and while an app
+            # starts (default 15 s): a slow app costs a partial tree, not a
+            # stuck helper.
+            atspi.set_timeout(800, 3000)
             from gi.repository import GLib
 
             self.context = GLib.MainContext.default()
@@ -324,7 +325,7 @@ class Desktop:
                     stack.extend((k, depth + 1, secret) for k in reversed(kids))
         return {
             "screen": self.screen(bounds),
-            "coords": "window" if os.environ.get("WAYLAND_DISPLAY") else "screen",
+            "coords": "window" if wayland() else "screen",
             "partial": partial,
             "windows": windows,
             "nodes": nodes,
@@ -434,6 +435,15 @@ class Desktop:
         index = next((i for i, a in enumerate(names) if a in INVOKE_NAMES), 0)
         if not acc.do_action(index):
             raise RuntimeError("the action failed")
+
+
+def wayland():
+    """A Wayland session, also when the service manager lacks the
+    session's WAYLAND_DISPLAY."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    run = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.exists(os.path.join(run, "wayland-0"))
 
 
 def guarded(fn, *args):
