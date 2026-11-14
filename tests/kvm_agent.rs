@@ -107,7 +107,8 @@ fn agent_drives_the_console() {
     d.ok(&["agent", "dev", "on"]);
     let row = d.ok(&["ls"]);
     let row = row.lines().find(|l| l.starts_with("dev ")).unwrap();
-    assert!(row.ends_with(" on"), "{row}");
+    let cols: Vec<_> = row.split_whitespace().collect();
+    assert_eq!(cols[cols.len() - 3], "on", "{row}");
     for r in [
         Request::SetAgent {
             name: "dev".into(),

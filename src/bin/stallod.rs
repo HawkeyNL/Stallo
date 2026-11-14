@@ -713,9 +713,9 @@ fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
 
 /// A VM as `ls` shows it; the state comes from QEMU when it runs.
 async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
-    let state = match m.running(&cfg.name) {
-        None => "stopped".to_owned(),
-        Some(vm) => vm.state().await,
+    let (state, guest_agent) = match m.running(&cfg.name) {
+        None => ("stopped".to_owned(), None),
+        Some(vm) => tokio::join!(vm.state(), vm.agent_port_open()),
     };
     VmInfo {
         name: cfg.name.clone(),
@@ -728,6 +728,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         agent_control: cfg.agent_control,
         vnc: cfg.vnc,
         ui: cfg.ui,
+        guest_agent,
         image: Some(cfg.image.clone()),
         cdrom: cfg.cdrom.clone(),
     }

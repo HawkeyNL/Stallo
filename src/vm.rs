@@ -1341,9 +1341,15 @@ impl Manager {
                 delay = (delay * 2).min(Duration::from_secs(1));
             }
         };
-        tokio::time::timeout(limit, poll)
-            .await
-            .map_err(|_| anyhow::anyhow!("{name}: guest agent not ready after {limit:?}"))?
+        match tokio::time::timeout(limit, poll).await {
+            Ok(ready) => ready,
+            Err(_) => {
+                if let Some(vm) = self.running(name) {
+                    vm.no_agent().await?;
+                }
+                bail!("{name}: guest agent not ready after {limit:?}")
+            }
+        }
     }
 
     /// Powers the VM off: ACPI power button, then `quit` after
@@ -2094,9 +2100,15 @@ impl Running {
         .await;
         match ready {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                drop(agent);
+                self.no_agent().await?;
+                return Err(e);
+            }
             Err(_) => {
                 *agent = None;
+                drop(agent);
+                self.no_agent().await?;
                 bail!("guest agent did not answer within {connect:?}");
             }
         }
@@ -2106,6 +2118,31 @@ impl Running {
             *agent = None;
         }
         result
+    }
+
+    /// Whether the guest has its end of the guest-agent port open, as QEMU
+    /// reports it; `None` if QEMU does not say.
+    pub async fn agent_port_open(&self) -> Option<bool> {
+        let v = self
+            .qmp
+            .execute_timeout("query-chardev", None, Duration::from_secs(1))
+            .await
+            .ok()?;
+        v.as_array()?
+            .iter()
+            .find(|c| c["label"] == qemu::QGA_CHARDEV)?["frontend-open"]
+            .as_bool()
+    }
+
+    /// Fails with what to do if no guest agent has the port open, after
+    /// the agent did not answer.
+    pub(crate) async fn no_agent(&self) -> Result<()> {
+        ensure!(
+            self.agent_port_open().await != Some(false),
+            "no guest agent in {}: it may still be booting, or qemu-guest-agent is not installed or not running (Debian/Ubuntu: sudo apt install qemu-guest-agent; Fedora: sudo dnf install qemu-guest-agent)",
+            self.config.name
+        );
+        Ok(())
     }
 
     /// Runs `op` on the UI helper's connection, made first if needed. A
@@ -2695,6 +2732,11 @@ mod tests {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 let reply = match req["execute"].as_str().unwrap() {
                     "query-status" => serde_json::json!({"return": {"status": status}}),
+                    // No guest agent opened its port.
+                    "query-chardev" => serde_json::json!({"return": [
+                        {"label": "qmp", "filename": "unix:", "frontend-open": true},
+                        {"label": "qga0", "filename": "unix:", "frontend-open": false}
+                    ]}),
                     "input-send-event" => {
                         events += 1;
                         seen.lock()
@@ -2970,6 +3012,28 @@ mod tests {
         vm.ping().await.unwrap();
         vm.ping().await.unwrap();
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn no_guest_agent_says_what_to_install() {
+        let (_d, vm, _) = fake_vm("running", None).await;
+        assert_eq!(vm.agent_port_open().await, Some(false));
+        let e = vm.ping().await.unwrap_err().to_string();
+        assert!(
+            e.starts_with("no guest agent in dev:") && e.contains("apt install qemu-guest-agent"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_ready_says_what_to_install() {
+        let (_t, _d, m, _) = ui_manager(|_, _| vec![]).await;
+        let e = m
+            .wait_ready("dev", Duration::from_millis(300))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("no guest agent in dev:"), "{e}");
     }
 
     #[tokio::test]

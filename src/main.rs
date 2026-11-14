@@ -1141,12 +1141,12 @@ fn print_table(vms: &[VmInfo]) {
         return;
     }
     println!(
-        "{:<20} {:<12} {:>4} {:>9} {:>6}  {:<8} AGENT",
-        "NAME", "STATE", "CPUS", "MEMORY", "DISK", "NET"
+        "{:<20} {:<12} {:>4} {:>9} {:>6}  {:<8} {:<5} {:<3} GA",
+        "NAME", "STATE", "CPUS", "MEMORY", "DISK", "NET", "AGENT", "UI"
     );
     for vm in vms {
         println!(
-            "{:<20} {:<12} {:>4} {:>9} {:>5}G  {:<8} {}",
+            "{:<20} {:<12} {:>4} {:>9} {:>5}G  {:<8} {:<5} {:<3} {}",
             vm.name,
             vm.state,
             vm.vcpus,
@@ -1156,7 +1156,13 @@ fn print_table(vms: &[VmInfo]) {
                 .unwrap()
                 .as_str()
                 .unwrap_or("?"),
-            if vm.agent_control { "on" } else { "off" }
+            if vm.agent_control { "on" } else { "off" },
+            if vm.ui { "on" } else { "off" },
+            match vm.guest_agent {
+                Some(true) => "up",
+                Some(false) => "none",
+                None => "-",
+            }
         );
     }
 }
