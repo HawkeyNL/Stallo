@@ -150,6 +150,7 @@ impl Manager {
             forwards: vec![],
             vnc: false,
             ui: false,
+            screens: 1,
             ..src.clone()
         }
         .save(&to)
@@ -199,6 +200,7 @@ mod tests {
             vnc: false,
             ui: false,
             guest_user: None,
+            screens: 1,
             cdrom: None,
             machine: Os::Linux,
         }

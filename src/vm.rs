@@ -475,6 +475,7 @@ impl Manager {
             vnc: new.vnc || iso,
             ui: iso,
             guest_user: None,
+            screens: 1,
             cdrom: iso.then(|| new.image.clone()),
             machine: images::image_os(&self.paths, &new.image)?,
         };
@@ -860,14 +861,17 @@ impl Manager {
         // QEMU created the VNC socket before it answered QMP; it carries
         // QEMU's umask, so open it to API users here.
         if cfg.vnc {
-            let sock = self.paths.vnc_socket(name);
             let mode = fs::Permissions::from_mode(self.shared_modes().1);
-            // chmod follows symlinks: only ever touch QEMU's own socket.
-            let shared = match fs::symlink_metadata(&sock) {
-                Ok(m) if m.file_type().is_socket() => fs::set_permissions(&sock, mode),
-                Ok(_) => Err(std::io::Error::other("not a socket")),
-                Err(e) => Err(e),
-            };
+            // chmod follows symlinks: only ever touch QEMU's own sockets.
+            let shared = self
+                .paths
+                .vnc_sockets(name, cfg.screens)
+                .iter()
+                .try_for_each(|sock| match fs::symlink_metadata(sock) {
+                    Ok(m) if m.file_type().is_socket() => fs::set_permissions(sock, mode.clone()),
+                    Ok(_) => Err(std::io::Error::other("not a socket")),
+                    Err(e) => Err(e),
+                });
             if let Err(e) = shared {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -1220,6 +1224,47 @@ impl Manager {
         Ok(cfg)
     }
 
+    /// Sets a stopped ISO VM's guest screens (1 to `MAX_SCREENS`), from
+    /// its next start. Guarded as `set_net`: a RAM snapshot only loads into
+    /// the same display devices. Returns the config and, for Windows, a
+    /// note on the driver screens 2+ need.
+    pub async fn set_screens(&self, name: &str, screens: u8) -> Result<(VmConfig, Option<String>)> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        ensure!(
+            self.running(name).is_none(),
+            "{name} is running; stop it first to change its screens: stallo stop {name}"
+        );
+        let mut cfg = self.load(name)?;
+        ensure!(
+            cfg.throwaway_of.is_none(),
+            "{name} is a `stallo run` clone; change the VM it was made from"
+        );
+        ensure!(
+            images::is_iso(&cfg.image).with_context(|| format!(
+                "{name} is made from an image this build does not know"
+            ))?,
+            "{name} is made from cloud image {}, which has no desktop; more screens are for VMs installed from an ISO",
+            cfg.image
+        );
+        let note = (cfg.machine == images::Os::Windows && screens > 1).then(|| {
+            "screens 2 and up need the virtio-win display driver (viogpudo) in the guest".to_owned()
+        });
+        if cfg.screens == screens {
+            return Ok((cfg, note));
+        }
+        cfg.screens = screens;
+        cfg.validate()?;
+        let ram = self.ram_snapshots(name).await?;
+        ensure!(
+            ram.is_empty(),
+            "{name} has RAM snapshots ({}) that only restore with its current screens; delete them first: stallo snap {name} --delete <name>",
+            ram.join(", ")
+        );
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok((cfg, note))
+    }
+
     /// Adds or removes a stopped VM's UI channel (see [`VmConfig::ui`]).
     /// Refused while the VM has RAM snapshots: their device state holds
     /// the port (or its absence), so they only restore with it as it is.
@@ -1291,7 +1336,11 @@ impl Manager {
         } else {
             tpm::MEMORY_MIB
         };
-        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt + swtpm
+        let screens = match cfg.screens {
+            1 => 0,
+            n => u64::from(n) * qemu::SCREEN_HOSTMEM_MIB,
+        };
+        overhead_mib(self.config.host.qemu_overhead_mib, cfg.memory_mib) + passt + swtpm + screens
     }
 
     /// QEMU creates the QMP socket shortly after start.
@@ -2954,6 +3003,7 @@ mod tests {
                 vnc: false,
                 ui: false,
                 guest_user: None,
+                screens: 1,
                 cdrom: None,
                 machine: images::Os::Linux,
             },
@@ -3704,7 +3754,18 @@ mod tests {
             .insert("win".into(), Arc::new(running));
         let e = err(m.set_net("win", Offline).await);
         assert!(e.contains("win is running; stop it first"), "{e}");
+        let e = err(m.set_screens("win", 2).await.map(|r| r.0));
+        assert!(e.contains("win is running; stop it first"), "{e}");
         m.running.lock().unwrap().clear();
+        assert_eq!(m.load("win").unwrap(), win, "nothing saved");
+
+        // Screens: the same guards, 1 to 3, a driver note for Windows.
+        let e = err(m.set_screens("dev", 2).await.map(|r| r.0));
+        assert!(e.contains("which has no desktop"), "{e}");
+        let e = err(m.set_screens("run-0a1b2c3d", 2).await.map(|r| r.0));
+        assert!(e.contains("clone"), "{e}");
+        let e = err(m.set_screens("win", 4).await.map(|r| r.0));
+        assert!(e.contains("screens must be between 1 and 3"), "{e}");
         assert_eq!(m.load("win").unwrap(), win, "nothing saved");
 
         // Below: snapshots are listed with a confined qemu-img.
@@ -3740,6 +3801,13 @@ mod tests {
             }
         );
         assert_eq!(m.load("win").unwrap(), cfg, "vm.toml round-trip");
+        // Screens too, once snapshots can be listed: 2 with a driver note
+        // for Windows, and back.
+        let (cfg, note) = m.set_screens("win", 2).await.unwrap();
+        assert_eq!(cfg.screens, 2);
+        assert!(note.unwrap().contains("viogpudo"));
+        let (cfg, note) = m.set_screens("win", 1).await.unwrap();
+        assert_eq!((cfg.screens, note), (1, None));
     }
 
     /// `ui_tree`: only for a VM started with the UI channel; a helper

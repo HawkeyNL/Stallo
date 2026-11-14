@@ -5,7 +5,7 @@
 //! and no network device unless a profile adds one.
 
 use std::os::fd::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -45,6 +45,17 @@ pub const UI_SOCK: &str = "ui.sock";
 pub const UI_PORT: &str = "org.stallo.ui.0";
 pub const UI_CHARDEV: &str = "ui0";
 pub const VNC_SOCK: &str = "vnc.sock";
+/// Host memory QEMU may use for one screen's guest buffers
+/// (`virtio-gpu-pci,max_hostmem`); counted in the VM's memory limit.
+pub const SCREEN_HOSTMEM_MIB: u64 = 64;
+
+/// The VNC socket of screen `head` (0-based) next to screen 1's `first`.
+pub fn head_socket(first: &Path, head: u8) -> PathBuf {
+    match head {
+        0 => first.to_owned(),
+        n => first.with_file_name(format!("vnc-{}.sock", n + 1)),
+    }
+}
 /// Screendumps; created by the daemon, written by QEMU.
 pub const SCREEN_FILES: [&str; 2] = ["screen.png", "screen.ppm"];
 
@@ -113,10 +124,18 @@ pub fn argv(
         "vnc {} with socket {vnc:?}",
         vm.vnc
     );
-    // A Unix socket only: VNC has no usable authentication.
-    let vnc = vnc
-        .map(|p| Ok::<_, anyhow::Error>(format!("-vnc unix:{}", opt_path(p)?)))
-        .transpose()?;
+    // A Unix socket only: VNC has no usable authentication. With several
+    // screens, one server per screen.
+    let vnc = match vnc {
+        None => vec![],
+        Some(p) if vm.screens == 1 => vec![format!("-vnc unix:{}", opt_path(p)?)],
+        Some(p) => (0..vm.screens)
+            .map(|i| {
+                let sock = opt_path(&head_socket(p, i))?;
+                Ok(format!("-vnc unix:{sock},display=video{i}"))
+            })
+            .collect::<Result<_>>()?,
+    };
     // The SMBIOS systemd credentials below tune the boot of the cloud
     // guests Stallo sets up. A guest installed from an ISO is the user's
     // own system: it gets none.
@@ -239,10 +258,22 @@ pub fn argv(
         "-blockdev driver=qcow2,node-name=disk0,file=disk0-file,discard=unmap".into(),
         format!("-device {disk_dev},bootindex=1,werror=stop,rerror=stop"),
     ];
+    // No legacy VGA, and a USB controller only for Windows, which has no
+    // virtio-input driver: less emulated hardware. Several screens take one
+    // single-output virtio-gpu each: every screen is on from boot, and
+    // Windows' driver drives one output per adapter. No virgl or blob
+    // resources; guest buffers are capped per device.
+    let display: Vec<String> = match vm.screens {
+        1 => vec![format!("-device bochs-display,edid=on,xres={w},yres={h}")],
+        n => (0..n)
+            .map(|i| {
+                format!(
+                    "-device virtio-gpu-pci,id=video{i},max_outputs=1,edid=on,xres={w},yres={h},max_hostmem={SCREEN_HOSTMEM_MIB}M"
+                )
+            })
+            .collect(),
+    };
     let devices = [
-        // No legacy VGA, and a USB controller only for Windows, which has
-        // no virtio-input driver: less emulated hardware.
-        format!("-device bochs-display,edid=on,xres={w},yres={h}"),
         pointer.into(),
         format!("-chardev socket,id=qmp,path={qmp},server=on,wait=off"),
         "-mon chardev=qmp,mode=control".into(),
@@ -267,6 +298,7 @@ pub fn argv(
         .iter()
         .chain(&rtc)
         .chain(&media)
+        .chain(&display)
         .chain(&devices)
         .chain(&ui)
         .chain(&tpm)
@@ -355,6 +387,7 @@ mod tests {
             vnc: false,
             ui: false,
             guest_user: None,
+            screens: 1,
             cdrom: None,
             machine: Os::Linux,
         }
@@ -600,6 +633,64 @@ mod tests {
             !a.iter()
                 .any(|x| x == "-vnc" || x.contains("tcp:") || x.contains("host="))
         );
+    }
+
+    /// Several screens: one capped virtio-gpu and one VNC server per
+    /// screen in place of bochs-display and the single server; nothing
+    /// else changes. Never virgl, blob, legacy VGA or QXL.
+    #[test]
+    fn golden_screens() {
+        let sock = Path::new("/r/vnc/dev/vnc.sock");
+        let run = |vm: &VmConfig, media| {
+            let tpm = (vm.machine == Os::Windows).then_some(9);
+            argv(
+                vm,
+                Path::new("/d"),
+                Path::new("/r"),
+                None,
+                tpm,
+                Some(sock),
+                Agent::Manual,
+                media,
+            )
+            .unwrap()
+            .join(" ")
+        };
+        let iso = Media::Cdrom(None);
+        for base in [VmConfig { vnc: true, ..vm() }, windows()] {
+            let one = run(&base, iso);
+            let bochs = "-device bochs-display,edid=on,xres=1280,yres=800";
+            assert!(one.contains(bochs) && one.ends_with("-vnc unix:/r/vnc/dev/vnc.sock"));
+            for n in [2u8, 3] {
+                let more = run(
+                    &VmConfig {
+                        screens: n,
+                        ..base.clone()
+                    },
+                    iso,
+                );
+                let gpus: Vec<String> = (0..n)
+                    .map(|i| format!("-device virtio-gpu-pci,id=video{i},max_outputs=1,edid=on,xres=1280,yres=800,max_hostmem=64M"))
+                    .collect();
+                let vnc: Vec<String> = (0..n)
+                    .map(|i| {
+                        let name = if i == 0 {
+                            "vnc.sock".to_owned()
+                        } else {
+                            format!("vnc-{}.sock", i + 1)
+                        };
+                        format!("-vnc unix:/r/vnc/dev/{name},display=video{i}")
+                    })
+                    .collect();
+                let expect = one
+                    .replace(bochs, &gpus.join(" "))
+                    .replace("-vnc unix:/r/vnc/dev/vnc.sock", &vnc.join(" "));
+                assert_eq!(more, expect);
+                for bad in ["virgl", "blob", "virtio-vga", "qxl", "tcp:", "host="] {
+                    assert!(!more.contains(bad), "{bad}");
+                }
+            }
+        }
     }
 
     #[test]

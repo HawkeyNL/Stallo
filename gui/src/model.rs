@@ -2938,6 +2938,7 @@ mod tests {
             ui: false,
             guest_agent: None,
             guest_user: None,
+            screens: 1,
             image: None,
             cdrom: None,
         }
@@ -3278,6 +3279,7 @@ mod tests {
             addresses,
             disk_used_bytes: 3 << 29,
             vnc_socket: None,
+            vnc_sockets: vec![],
         };
         let f = facts(
             &web,
@@ -3801,6 +3803,7 @@ mod tests {
             addresses: None,
             disk_used_bytes: 0,
             vnc_socket: socket.map(PathBuf::from),
+            vnc_sockets: vec![],
         }
     }
 

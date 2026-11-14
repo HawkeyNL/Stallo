@@ -256,6 +256,31 @@ ssh -N -L 127.0.0.1:5901:/run/stallo/vnc/<vm>/vnc.sock <host>
 VNC input bypasses agent control and the audit log, so only humans can
 turn it on. `stallo set <vm> --vnc off` removes it at the next start.
 
+### Multiple screens
+
+A VM made from an installer ISO can have 2 or 3 monitors, for example to
+test an app that uses two screens:
+
+```sh
+stallo stop desk
+stallo set desk --screens 2
+stallo start desk
+```
+
+The guest sees one display adapter per screen (`virtio-gpu-pci`), so
+every screen is on from boot and the desktop extends across them.
+Stallo assumes the guest keeps its default layout: screens side by
+side, left to right, screen 1 first (GNOME does this). If you rearrange
+the monitors in the guest's settings, clicks on screens 2 and 3 land in
+the wrong place. Each screen has its own VNC socket: `vnc.sock` for
+screen 1, then `vnc-2.sock` and `vnc-3.sock` in the same directory.
+
+Like a network change, it needs the VM stopped and no RAM snapshots
+(they hold the display devices). A Windows guest needs the virtio-win
+display driver (viogpudo) for screens 2 and 3. Each extra screen lets
+the guest use up to 64 MiB of host memory for its buffers, which counts
+towards the VM's memory limit.
+
 ## Install a desktop from an ISO
 
 An installer ISO gives you a full desktop that you install yourself on

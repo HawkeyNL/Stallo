@@ -191,6 +191,10 @@ enum Cmd {
         /// in a running Linux guest (`off` asks for passwords again).
         #[arg(long, value_enum, group = "change")]
         passwordless: Option<OnOff>,
+        /// Guest monitors, 1 to 3 (the VM must be stopped; VMs from an
+        /// installer ISO). They sit left to right, screen 1 first.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3), group = "change")]
+        screens: Option<u8>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
@@ -584,6 +588,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cdrom,
             guest_user,
             passwordless,
+            screens,
         } => {
             // First, so a running VM is refused before VNC changes.
             let resources = if cpus.is_some() || mem.is_some() {
@@ -748,6 +753,37 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 passwordless_result = Some(v);
             }
+            let mut screens_result = None;
+            if let Some(screens) = screens {
+                let earlier = [
+                    resources.is_some(),
+                    net_result.is_some(),
+                    ui_result.is_some(),
+                    vnc_result.is_some(),
+                    cdrom_result.is_some(),
+                    user_result.is_some(),
+                    passwordless_result.is_some(),
+                ]
+                .contains(&true);
+                let v = call(Request::SetScreens {
+                    name: vm.clone(),
+                    screens,
+                })
+                .await
+                .map_err(|e| match earlier {
+                    false => e,
+                    true => e.context(format!(
+                        "the other changes of {vm} were applied, the screens were not"
+                    )),
+                })?;
+                if !json {
+                    println!("{vm}  screens {screens}");
+                    if let Some(note) = v["note"].as_str() {
+                        println!("note: {note}");
+                    }
+                }
+                screens_result = Some(v);
+            }
             if json {
                 print_json(&serde_json::json!({
                     "resources": resources,
@@ -757,6 +793,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "cdrom": cdrom_result,
                     "guest_user": user_result,
                     "passwordless": passwordless_result,
+                    "screens": screens_result,
                 }));
             }
         }
@@ -1043,6 +1080,9 @@ fn summary(vm: &VmInfo) -> String {
     for f in &vm.forwards {
         let host = std::net::SocketAddr::new(f.bind, f.host);
         s.push_str(&format!(" · {host}→{}", f.guest));
+    }
+    if vm.screens > 1 {
+        s.push_str(&format!(" · {} screens", vm.screens));
     }
     s
 }

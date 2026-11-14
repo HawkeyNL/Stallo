@@ -42,7 +42,7 @@ profile stallo-qemu flags=(enforce) {
   # QMP, QGA, UI and VNC sockets; screendumps.
   /run/stallo/vms/*/{qmp,qga,ui}.sock rw,
   /run/stallo/vms/*/screen.{png,ppm} rw,
-  /run/stallo/vnc/*/vnc.sock rw,
+  /run/stallo/vnc/*/vnc{,-2,-3}.sock rw,
   unix (create, bind, listen, accept, send, receive, getattr, getopt, setopt, shutdown) type=stream,
 
   # QEMU kicks its own vCPU threads with signals. Under no_new_privs the

@@ -183,6 +183,11 @@ gate.
     to others. Under an older loaded profile QEMU cannot create the socket
     and such a VM does not start (fail closed); VMs without the channel are
     unaffected. Not measured in the lab yet.
+  - Screens 2 and 3 of a VM with VNC (`stallo set <vm> --screens 2`)
+    have their own sockets, `vnc-2.sock` and `vnc-3.sock`, which also
+    need the profile of the package that added them. Under an older
+    profile such a VM does not start (fail closed); VMs with one screen
+    are unaffected.
   - Dev mode does not use the profile: its paths are under `$HOME`, and
     loading a profile needs root.
   - Removing the package unloads the profile; the conffile stays until

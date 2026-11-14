@@ -199,6 +199,12 @@ pub fn describe(r: &Request) -> Described<'_> {
             vec![("on", u64::from(*on))],
             None,
         ),
+        Request::SetScreens { name, screens } => (
+            "set_screens",
+            Some(name),
+            vec![("screens", u64::from(*screens))],
+            None,
+        ),
         Request::SetGuestUser { name, user } => (
             "set_guest_user",
             Some(name),

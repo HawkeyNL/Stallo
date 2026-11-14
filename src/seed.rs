@@ -220,6 +220,7 @@ mod tests {
             vnc: false,
             ui: false,
             guest_user: None,
+            screens: 1,
             cdrom: None,
             machine: crate::images::Os::Linux,
         }
