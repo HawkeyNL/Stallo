@@ -179,6 +179,15 @@ class Desktop:
             from gi.repository import GLib
 
             self.context = GLib.MainContext.default()
+            # Apps send these events only to a registered listener; with
+            # them libatspi keeps its cache current (handled in idle()).
+            self.listener = atspi.EventListener.new(lambda *_: None)
+            for event in (
+                "object:state-changed",
+                "object:property-change:accessible-name",
+                "object:children-changed",
+            ):
+                self.listener.register(event)
         else:
             self.context = None
         self.atspi = atspi
@@ -315,9 +324,9 @@ class Desktop:
                     partial = True  # it hung a helper before
                     continue
                 self.busy(pid)
-                # The cache stays as libatspi keeps it (events update it
-                # while idle): a cache mask of NONE hangs libatspi 2.60 on a
-                # futex at the first get_name.
+                # The cache stays as libatspi keeps it, current through the
+                # events registered above: a cache mask of NONE hangs
+                # libatspi 2.60 on a futex at the first get_name.
                 app_name = (app.get_name() or "")[:APP_MAX + 1]
                 tops, _ = self.children(app, 64, deadline)
             except Exception:
