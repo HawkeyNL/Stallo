@@ -60,11 +60,15 @@ pub fn text_keys(text: &str) -> Result<Vec<Vec<&'static str>>> {
         text.len() <= MAX_TEXT,
         "text is longer than {MAX_TEXT} bytes"
     );
+    // The error names the position, never the character: the text may be
+    // a password.
     text.chars()
-        .map(|c| match char_keys(c) {
+        .enumerate()
+        .map(|(i, c)| match char_keys(c) {
             Some(k) => Ok(k),
             None => bail!(
-                "cannot type {c:?}: type_text takes printable ASCII, newline and tab; use file_write for other text"
+                "cannot type character {}: type_text takes printable ASCII, newline and tab; use file_write for other text",
+                i + 1
             ),
         })
         .collect()
@@ -250,7 +254,11 @@ mod tests {
     fn text_is_checked() {
         assert_eq!(text_keys("ls -l\n").unwrap().len(), 6);
         let err = text_keys("café").unwrap_err().to_string();
-        assert!(err.contains("file_write"), "{err}");
+        assert!(
+            err.contains("character 4") && err.contains("file_write"),
+            "{err}"
+        );
+        assert!(!err.contains('é'), "{err}");
         assert!(text_keys(&"a".repeat(MAX_TEXT)).is_ok());
         assert!(text_keys(&"a".repeat(MAX_TEXT + 1)).is_err());
     }

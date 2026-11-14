@@ -744,6 +744,34 @@ impl Vms {
         });
     }
 
+    /// Types pasted text into the VM `name`, or says why it cannot; then
+    /// calls `done`.
+    pub(crate) fn paste(
+        self: &Rc<Self>,
+        name: &str,
+        text: Result<String, &str>,
+        done: impl FnOnce() + 'static,
+    ) {
+        let text = match text {
+            Ok(text) => text,
+            Err(why) => {
+                self.ui.toast(why);
+                return done();
+            }
+        };
+        let (v, socket, name) = (self.clone(), self.socket.clone(), name.to_owned());
+        glib::spawn_future_local(async move {
+            let got =
+                client::spawn(async move { client::type_text(&socket, name, text).await }).await;
+            match got {
+                Ok(Ok(_)) => v.ui.toast("Pasted"),
+                Ok(Err(e)) => v.ui.fail(&model::failure("Could not paste".into(), &e)),
+                Err(_) => {}
+            }
+            done();
+        });
+    }
+
     /// An Overview switch moved: off at once, on after the risk is
     /// spelled out. A move that matches the VM (an update) does nothing.
     fn switch(self: &Rc<Self>, setting: Setting, row: &adw::SwitchRow, name: &str) {

@@ -50,6 +50,7 @@ pub struct Screen {
     picture: gtk::Picture,
     hint: gtk::Label,
     ctrl_alt_del: gtk::Button,
+    paste: gtk::Button,
     view_only: gtk::ToggleButton,
     actual_size: gtk::ToggleButton,
     /// Fullscreen only, above the guest: whose screen this is, and the
@@ -77,6 +78,8 @@ pub struct Screen {
     shown_page: RefCell<Option<ScreenPage>>,
     /// The guest has the keyboard.
     grabbed: Cell<bool>,
+    /// A paste is being typed: no second one on top of it.
+    pasting: Cell<bool>,
     /// The window whose system shortcuts go to the guest while grabbed.
     inhibited: RefCell<Option<gdk::Toplevel>>,
     keys: RefCell<model::Keys>,
@@ -182,6 +185,11 @@ impl Screen {
             .label("Ctrl+Alt+Del")
             .tooltip_text("Send Ctrl+Alt+Del")
             .build();
+        let paste = gtk::Button::builder()
+            .icon_name("edit-paste-symbolic")
+            .tooltip_text("Type the clipboard text (US keyboard layout)")
+            .build();
+        paste.update_property(&[gtk::accessible::Property::Label("Paste")]);
         let hint = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .build();
@@ -202,6 +210,7 @@ impl Screen {
         fullscreen.update_property(&[gtk::accessible::Property::Label("Fullscreen")]);
         let bar = gtk::ActionBar::new();
         bar.pack_start(&ctrl_alt_del);
+        bar.pack_start(&paste);
         bar.set_center_widget(Some(&hint));
         bar.pack_end(&fullscreen);
         bar.pack_end(&actual_size);
@@ -233,6 +242,7 @@ impl Screen {
             picture,
             hint,
             ctrl_alt_del,
+            paste,
             view_only,
             actual_size,
             strip,
@@ -251,6 +261,7 @@ impl Screen {
             shown: Cell::new(None),
             shown_page: RefCell::default(),
             grabbed: Cell::new(false),
+            pasting: Cell::new(false),
             inhibited: RefCell::default(),
             keys: RefCell::default(),
             mouse: RefCell::default(),
@@ -281,6 +292,42 @@ impl Screen {
                     s.send(input);
                 }
             }
+        });
+        let s = weak();
+        self.paste.connect_clicked(move |b| {
+            let Some(screen) = s.upgrade().filter(|s| !s.pasting.replace(true)) else {
+                return;
+            };
+            screen.show_input();
+            let s = s.clone();
+            let clipboard = b.clipboard();
+            glib::spawn_future_local(async move {
+                // Read only on a click, never kept or logged. A clipboard
+                // owner that hangs counts as no text.
+                let read = clipboard.read_text_future();
+                let text = glib::future_with_timeout(std::time::Duration::from_secs(5), read)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten();
+                let Some(screen) = s.upgrade() else {
+                    return;
+                };
+                let done = move || {
+                    if let Some(s) = s.upgrade() {
+                        s.pasting.set(false);
+                        s.show_input();
+                    }
+                };
+                match screen.vms.upgrade().filter(|_| screen.input_allowed()) {
+                    Some(v) => v.paste(
+                        &screen.name,
+                        model::paste_text(text.as_deref().unwrap_or("")),
+                        done,
+                    ),
+                    None => done(),
+                }
+            });
         });
         let s = weak();
         self.view_only.connect_toggled(move |_| {
@@ -577,6 +624,7 @@ impl Screen {
         self.strip_hint.set_visible(grabbed);
         self.release.set_visible(grabbed);
         self.ctrl_alt_del.set_sensitive(allowed);
+        self.paste.set_sensitive(allowed && !self.pasting.get());
         self.banner
             .set_revealed(self.view_only.is_active() && self.agent.get() == Some(true));
     }
