@@ -619,6 +619,7 @@ async fn dispatch(
             let cfg = m.set_net(&name, net).await?;
             json!(info(m, &cfg).await)
         }
+        Request::SetPasswordless { name, on } => json!(m.set_passwordless(&name, on).await?),
         Request::SetGuestUser { name, user } => {
             let cfg = m.set_guest_user(&name, user.as_deref()).await?;
             json!(info(m, &cfg).await)

@@ -14,6 +14,7 @@ pub mod input;
 pub mod mcp;
 pub mod mcp_http;
 pub mod net;
+pub mod passwordless;
 pub mod paths;
 pub mod qemu;
 pub mod qga;

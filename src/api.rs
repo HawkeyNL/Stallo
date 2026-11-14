@@ -243,6 +243,12 @@ pub enum Request {
         name: String,
         user: Option<String>,
     },
+    /// Makes a running Linux guest's user need no password for sudo,
+    /// polkit and login, or undoes that (humans only).
+    SetPasswordless {
+        name: String,
+        on: bool,
+    },
     /// Adds or removes a stopped VM's UI channel (humans only).
     SetUi {
         name: String,
@@ -477,6 +483,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | UiInstall { .. }
         // Which guest account agents act as is a human's choice.
         | SetGuestUser { .. }
+        // So are the guest's password prompts.
+        | SetPasswordless { .. }
         // What a VM boots from is a human's choice, as at `new`.
         | SetCdrom { .. }
         // Growing a VM takes host CPU and memory budget that a human sized;
@@ -754,6 +762,13 @@ mod tests {
         );
         assert_eq!(
             agent_gate(&Request::UiInstall { name: name() }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::SetPasswordless {
+                name: name(),
+                on: true
+            }),
             Gate::Closed
         );
         assert_eq!(
