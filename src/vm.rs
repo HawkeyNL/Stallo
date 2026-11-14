@@ -111,6 +111,9 @@ pub struct Screenshot {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Screens 2 and up as (PNG, width, height), left to right after this
+    /// one; empty with one screen. Pointer coordinates span them all.
+    pub more: Vec<(Vec<u8>, u32, u32)>,
 }
 
 /// What a new VM looks like.
@@ -867,15 +870,20 @@ impl Manager {
                 .paths
                 .vnc_sockets(name, cfg.screens)
                 .iter()
-                .try_for_each(|sock| match fs::symlink_metadata(sock) {
-                    Ok(m) if m.file_type().is_socket() => fs::set_permissions(sock, mode.clone()),
-                    Ok(_) => Err(std::io::Error::other("not a socket")),
-                    Err(e) => Err(e),
+                .try_for_each(|sock| {
+                    match fs::symlink_metadata(sock) {
+                        Ok(m) if m.file_type().is_socket() => {
+                            fs::set_permissions(sock, mode.clone())
+                        }
+                        Ok(_) => Err(std::io::Error::other("not a socket")),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| anyhow::Error::from(e).context(format!("{}", sock.display())))
                 });
             if let Err(e) = shared {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                return Err(anyhow::Error::from(e).context("cannot share the VNC socket"));
+                return Err(e.context("cannot share the VNC socket"));
             }
         }
         // passt checks its arguments at once; by the time QMP answers, a
@@ -984,7 +992,8 @@ impl Manager {
             screen_lock: tokio::sync::Mutex::new(()),
             input_lock: tokio::sync::Mutex::new(()),
             boot_key_task: Mutex::new(None),
-            screen_size: Mutex::new(qemu::SCREEN),
+            // The desktop until the first screenshot: screens side by side.
+            screen_size: Mutex::new((qemu::SCREEN.0 * u32::from(cfg.screens), qemu::SCREEN.1)),
             qga: tokio::sync::Mutex::new(None),
             disk_full: AtomicBool::new(false),
             qemu_log,
@@ -1240,10 +1249,12 @@ impl Manager {
             cfg.throwaway_of.is_none(),
             "{name} is a `stallo run` clone; change the VM it was made from"
         );
+        // Back to one screen is always allowed.
         ensure!(
-            images::is_iso(&cfg.image).with_context(|| format!(
-                "{name} is made from an image this build does not know"
-            ))?,
+            screens == 1
+                || images::is_iso(&cfg.image).with_context(|| format!(
+                    "{name} is made from an image this build does not know"
+                ))?,
             "{name} is made from cloud image {}, which has no desktop; more screens are for VMs installed from an ISO",
             cfg.image
         );
@@ -1888,7 +1899,7 @@ impl Manager {
         // The returned PNG is taken after the screen settled; on a screen
         // that keeps changing it can differ from the last compared frame.
         let vm = self.running_vm(name)?;
-        let settled = settle(|| vm.screendump("screen.ppm", "ppm"), stable, limit).await?;
+        let settled = settle(|| vm.dump_all(), stable, limit).await?;
         Ok((vm.screenshot().await?, settled))
     }
 
@@ -2212,14 +2223,39 @@ impl Running {
         pressed.and(released)
     }
 
+    /// Every screen. The pointer then spans the desktop they make: side
+    /// by side, left to right, top-aligned (the guest's default layout).
     async fn screenshot(&self) -> Result<Screenshot> {
-        let png = self.screendump("screen.png", "png").await?;
-        let (width, height) = input::png_size(&png)?;
-        *self.screen_size.lock().unwrap() = (width, height);
-        Ok(Screenshot { png, width, height })
+        let mut shots = Vec::new();
+        for head in 0..self.config.screens {
+            let png = self.screendump("screen.png", "png", head).await?;
+            let (w, h) = input::png_size(&png)?;
+            shots.push((png, w, h));
+        }
+        let desktop = shots.iter().fold((0, 0), |(w, h), s| (w + s.1, h.max(s.2)));
+        *self.screen_size.lock().unwrap() = desktop;
+        let mut shots = shots.into_iter();
+        let (png, width, height) = shots.next().context("no screen")?;
+        Ok(Screenshot {
+            png,
+            width,
+            height,
+            more: shots.collect(),
+        })
     }
 
-    /// Absolute pointer events for pixel (`x`, `y`) of the last screenshot.
+    /// Every screen's raw frame, one after the other: for telling whether
+    /// anything changed.
+    async fn dump_all(&self) -> Result<Vec<u8>> {
+        let mut all = Vec::new();
+        for head in 0..self.config.screens {
+            all.extend(self.screendump("screen.ppm", "ppm", head).await?);
+        }
+        Ok(all)
+    }
+
+    /// Absolute pointer events for pixel (`x`, `y`) of the last screenshot,
+    /// on the desktop of all screens.
     fn move_events(&self, x: u32, y: u32) -> Result<Vec<Value>> {
         pointer_events(x, y, *self.screen_size.lock().unwrap())
     }
@@ -2255,16 +2291,19 @@ impl Running {
         pressed.and(released)
     }
 
-    /// Has QEMU write the screen to `<rt>/<file>` and reads it back.
-    async fn screendump(&self, file: &str, format: &str) -> Result<Vec<u8>> {
+    /// Has QEMU write screen `head` (0-based) to `<rt>/<file>` and reads
+    /// it back.
+    async fn screendump(&self, file: &str, format: &str, head: u8) -> Result<Vec<u8>> {
         let _screen = self.screen_lock.lock().await;
         let _slot = SCREENS.acquire().await?;
         let path = self.rt_dir.join(file);
+        let mut args = serde_json::json!({"filename": path, "format": format});
+        // One screen: no device, as before.
+        if self.config.screens > 1 {
+            args["device"] = format!("video{head}").into();
+        }
         self.qmp
-            .execute(
-                "screendump",
-                Some(serde_json::json!({"filename": path, "format": format})),
-            )
+            .execute("screendump", Some(args))
             .await
             .context("cannot take a screenshot")?;
         // Off the async workers: a read of up to MAX_SCREEN_BYTES.

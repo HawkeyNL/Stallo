@@ -274,12 +274,18 @@ side, left to right, screen 1 first (GNOME does this). If you rearrange
 the monitors in the guest's settings, clicks on screens 2 and 3 land in
 the wrong place. Each screen has its own VNC socket: `vnc.sock` for
 screen 1, then `vnc-2.sock` and `vnc-3.sock` in the same directory.
+Agents get one image per screen from `screenshot`, and their pointer
+coordinates run across the whole desktop: screen 2 starts at x = screen
+1's width. A plain VNC viewer's mouse does not account for the other
+screens (QEMU scales it to one screen), so use the desktop app or the
+keyboard there.
 
 Like a network change, it needs the VM stopped and no RAM snapshots
 (they hold the display devices). A Windows guest needs the virtio-win
 display driver (viogpudo) for screens 2 and 3. Each extra screen lets
-the guest use up to 64 MiB of host memory for its buffers, which counts
-towards the VM's memory limit.
+the guest use up to 64 MiB of host memory for its buffers (enough for a
+double-buffered 2560x1600 screen), which counts towards the VM's memory
+limit.
 
 ## Install a desktop from an ISO
 

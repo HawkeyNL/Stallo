@@ -193,7 +193,7 @@ enum Cmd {
         passwordless: Option<OnOff>,
         /// Guest monitors, 1 to 3 (the VM must be stopped; VMs from an
         /// installer ISO). They sit left to right, screen 1 first.
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3), group = "change")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=i64::from(stallo::config::MAX_SCREENS)), group = "change")]
         screens: Option<u8>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).

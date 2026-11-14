@@ -417,6 +417,19 @@ pub struct ScreenResult {
     /// `wait_for_screen` only: whether the screen settled in time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable: Option<bool>,
+    /// Screens 2 and up, left to right after this one (screen 1). Pointer
+    /// coordinates span all screens: screen 2 starts at x = screen 1's
+    /// width.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more: Vec<ScreenPart>,
+}
+
+/// One more guest screen of a [`ScreenResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenPart {
+    pub png_base64: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Part of a guest file.

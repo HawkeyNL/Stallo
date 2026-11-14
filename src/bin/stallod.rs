@@ -723,6 +723,15 @@ fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
     if let Some(stable) = stable {
         v["stable"] = stable.into();
     }
+    if !shot.more.is_empty() {
+        v["more"] = shot
+            .more
+            .into_iter()
+            .map(|(png, width, height)| {
+                json!({"png_base64": BASE64.encode(png), "width": width, "height": height})
+            })
+            .collect();
+    }
     v
 }
 
