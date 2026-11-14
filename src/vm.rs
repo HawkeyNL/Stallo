@@ -1580,6 +1580,91 @@ impl Manager {
         Ok(out)
     }
 
+    /// Makes the guest user need no password for sudo, polkit and login,
+    /// or undoes that (see `passwordless.rs`). Returns what was done.
+    pub async fn set_passwordless(&self, name: &str, on: bool) -> Result<String> {
+        use crate::passwordless as pw;
+        let vm = self.running_vm(name)?;
+        ensure!(
+            vm.config.machine == images::Os::Linux,
+            "{name} runs Windows; passwordless is for Linux guests"
+        );
+        let user = self
+            .load(name)?
+            .guest_user
+            .unwrap_or_else(|| seed::GUEST_USER.to_owned());
+        let run = async |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+            self.exec(name, &argv, true, Duration::from_secs(60), None)
+                .await
+        };
+        let write = async |path: &str, content: &str, mode: &str| {
+            self.file_write(name, path, content.as_bytes(), false, true)
+                .await?;
+            guest_ok(run(&["chmod", mode, path]).await?, "chmod")
+        };
+        if on {
+            ensure!(
+                run(&["id", "-u", &user]).await?.exit_code == 0,
+                "the guest user {user:?} does not exist in {name}; name yours with `stallo set {name} --guest-user NAME`"
+            );
+            write(pw::SUDOERS_TMP, &pw::sudoers(&user), "0440").await?;
+            guest_ok(run(&["visudo", "-cf", pw::SUDOERS_TMP]).await?, "visudo")?;
+            guest_ok(
+                run(&["mv", "-f", pw::SUDOERS_TMP, pw::SUDOERS]).await?,
+                "mv",
+            )?;
+            guest_ok(
+                run(&["mkdir", "-p", "/etc/polkit-1/rules.d"]).await?,
+                "mkdir",
+            )?;
+            write(pw::POLKIT_RULE, &pw::polkit_rule(&user), "0644").await?;
+            write(pw::SCREEN_DEFAULTS.0, pw::SCREEN_DEFAULTS.1, "0644").await?;
+        } else {
+            let files = [
+                pw::SUDOERS,
+                pw::SUDOERS_TMP,
+                pw::POLKIT_RULE,
+                pw::SCREEN_DEFAULTS.0,
+            ];
+            guest_ok(run(&[&["rm", "-f"][..], &files].concat()).await?, "rm")?;
+        }
+        // Best effort: a guest without GLib's tools has no GNOME screen
+        // settings to change.
+        run(&["glib-compile-schemas", ui::SCHEMAS_DIR]).await?;
+        // The login screen, if it is GDM's.
+        let mut gdm = None;
+        for conf in pw::GDM_CONFS {
+            if run(&["test", "-f", conf]).await?.exit_code != 0 {
+                continue;
+            }
+            let (old, more) = self.file_read(name, conf, 0, 64 << 10, true).await?;
+            ensure!(!more, "{conf} in {name} is over 64 KiB; edit it by hand");
+            let old = String::from_utf8(old).with_context(|| format!("{conf} is not UTF-8"))?;
+            let new = pw::gdm_conf(&old, on.then_some(user.as_str()));
+            if new != old {
+                // Replaced whole: a cut-off write never leaves half a file.
+                let tmp = format!("{conf}.stallo-new");
+                write(&tmp, &new, "0644").await?;
+                guest_ok(run(&["mv", "-f", &tmp, conf]).await?, "mv")?;
+            }
+            gdm = Some(conf);
+            break;
+        }
+        Ok(match (on, gdm) {
+            (true, Some(_)) => format!(
+                "{name}: {user} needs no password for sudo, admin dialogs or login (automatic at boot, after {}s on the login screen after a log out); no lock screen. Log out and in, or restart the guest, for all of it to apply",
+                pw::TIMED_LOGIN_DELAY
+            ),
+            (true, None) => format!(
+                "{name}: {user} needs no password for sudo or admin dialogs; no lock screen. No GDM found, so login is unchanged"
+            ),
+            (false, _) => format!(
+                "{name}: passwords are asked again (sudo, admin dialogs, login, lock screen) from the next login"
+            ),
+        })
+    }
+
     /// Acts on a control from `ui_tree`, waits `act.settle` (and for
     /// `act.until`), and returns what was done and what changed.
     pub async fn ui_act(&self, name: &str, act: ui::Act) -> Result<String> {

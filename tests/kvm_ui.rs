@@ -61,6 +61,19 @@ fn ui_channel() {
         "{out:?}"
     );
     d.ok(&["set", "ui", "--guest-user", "agent"]);
+    // Passwordless: sudo without a password for the guest user, and back.
+    let sudo = |d: &Daemon| {
+        d.stallo(&["exec", "ui", "--", "sudo", "-n", "true"])
+            .status
+            .success()
+    };
+    assert!(!sudo(&d), "the seed's agent needs a password for sudo");
+    let out = d.ok(&["set", "ui", "--passwordless", "on"]);
+    assert!(out.contains("agent needs no password for sudo"), "{out}");
+    assert!(sudo(&d));
+    d.ok(&["exec", "ui", "--admin", "--", "visudo", "-c"]);
+    d.ok(&["set", "ui", "--passwordless", "off"]);
+    assert!(!sudo(&d));
     let out = d.stallo(&["set", "ui", "--ui", "on"]);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("stop it first"),

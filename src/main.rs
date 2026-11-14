@@ -187,6 +187,10 @@ enum Cmd {
         /// (default: agent; `agent` restores it); applies to the next call.
         #[arg(long, value_name = "USER", group = "change")]
         guest_user: Option<String>,
+        /// No password for sudo, admin dialogs or login for the guest user
+        /// in a running Linux guest (`off` asks for passwords again).
+        #[arg(long, value_enum, group = "change")]
+        passwordless: Option<OnOff>,
     },
     /// Continue a paused VM (for example after the disk watchdog paused it).
     Resume { vm: String },
@@ -579,6 +583,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             ui,
             cdrom,
             guest_user,
+            passwordless,
         } => {
             // First, so a running VM is refused before VNC changes.
             let resources = if cpus.is_some() || mem.is_some() {
@@ -716,6 +721,33 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 user_result = Some(v);
             }
+            let mut passwordless_result = None;
+            if let Some(state) = passwordless {
+                let v = call(Request::SetPasswordless {
+                    name: vm.clone(),
+                    on: matches!(state, OnOff::On),
+                })
+                .await
+                .map_err(|e| {
+                    match (
+                        &resources,
+                        &net_result,
+                        &ui_result,
+                        &vnc_result,
+                        &cdrom_result,
+                        &user_result,
+                    ) {
+                        (None, None, None, None, None, None) => e,
+                        _ => e.context(format!(
+                            "the other changes of {vm} were applied, passwordless was not"
+                        )),
+                    }
+                })?;
+                if !json {
+                    println!("{}", v.as_str().unwrap_or_default());
+                }
+                passwordless_result = Some(v);
+            }
             if json {
                 print_json(&serde_json::json!({
                     "resources": resources,
@@ -724,6 +756,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "vnc": vnc_result,
                     "cdrom": cdrom_result,
                     "guest_user": user_result,
+                    "passwordless": passwordless_result,
                 }));
             }
         }
