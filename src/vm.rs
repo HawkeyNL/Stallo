@@ -1341,9 +1341,15 @@ impl Manager {
                 delay = (delay * 2).min(Duration::from_secs(1));
             }
         };
-        tokio::time::timeout(limit, poll)
-            .await
-            .map_err(|_| anyhow::anyhow!("{name}: guest agent not ready after {limit:?}"))?
+        match tokio::time::timeout(limit, poll).await {
+            Ok(ready) => ready,
+            Err(_) => {
+                if let Some(vm) = self.running(name) {
+                    vm.no_agent().await?;
+                }
+                bail!("{name}: guest agent not ready after {limit:?}")
+            }
+        }
     }
 
     /// Powers the VM off: ACPI power button, then `quit` after
@@ -2095,11 +2101,13 @@ impl Running {
         match ready {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
+                drop(agent);
                 self.no_agent().await?;
                 return Err(e);
             }
             Err(_) => {
                 *agent = None;
+                drop(agent);
                 self.no_agent().await?;
                 bail!("guest agent did not answer within {connect:?}");
             }
@@ -2128,7 +2136,7 @@ impl Running {
 
     /// Fails with what to do if no guest agent has the port open, after
     /// the agent did not answer.
-    async fn no_agent(&self) -> Result<()> {
+    pub(crate) async fn no_agent(&self) -> Result<()> {
         ensure!(
             self.agent_port_open().await != Some(false),
             "no guest agent in {}: it may still be booting, or qemu-guest-agent is not installed or not running (Debian/Ubuntu: sudo apt install qemu-guest-agent; Fedora: sudo dnf install qemu-guest-agent)",
@@ -3015,6 +3023,17 @@ mod tests {
             e.starts_with("no guest agent in dev:") && e.contains("apt install qemu-guest-agent"),
             "{e}"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_ready_says_what_to_install() {
+        let (_t, _d, m, _) = ui_manager(|_, _| vec![]).await;
+        let e = m
+            .wait_ready("dev", Duration::from_millis(300))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("no guest agent in dev:"), "{e}");
     }
 
     #[tokio::test]

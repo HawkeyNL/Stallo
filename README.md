@@ -309,8 +309,9 @@ agent in the guest, which Stallo does not install:
 - Check `systemctl status qemu-guest-agent`; if it is missing, install
   it (Debian/Ubuntu: `sudo apt install qemu-guest-agent`, Fedora:
   `sudo dnf install qemu-guest-agent`), then
-  `sudo systemctl enable --now qemu-guest-agent`. `stallo ls` shows `GA
-  up` once it runs, and `none` while no agent has its port open. Without
+  `sudo systemctl enable --now qemu-guest-agent`. The GA column of
+  `stallo ls` shows `up` once it runs and `none` while no agent has its
+  port open (`-` when stopped). Without
   `--net internet` (production mode) the VM is offline: if neither the
   installed system nor its ISO holds the package, it cannot be installed.
 - Without `--admin`, Stallo runs commands and file copies as the guest
@@ -463,7 +464,8 @@ true` in `stallod.toml`), `vm_start`, `vm_stop`, `vm_reset`, `screenshot`,
 `wait_for_screen`, `mouse_move`, `click`, `drag`, `scroll`, `type_text`,
 `key`, `exec`, `file_read`, `file_write`, `image_list`,
 `snapshot_create`, `snapshot_list`, `snapshot_restore`, `ui_tree`,
-`ui_act`, `ui_wait`. There is no delete tool. Every call is logged in `<data>/audit/`; see SECURITY.md.
+`ui_act`, `ui_wait`. There is no delete tool. Every call is logged in
+`<data>/audit/`; see SECURITY.md.
 
 ## Licence
 

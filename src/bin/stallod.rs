@@ -715,7 +715,7 @@ fn screen(shot: Screenshot, stable: Option<bool>) -> Value {
 async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
     let (state, guest_agent) = match m.running(&cfg.name) {
         None => ("stopped".to_owned(), None),
-        Some(vm) => (vm.state().await, vm.agent_port_open().await),
+        Some(vm) => tokio::join!(vm.state(), vm.agent_port_open()),
     };
     VmInfo {
         name: cfg.name.clone(),
