@@ -132,7 +132,7 @@ fn named_key(name: &str) -> Option<&'static str> {
         "altgr" => "alt_r",
         "shift" => "shift",
         "super" | "meta" | "win" | "cmd" => "meta_l",
-        "enter" | "return" => "ret",
+        "enter" | "return" | "ret" => "ret",
         "esc" | "escape" => "esc",
         "tab" => "tab",
         "space" => "spc",
@@ -268,6 +268,7 @@ mod tests {
         assert_eq!(chord("ctrl+alt+t").unwrap(), ["ctrl", "alt", "t"]);
         assert_eq!(chord("Ctrl + C").unwrap(), ["ctrl", "c"]);
         assert_eq!(chord("enter").unwrap(), ["ret"]);
+        assert_eq!(chord("ret").unwrap(), ["ret"]);
         assert_eq!(chord("shift+F10").unwrap(), ["shift", "f10"]);
         assert_eq!(chord("super").unwrap(), ["meta_l"]);
         assert_eq!(chord("ctrl+?").unwrap(), ["ctrl", "shift", "slash"]);

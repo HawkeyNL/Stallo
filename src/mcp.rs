@@ -203,7 +203,7 @@ struct UiActArgs {
     id: Option<String>,
     /// For type: the text to type.
     text: Option<String>,
-    /// For key: a chord such as "ctrl+s" or "ret".
+    /// For key: a chord such as "ctrl+s" or "enter".
     keys: Option<String>,
     /// For scroll: wheel clicks, positive is down (-50 to 50).
     dy: Option<i32>,
