@@ -62,6 +62,15 @@ fn ui_channel() {
     d.ok(&["start", "ui"]);
     d.assert_safe("ui");
     assert!(has_port(&d));
+    // `ls` shows the UI channel and the running guest agent.
+    let ls = d.ok(&["ls"]);
+    let row: Vec<_> = ls
+        .lines()
+        .find(|l| l.starts_with("ui "))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(row[row.len() - 2..], ["on", "up"], "{ls}");
     let sock = d.vm_runtime("ui").join("ui.sock");
     assert!(sock.exists());
 

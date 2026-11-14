@@ -2918,6 +2918,7 @@ mod tests {
             agent_control: false,
             vnc: false,
             ui: false,
+            guest_agent: None,
             image: None,
             cdrom: None,
         }

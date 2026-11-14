@@ -326,6 +326,10 @@ pub struct VmInfo {
     /// The UI channel for a helper in the guest (`VmConfig::ui`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ui: bool,
+    /// Whether a guest agent has its port open; `None` when stopped, when
+    /// QEMU does not say, or from an older stallod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_agent: Option<bool>,
     /// The image the VM was made from (an older stallod does not send it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,

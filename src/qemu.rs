@@ -38,6 +38,8 @@ pub const SEED: &str = "seed.iso";
 pub const STATES: &str = "states";
 pub const QMP_SOCK: &str = "qmp.sock";
 pub const QGA_SOCK: &str = "qga.sock";
+/// The guest agent's chardev, as `query-chardev` names it.
+pub const QGA_CHARDEV: &str = "qga0";
 /// The UI helper's channel (`VmConfig::ui`): host socket and guest port.
 pub const UI_SOCK: &str = "ui.sock";
 pub const UI_PORT: &str = "org.stallo.ui.0";
@@ -243,9 +245,9 @@ pub fn argv(
         pointer.into(),
         format!("-chardev socket,id=qmp,path={qmp},server=on,wait=off"),
         "-mon chardev=qmp,mode=control".into(),
-        format!("-chardev socket,id=qga0,path={qga},server=on,wait=off"),
+        format!("-chardev socket,id={QGA_CHARDEV},path={qga},server=on,wait=off"),
         "-device virtio-serial-pci".into(),
-        "-device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0".into(),
+        format!("-device virtserialport,chardev={QGA_CHARDEV},name=org.qemu.guest_agent.0"),
     ];
     let ui = if vm.ui {
         vec![
