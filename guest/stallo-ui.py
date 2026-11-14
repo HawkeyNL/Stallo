@@ -1,7 +1,7 @@
 #!/usr/bin/python3 -I
 """Stallo UI helper: reports the desktop's windows and controls to the host.
 
-Runs in the logged-in user's session (XDG autostart) and answers requests
+Runs in the logged-in user's session (a systemd user service) and answers requests
 from Stallo over the virtio-serial port org.stallo.ui.0, one JSON object per
 line each way, read from the accessibility bus (AT-SPI). It runs no commands
 and evaluates nothing: it only handles the ops below.
@@ -15,6 +15,7 @@ and evaluates nothing: it only handles the ops below.
 `python3 -I stallo-ui.py --self-test` checks the pure parts without AT-SPI.
 """
 
+import faulthandler
 import hashlib
 import json
 import os
@@ -40,6 +41,10 @@ MAX_BYTES = 900_000
 # tables: their rows are made on demand).
 MAX_MANAGED = 200
 WRITE_SECONDS = 5.0
+# A request or idle pass that takes longer hangs (an app that never
+# answers the accessibility bus): print the stack and exit, so the service
+# starts a fresh helper.
+HANG_SECONDS = 30
 
 # AT-SPI role names (non-localized) to the host's vocabulary.
 ROLES = {
@@ -166,6 +171,9 @@ class Desktop:
             from gi.repository import Atspi as atspi
 
             atspi.init()
+            # Per call to an app, in ms, and while an app starts (default
+            # 15 s): a slow app costs a partial tree, not a stuck helper.
+            atspi.set_timeout(1000, 3000)
             from gi.repository import GLib
 
             self.context = GLib.MainContext.default()
@@ -428,6 +436,15 @@ class Desktop:
             raise RuntimeError("the action failed")
 
 
+def guarded(fn, *args):
+    """Runs fn(*args); exits with a stack dump if it takes HANG_SECONDS."""
+    faulthandler.dump_traceback_later(HANG_SECONDS, exit=True)
+    try:
+        return fn(*args)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
 def answer(desktop, req):
     op, rid = req["op"], req["id"]
     try:
@@ -480,7 +497,7 @@ def serve(desktop):
         try:
             while True:
                 readable, _, _ = select.select([fd], [], [], 1.0)
-                desktop.idle()
+                guarded(desktop.idle)
                 if not readable:
                     continue
                 chunk = os.read(fd, 65536)
@@ -494,7 +511,7 @@ def serve(desktop):
                     req = parse_request(line) if len(line) <= MAX_REQUEST else None
                     if req is None:
                         continue
-                    if not write_all(fd, dump(answer(desktop, req)) + b"\n"):
+                    if not write_all(fd, dump(guarded(answer, desktop, req)) + b"\n"):
                         raise OSError("the host stopped reading")
                 if len(buf) > MAX_REQUEST:
                     buf = b""
@@ -504,6 +521,12 @@ def serve(desktop):
 
 
 def self_test():
+    assert guarded(lambda a: a + 1, 1) == 2
+    try:
+        guarded(lambda: 1 / 0)
+        raise AssertionError("no error")
+    except ZeroDivisionError:
+        pass
     assert role_word("push button", False) == "button"
     assert role_word("text", True) == "textbox"
     assert role_word("text", False) == "text"

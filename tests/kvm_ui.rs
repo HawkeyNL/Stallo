@@ -279,8 +279,10 @@ fn ui_tree_from_a_helper() {
     assert!(out.contains("installed the UI helper in ui"), "{out}");
     for path in [
         "/usr/local/lib/stallo-ui/stallo-ui.py",
-        "/etc/xdg/autostart/stallo-ui.desktop",
+        "/etc/systemd/user/stallo-ui.service",
+        "/etc/systemd/user/graphical-session.target.wants/stallo-ui.service",
         "/etc/udev/rules.d/70-stallo-ui.rules",
+        "/usr/share/glib-2.0/schemas/90_stallo-ui.gschema.override",
     ] {
         assert!(has(path), "{path}");
     }
@@ -292,10 +294,11 @@ fn ui_tree_from_a_helper() {
         "-c",
         "%a",
         "/usr/local/lib/stallo-ui/stallo-ui.py",
-        "/etc/xdg/autostart/stallo-ui.desktop",
+        "/etc/systemd/user/stallo-ui.service",
         "/etc/udev/rules.d/70-stallo-ui.rules",
+        "/usr/share/glib-2.0/schemas/90_stallo-ui.gschema.override",
     ]);
-    assert_eq!(modes, "644\n644\n644\n");
+    assert_eq!(modes, "644\n644\n644\n644\n");
     let helper = d.ok(&[
         "exec",
         "ui",
