@@ -38,6 +38,22 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A guest account name for `setpriv`: a portable user name, not root
+/// (`--admin` is how a call runs as root).
+pub fn validate_guest_user(user: &str) -> Result<()> {
+    let ok = user.len() <= 32
+        && user.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && user
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    ensure!(
+        ok,
+        "invalid guest user {user:?}: lowercase letters, digits, _ and -, at most 32"
+    );
+    ensure!(user != "root", "use --admin to run as root");
+    Ok(())
+}
+
 /// Checks a snapshot tag: `^[A-Za-z][A-Za-z0-9._-]{0,63}$`. The leading
 /// letter rules out `.`/`..`, option-like `-x` and all-digit tags, which QEMU
 /// would also match against snapshot ids.
@@ -120,6 +136,10 @@ pub struct VmConfig {
     /// without it do not restore with it, and the other way round.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ui: bool,
+    /// The guest account that commands and file copies without `--admin`
+    /// run as; `None` is `agent`, the user the seed makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_user: Option<String>,
     /// The installer ISO (catalog id) in the CD-ROM drive of a VM made from
     /// an ISO. Such a VM has the drive and no seed; `None` leaves the drive
     /// empty.
@@ -180,6 +200,9 @@ impl VmConfig {
             validate_image_id(iso)?;
         }
         ensure!(is_uuid(&self.uuid), "invalid uuid {:?}", self.uuid);
+        if let Some(user) = &self.guest_user {
+            validate_guest_user(user)?;
+        }
         if let Some(source) = &self.throwaway_of {
             validate_name(source)?;
             ensure!(*source != self.name, "a VM cannot overlay itself");
@@ -417,6 +440,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn guest_users() {
+        for ok in ["agent", "gus-ai", "_svc", "a1"] {
+            validate_guest_user(ok).unwrap();
+        }
+        for bad in ["", "root", "Gus", "1x", "-x", "a b", "a:b", &"a".repeat(33)] {
+            assert!(validate_guest_user(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn names() {
         for ok in ["a", "dev", "web-1", "a0-", &"a".repeat(31)] {
             assert!(validate_name(ok).is_ok(), "{ok}");
@@ -479,6 +512,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             ui: false,
+            guest_user: None,
             cdrom: None,
             machine: Os::Linux,
         }

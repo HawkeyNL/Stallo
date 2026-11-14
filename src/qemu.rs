@@ -353,6 +353,7 @@ mod tests {
             forwards: vec![],
             vnc: false,
             ui: false,
+            guest_user: None,
             cdrom: None,
             machine: Os::Linux,
         }

@@ -193,6 +193,19 @@ pub fn describe(r: &Request) -> Described<'_> {
         Request::SetAgent { name, on } => ("agent", Some(name), vec![("on", u64::from(*on))], None),
         Request::SetVnc { name, on } => ("vnc", Some(name), vec![("on", u64::from(*on))], None),
         Request::SetUi { name, on } => ("set_ui", Some(name), vec![("on", u64::from(*on))], None),
+        Request::SetGuestUser { name, user } => (
+            "set_guest_user",
+            Some(name),
+            // Whether a user other than the default was set, not who.
+            vec![(
+                "user",
+                u64::from(
+                    user.as_deref()
+                        .is_some_and(|u| u != crate::seed::GUEST_USER),
+                ),
+            )],
+            None,
+        ),
         // The ISO is in `image` (see [`image`]).
         Request::SetCdrom { name, iso } => (
             "set_cdrom",

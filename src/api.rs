@@ -237,6 +237,12 @@ pub enum Request {
         name: String,
         on: bool,
     },
+    /// Sets the guest account for calls without `admin`; `None` or
+    /// `agent` is the default (humans only).
+    SetGuestUser {
+        name: String,
+        user: Option<String>,
+    },
     /// Adds or removes a stopped VM's UI channel (humans only).
     SetUi {
         name: String,
@@ -330,6 +336,9 @@ pub struct VmInfo {
     /// QEMU does not say, or from an older stallod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_agent: Option<bool>,
+    /// The guest account for calls without `admin`, if not `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_user: Option<String>,
     /// The image the VM was made from (an older stallod does not send it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -466,6 +475,8 @@ pub fn agent_gate(r: &Request) -> Gate<'_> {
         | SetUi { .. }
         // Software that runs in the user's session: a human's choice.
         | UiInstall { .. }
+        // Which guest account agents act as is a human's choice.
+        | SetGuestUser { .. }
         // What a VM boots from is a human's choice, as at `new`.
         | SetCdrom { .. }
         // Growing a VM takes host CPU and memory budget that a human sized;
@@ -743,6 +754,13 @@ mod tests {
         );
         assert_eq!(
             agent_gate(&Request::UiInstall { name: name() }),
+            Gate::Closed
+        );
+        assert_eq!(
+            agent_gate(&Request::SetGuestUser {
+                name: name(),
+                user: Some("gus".into())
+            }),
             Gate::Closed
         );
         assert_eq!(

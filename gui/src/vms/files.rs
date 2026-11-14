@@ -4,7 +4,7 @@
 //! shows progress and can cancel between chunks. The window keeps the
 //! copies ([`model::Copies`]), so a VM's page opened again shows its copy.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Read, Write};
@@ -39,6 +39,8 @@ pub(super) struct Files {
     blocked: Cell<bool>,
     /// A copy on this VM runs: one at a time.
     copying: Cell<bool>,
+    /// The guest account for copies without admin (`None`: the default).
+    user: RefCell<Option<String>>,
 }
 
 impl Files {
@@ -123,6 +125,7 @@ impl Files {
             cancel,
             blocked: Cell::new(true),
             copying: Cell::new(false),
+            user: RefCell::new(vm.guest_user.clone()),
         });
         files.connect_signals(&page);
         files
@@ -178,6 +181,7 @@ impl Files {
     /// the VM's buttons.
     pub fn update(&self, vm: &VmInfo, blocked: bool, copy: Option<&CopyJob>) {
         self.blocked.set(blocked);
+        self.user.replace(vm.guest_user.clone());
         match model::files_status(vm, copy.is_some()) {
             Some(s) => {
                 self.status.set_icon_name(s.icon);
@@ -251,7 +255,7 @@ impl Files {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let text = format!("{}{name}", model::guest_home(self.admin.is_active()));
+        let text = format!("{}{name}", self.home());
         let heading = format!("Upload {}", stallo::printable(&name, 64));
         let body = Some("A file with this name in the VM is replaced.");
         self.ask_path(
@@ -264,8 +268,12 @@ impl Files {
         );
     }
 
+    fn home(&self) -> String {
+        model::guest_home(self.admin.is_active(), self.user.borrow().as_deref())
+    }
+
     fn ask_download(self: &Rc<Self>) {
-        let text = model::guest_home(self.admin.is_active());
+        let text = self.home();
         self.ask_path(
             "Download a File",
             None,

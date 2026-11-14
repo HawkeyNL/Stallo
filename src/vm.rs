@@ -474,6 +474,7 @@ impl Manager {
             forwards: new.forwards.clone(),
             vnc: new.vnc || iso,
             ui: iso,
+            guest_user: None,
             cdrom: iso.then(|| new.image.clone()),
             machine: images::image_os(&self.paths, &new.image)?,
         };
@@ -1070,6 +1071,18 @@ impl Manager {
         let mut cfg = self.load(name)?;
         cfg.agent_control = on;
         cfg.save(&self.paths.vm_dir(name))
+    }
+
+    /// Sets the guest account for calls without `--admin` (`None`: the
+    /// seed's `agent`). It applies to the next call, running or not.
+    pub async fn set_guest_user(&self, name: &str, user: Option<&str>) -> Result<VmConfig> {
+        self.check_exists(name)?;
+        let _op = self.lock(name).await?;
+        let mut cfg = self.load(name)?;
+        cfg.guest_user = user.filter(|u| *u != seed::GUEST_USER).map(str::to_owned);
+        cfg.validate()?;
+        cfg.save(&self.paths.vm_dir(name))?;
+        Ok(cfg)
     }
 
     /// Turns the VNC socket on or off; it takes effect at the next start.
@@ -1784,13 +1797,28 @@ impl Manager {
         stdin: Option<&[u8]>,
     ) -> Result<ExecOutput> {
         let vm = self.running_vm(name)?;
-        let (path, args) = guest_command(argv, admin, limit);
+        let user = if admin {
+            None
+        } else {
+            let cfg = self.load(name)?;
+            Some(
+                cfg.guest_user
+                    .unwrap_or_else(|| seed::GUEST_USER.to_owned()),
+            )
+        };
+        let (path, args) = guest_command(argv, user.as_deref(), limit);
         let started = Instant::now();
         let out = vm
             .with_agent(QGA_BUSY_WAIT, Duration::from_secs(5), async |q| {
                 q.exec(&path, &args, stdin, limit, cap).await
             })
             .await?;
+        if let Some(user) = &user {
+            ensure!(
+                !no_such_user(&out, user),
+                "the guest user {user:?} does not exist in {name} (or has no group of that name); name another with `stallo set {name} --guest-user NAME`, or run as root with --admin"
+            );
+        }
         // The scope's SIGKILL shows up as signal 9.
         ensure!(
             !(out.exit_code == 137 && started.elapsed() >= limit),
@@ -2510,10 +2538,11 @@ pub fn overhead_mib(minimum: u64, memory_mib: u64) -> u64 {
 /// in a transient cgroup that is killed with SIGKILL after `limit`, children
 /// and `setsid` escapes included. (coreutils `timeout` kills only its direct
 /// child, and an orphaned grandchild keeps QGA waiting on the output pipe.)
-/// Without `admin`, `setpriv` switches to the guest user in place and
-/// `--reset-env` sets HOME, USER and PATH for that user. That user may use
-/// sudo in the guest, so this is a convenience, not a security boundary.
-fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<String>) {
+/// With a `user` (`None` is root), `setpriv` switches to it in place and
+/// `--reset-env` sets HOME, USER and PATH for it; its group has its name.
+/// That user may use sudo in the guest, so this is a convenience, not a
+/// security boundary.
+fn guest_command(argv: &[String], user: Option<&str>, limit: Duration) -> (String, Vec<String>) {
     // No `$VAR` expansion by systemd-run: argv reaches the command as given.
     let mut args: Vec<String> = [
         "--scope",
@@ -2528,9 +2557,11 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
     .into();
     args.push(format!("RuntimeMaxSec={}ms", limit.as_millis()));
     args.push("--".to_owned());
-    if !admin {
-        let user = seed::GUEST_USER;
+    if let Some(user) = user {
+        // English errors from setpriv (`--reset-env` drops LC_ALL again).
         args.extend([
+            "env".to_owned(),
+            "LC_ALL=C".to_owned(),
             "setpriv".to_owned(),
             format!("--reuid={user}"),
             format!("--regid={user}"),
@@ -2541,6 +2572,15 @@ fn guest_command(argv: &[String], admin: bool, limit: Duration) -> (String, Vec<
     }
     args.extend_from_slice(argv);
     ("systemd-run".to_owned(), args)
+}
+
+/// Whether `setpriv` refused the guest user (or its group) as unknown.
+fn no_such_user(out: &ExecOutput, user: &str) -> bool {
+    out.exit_code == 1
+        && out.stdout.is_empty()
+        && ["reuid", "regid"]
+            .iter()
+            .any(|id| out.stderr == format!("setpriv: failed to parse {id}: '{user}'\n").as_bytes())
 }
 
 /// Whether a start presses Enter for the CD boot prompt: Windows VMs with
@@ -2773,6 +2813,7 @@ mod tests {
                 forwards: vec![],
                 vnc: false,
                 ui: false,
+                guest_user: None,
                 cdrom: None,
                 machine: images::Os::Linux,
             },
@@ -3133,18 +3174,49 @@ mod tests {
     #[test]
     fn guest_commands() {
         let argv = vec!["uname".to_owned(), "-a".to_owned()];
-        let (path, args) = guest_command(&argv, true, Duration::from_secs(120));
+        let (path, args) = guest_command(&argv, None, Duration::from_secs(120));
         assert_eq!(path, "systemd-run");
         assert_eq!(
             args.join(" "),
             "--scope --quiet --collect --expand-environment=no -p KillSignal=SIGKILL -p RuntimeMaxSec=120000ms -- uname -a"
         );
-        let (_, args) = guest_command(&argv, false, Duration::from_millis(1500));
+        let (_, args) = guest_command(&argv, Some("agent"), Duration::from_millis(1500));
         assert_eq!(
             args.join(" "),
             "--scope --quiet --collect --expand-environment=no -p KillSignal=SIGKILL -p RuntimeMaxSec=1500ms -- \
-             setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
+             env LC_ALL=C setpriv --reuid=agent --regid=agent --init-groups --reset-env -- uname -a"
         );
+    }
+
+    #[test]
+    fn missing_guest_user() {
+        let out = |code, err: &str| ExecOutput {
+            exit_code: code,
+            stdout: vec![],
+            stderr: err.into(),
+            truncated: false,
+        };
+        let reuid = "setpriv: failed to parse reuid: 'agent'\n";
+        assert!(no_such_user(&out(1, reuid), "agent"));
+        assert!(!no_such_user(&out(1, reuid), "gus"));
+        assert!(!no_such_user(&out(0, reuid), "agent"));
+        let regid = "setpriv: failed to parse regid: 'gus'\n";
+        assert!(no_such_user(&out(1, regid), "gus"));
+        assert!(!no_such_user(&out(1, "ls: cannot access 'x'\n"), "agent"));
+    }
+
+    #[tokio::test]
+    async fn guest_user_setting() {
+        let (_t, _d, m, _) = ui_manager(|_, _| vec![]).await;
+        let user = |m: &Manager| m.load("dev").unwrap().guest_user;
+        m.set_guest_user("dev", Some("gus-ai")).await.unwrap();
+        assert_eq!(user(&m).as_deref(), Some("gus-ai"));
+        assert!(m.set_guest_user("dev", Some("root")).await.is_err());
+        assert!(m.set_guest_user("dev", Some("a b")).await.is_err());
+        assert_eq!(user(&m).as_deref(), Some("gus-ai"), "unchanged");
+        // The default is stored as no setting.
+        m.set_guest_user("dev", Some("agent")).await.unwrap();
+        assert_eq!(user(&m), None);
     }
 
     /// `images rm` keeps an ISO that a running VM started with, even after

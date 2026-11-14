@@ -619,6 +619,10 @@ async fn dispatch(
             let cfg = m.set_net(&name, net).await?;
             json!(info(m, &cfg).await)
         }
+        Request::SetGuestUser { name, user } => {
+            let cfg = m.set_guest_user(&name, user.as_deref()).await?;
+            json!(info(m, &cfg).await)
+        }
         Request::SetUi { name, on } => {
             let cfg = m.set_ui(&name, on).await?;
             json!(info(m, &cfg).await)
@@ -729,6 +733,7 @@ async fn info(m: &Manager, cfg: &VmConfig) -> VmInfo {
         vnc: cfg.vnc,
         ui: cfg.ui,
         guest_agent,
+        guest_user: cfg.guest_user.clone(),
         image: Some(cfg.image.clone()),
         cdrom: cfg.cdrom.clone(),
     }
