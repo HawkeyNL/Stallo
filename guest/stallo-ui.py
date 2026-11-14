@@ -187,7 +187,10 @@ class Desktop:
                 "object:property-change:accessible-name",
                 "object:children-changed",
             ):
-                self.listener.register(event)
+                try:
+                    self.listener.register(event)
+                except Exception:
+                    pass  # the bus not up yet: an older cache, not no helper
         else:
             self.context = None
         self.atspi = atspi
@@ -231,7 +234,10 @@ class Desktop:
 
     def idle(self):
         """Handles pending bus messages, so nothing piles up while idle."""
-        while self.context is not None and self.context.pending():
+        # Bounded: a flood of events (a busy web page) waits for the next
+        # pass instead of keeping the helper from answering.
+        end = time.monotonic() + 0.2
+        while self.context is not None and self.context.pending() and time.monotonic() < end:
             self.context.iteration(False)
 
     def has(self, acc):
