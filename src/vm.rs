@@ -1663,7 +1663,7 @@ impl Manager {
             Ok::<_, anyhow::Error>(gdm)
         }
         .await
-        .context("passwordless is only partly applied; run the same command again")?;
+        .context("passwordless may be partly applied; run the same command again")?;
         Ok(match (on, gdm) {
             (true, Some(_)) => format!(
                 "{name}: {user} needs no password for sudo, admin dialogs or login (automatic at boot, after {}s on the login screen after a log out); no lock screen. Log out and in, or restart the guest, for all of it to apply",
