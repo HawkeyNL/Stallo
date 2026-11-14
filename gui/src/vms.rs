@@ -744,19 +744,31 @@ impl Vms {
         });
     }
 
-    /// Types pasted text into the VM `name`, or says why it cannot.
-    pub(crate) fn paste(self: &Rc<Self>, name: &str, text: Result<String, &str>) {
+    /// Types pasted text into the VM `name`, or says why it cannot; then
+    /// calls `done`.
+    pub(crate) fn paste(
+        self: &Rc<Self>,
+        name: &str,
+        text: Result<String, &str>,
+        done: impl FnOnce() + 'static,
+    ) {
         let text = match text {
             Ok(text) => text,
-            Err(why) => return self.ui.toast(why),
+            Err(why) => {
+                self.ui.toast(why);
+                return done();
+            }
         };
         let (v, socket, name) = (self.clone(), self.socket.clone(), name.to_owned());
         glib::spawn_future_local(async move {
             let got =
                 client::spawn(async move { client::type_text(&socket, name, text).await }).await;
-            if let Ok(Err(e)) = got {
-                v.ui.fail(&model::failure("Could not paste".into(), &e));
+            match got {
+                Ok(Ok(_)) => v.ui.toast("Pasted"),
+                Ok(Err(e)) => v.ui.fail(&model::failure("Could not paste".into(), &e)),
+                Err(_) => {}
             }
+            done();
         });
     }
 

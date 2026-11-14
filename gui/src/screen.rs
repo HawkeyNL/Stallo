@@ -78,6 +78,8 @@ pub struct Screen {
     shown_page: RefCell<Option<ScreenPage>>,
     /// The guest has the keyboard.
     grabbed: Cell<bool>,
+    /// A paste is being typed: no second one on top of it.
+    pasting: Cell<bool>,
     /// The window whose system shortcuts go to the guest while grabbed.
     inhibited: RefCell<Option<gdk::Toplevel>>,
     keys: RefCell<model::Keys>,
@@ -185,7 +187,7 @@ impl Screen {
             .build();
         let paste = gtk::Button::builder()
             .icon_name("edit-paste-symbolic")
-            .tooltip_text("Paste: types the clipboard text into the VM, as on a US keyboard")
+            .tooltip_text("Type the clipboard text (US keyboard layout)")
             .build();
         paste.update_property(&[gtk::accessible::Property::Label("Paste")]);
         let hint = gtk::Label::builder()
@@ -259,6 +261,7 @@ impl Screen {
             shown: Cell::new(None),
             shown_page: RefCell::default(),
             grabbed: Cell::new(false),
+            pasting: Cell::new(false),
             inhibited: RefCell::default(),
             keys: RefCell::default(),
             mouse: RefCell::default(),
@@ -292,18 +295,32 @@ impl Screen {
         });
         let s = weak();
         self.paste.connect_clicked(move |b| {
+            let Some(screen) = s.upgrade().filter(|s| !s.pasting.replace(true)) else {
+                return;
+            };
+            screen.show_input();
             let s = s.clone();
             let clipboard = b.clipboard();
             glib::spawn_future_local(async move {
                 // Read only on a click, never kept or logged.
                 let text = clipboard.read_text_future().await.ok().flatten();
-                let Some(s) = s.upgrade().filter(|s| s.input_allowed()) else {
+                let Some(screen) = s.upgrade() else {
                     return;
                 };
-                let Some(v) = s.vms.upgrade() else {
-                    return;
+                let done = move || {
+                    if let Some(s) = s.upgrade() {
+                        s.pasting.set(false);
+                        s.show_input();
+                    }
                 };
-                v.paste(&s.name, model::paste_text(text.as_deref().unwrap_or("")));
+                match screen.vms.upgrade().filter(|_| screen.input_allowed()) {
+                    Some(v) => v.paste(
+                        &screen.name,
+                        model::paste_text(text.as_deref().unwrap_or("")),
+                        done,
+                    ),
+                    None => done(),
+                }
             });
         });
         let s = weak();
@@ -601,7 +618,7 @@ impl Screen {
         self.strip_hint.set_visible(grabbed);
         self.release.set_visible(grabbed);
         self.ctrl_alt_del.set_sensitive(allowed);
-        self.paste.set_sensitive(allowed);
+        self.paste.set_sensitive(allowed && !self.pasting.get());
         self.banner
             .set_revealed(self.view_only.is_active() && self.agent.get() == Some(true));
     }
